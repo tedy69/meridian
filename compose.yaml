@@ -20,7 +20,7 @@ services:
         target: /workspace
       - type: volume
         source: meridian_node_modules
-        target: /opt/meridian-node_modules
+        target: /runtime/node_modules
     stop_grace_period: 45s
     mem_limit: 1024m
     cpus: 1.0

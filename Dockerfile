@@ -14,7 +14,7 @@ ENV NODE_ENV=production
 
 WORKDIR /app
 
-COPY --from=dependencies --chown=node:node /build/node_modules /opt/meridian-node_modules
+COPY --from=dependencies --chown=node:node /build/node_modules /runtime/node_modules
 COPY --chown=node:node . ./
 
 USER node

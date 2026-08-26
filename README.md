@@ -695,7 +695,7 @@ The production Compose service exposes no ports and runs as a non-root Node user
 For a host-mounted deployment, create the `node_modules` symlink once before the first start:
 
 ```sh
-ln -s /opt/meridian-node_modules /opt/meridian/node_modules
+ln -s /runtime/node_modules /opt/meridian/node_modules
 docker compose up -d --build
 ```
 
