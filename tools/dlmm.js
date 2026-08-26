@@ -19,8 +19,11 @@ import {
   markInRange,
   recordClaim,
   recordClose,
+  queuePendingAutoSwap,
   getTrackedPosition,
+  getTrackedPositions,
   minutesOutOfRange,
+  reopenPositionFromOnChain,
   syncOpenPositions,
 } from "../state.js";
 import { recordPerformance } from "../lessons.js";
@@ -31,6 +34,7 @@ import { agentMeridianJson, getAgentIdForRequests, getAgentMeridianHeaders } fro
 import { getAndClearStagedSignals } from "../signal-tracker.js";
 import { computePositions, fetchDlmmPnlForPool } from "./pnl.js";
 import { assertLiveTradingEnabled, isDryRun } from "../execution-guard.js";
+import { evaluateCloseProof } from "../close-settlement.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 // @meteora-ag/dlmm → @coral-xyz/anchor uses CJS directory imports
@@ -110,6 +114,142 @@ async function simulateThenSendAndConfirmTransaction(connection, transaction, si
     );
   }
   return sendAndConfirmTransactionRaw(connection, transaction, signers);
+}
+
+const CLOSE_VERIFICATION_ATTEMPTS = 6;
+const CLOSE_VERIFICATION_DELAY_MS = 3_000;
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function getFinalityForTransactions(transactionSignatures) {
+  const signatures = [...new Set((transactionSignatures || []).filter(Boolean))];
+  if (signatures.length === 0) {
+    return { finalized: false, error: "No close transaction signatures were returned" };
+  }
+  const response = await getConnection().getSignatureStatuses(signatures, {
+    searchTransactionHistory: true,
+  });
+  const pending = [];
+  const failed = [];
+  for (let index = 0; index < signatures.length; index++) {
+    const status = response.value[index];
+    if (!status) {
+      pending.push(`${signatures[index]} is not visible on RPC yet`);
+      continue;
+    }
+    if (status.err) {
+      failed.push(`${signatures[index]} failed: ${JSON.stringify(status.err)}`);
+      continue;
+    }
+    if (status.confirmationStatus === "finalized") {
+      // Relay responses may also contain a separate swap signature. The account
+      // absence check below is the actual close proof; one finalized submission
+      // is sufficient to wait for that finalized state without treating an
+      // unrelated swap retry as a still-open LP position.
+      return { finalized: true, signature: signatures[index] };
+    }
+    pending.push(`${signatures[index]} is ${status.confirmationStatus || "unconfirmed"}, not finalized`);
+  }
+  return { finalized: false, error: [...failed, ...pending].join("; ") || "No close transaction is finalized" };
+}
+
+/**
+ * Fail closed: an indexer omitting a position is not proof that it is closed.
+ * A completed close requires finalized transaction status and direct finalized
+ * RPC evidence that the Meteora position account no longer exists.
+ */
+async function verifyPositionClosedOnChain(positionAddress, closeTxHashes) {
+  const positionPubKey = new PublicKey(positionAddress);
+  let lastError = "Close has not been verified";
+
+  for (let attempt = 1; attempt <= CLOSE_VERIFICATION_ATTEMPTS; attempt++) {
+    try {
+      const transaction = await getFinalityForTransactions(closeTxHashes);
+      let positionAccountPresent;
+      if (transaction.finalized) {
+        const account = await getConnection().getAccountInfo(positionPubKey, "finalized");
+        positionAccountPresent = account !== null;
+      }
+      const proof = evaluateCloseProof({
+        transactionFinalized: transaction.finalized,
+        positionAccountPresent,
+      });
+      if (proof.confirmed) {
+        return {
+          ...proof,
+          transaction_finalized: true,
+          finalized_signature: transaction.signature,
+          position_account_absent: true,
+          attempts: attempt,
+        };
+      }
+      lastError = transaction.error || proof.reason;
+      log("close_warn", `Close verification pending for ${positionAddress} (attempt ${attempt}/${CLOSE_VERIFICATION_ATTEMPTS}): ${lastError}`);
+    } catch (error) {
+      lastError = error.message;
+      log("close_warn", `Close verification RPC failure for ${positionAddress} (attempt ${attempt}/${CLOSE_VERIFICATION_ATTEMPTS}): ${lastError}`);
+    }
+    if (attempt < CLOSE_VERIFICATION_ATTEMPTS) await wait(CLOSE_VERIFICATION_DELAY_MS);
+  }
+
+  return {
+    confirmed: false,
+    close_status: "pending_verification",
+    reason: lastError,
+    transaction_finalized: false,
+    position_account_absent: false,
+    attempts: CLOSE_VERIFICATION_ATTEMPTS,
+  };
+}
+
+function queueCloseSettlement({ positionAddress, baseMint, closeTxHashes, skipSwap }) {
+  if (skipSwap) return false;
+  try {
+    queuePendingAutoSwap({
+      position_address: positionAddress,
+      base_mint: baseMint,
+      close_txs: closeTxHashes,
+    });
+    return true;
+  } catch (error) {
+    // The close itself is still true on-chain, but the caller must not describe
+    // proceeds as settled if its durable retry record could not be written.
+    log("close_error", `Confirmed close could not queue base→SOL settlement: ${error.message}`);
+    return false;
+  }
+}
+
+function appendCloseDecision(entry) {
+  try {
+    appendDecision(entry);
+  } catch (error) {
+    // A local audit-log failure must never rewrite a finalized on-chain close
+    // into a reported failure that could lead to duplicate close attempts.
+    log("close_warn", `Could not write close decision log: ${error.message}`);
+  }
+}
+
+/**
+ * Repair historical state only after a direct finalized RPC account read. This
+ * handles positions incorrectly auto-closed by older versions of the agent.
+ */
+async function restoreHistoricallyFalseClosedPositions(observedPositions) {
+  const observed = new Set((observedPositions || []).map((position) => position?.position).filter(Boolean));
+  if (observed.size === 0 || !process.env.RPC_URL) return;
+  const candidates = getTrackedPositions(false)
+    .filter((position) => position.closed && observed.has(position.position));
+  for (const candidate of candidates) {
+    try {
+      const account = await getConnection().getAccountInfo(new PublicKey(candidate.position), "finalized");
+      if (account) {
+        reopenPositionFromOnChain(candidate.position);
+      }
+    } catch (error) {
+      log("state_warn", `Could not reconcile historical close for ${candidate.position}: ${error.message}`);
+    }
+  }
 }
 
 function shouldUseLpAgentRelay() {
@@ -1184,6 +1324,7 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
         const rpcResult = await computePositions(walletAddress);
         if (useLocalWallet) {
           syncOpenPositions(rpcResult.positions.map((p) => p.position));
+          await restoreHistoricallyFalseClosedPositions(rpcResult.positions);
           _positionsCache = rpcResult;
           _positionsCacheAt = Date.now();
         }
@@ -1355,6 +1496,7 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
     };
     if (useLocalWallet) {
       syncOpenPositions(positions.map(p => p.position));
+      await restoreHistoricallyFalseClosedPositions(positions);
       _positionsCache = result;
       _positionsCacheAt = Date.now();
     }
@@ -1513,7 +1655,7 @@ export async function claimFees({ position_address }) {
 }
 
 // ─── Close Position ────────────────────────────────────────────
-export async function closePosition({ position_address, reason }) {
+export async function closePosition({ position_address, reason, skip_swap = false }) {
   position_address = normalizeMint(position_address);
   if (isDryRun()) {
     return { dry_run: true, would_close: position_address, message: "DRY RUN — no transaction sent" };
@@ -1598,36 +1740,28 @@ export async function closePosition({ position_address, reason }) {
       const closeTxHashes = normalizeExecutionSignatures(submit);
       const txHashes = [...claimTxHashes, ...closeTxHashes];
 
-      await new Promise((resolve) => setTimeout(resolve, 5000));
       _positionsCacheAt = 0;
-
-      let closedConfirmed = false;
-      for (let attempt = 0; attempt < 4; attempt++) {
-        try {
-          const refreshed = await getMyPositions({ force: true, silent: true });
-          const stillOpen = refreshed?.positions?.some((p) => p.position === position_address);
-          if (!stillOpen) {
-            closedConfirmed = true;
-            break;
-          }
-          log("close_warn", `Relay close still appears open after submit (attempt ${attempt + 1}/4)`);
-        } catch (e) {
-          log("close_warn", `Relay close verification failed (attempt ${attempt + 1}/4): ${e.message}`);
-        }
-        if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, 3000));
-      }
-
-      if (!closedConfirmed) {
+      const closeVerification = await verifyPositionClosedOnChain(position_address, closeTxHashes);
+      if (!closeVerification.confirmed) {
         return {
           success: false,
-          error: "Close submit succeeded but position still appears open after verification window",
+          close_status: closeVerification.close_status,
+          error: `Close submit sent but direct on-chain verification is pending: ${closeVerification.reason}`,
           position: position_address,
           pool: poolAddress,
           close_txs: closeTxHashes,
           txs: txHashes,
+          close_verification: closeVerification,
         };
       }
 
+      const closeBaseMint = livePosition?.base_mint || pool.lbPair.tokenXMint.toString();
+      const settlementQueued = queueCloseSettlement({
+        positionAddress: position_address,
+        baseMint: closeBaseMint,
+        closeTxHashes,
+        skipSwap: skip_swap,
+      });
       recordClose(position_address, reason || "agent decision");
 
       if (tracked) {
@@ -1667,7 +1801,6 @@ export async function closePosition({ position_address, reason }) {
           log("close_warn", `Relay closed PnL fetch failed: ${e.message}`);
         }
 
-        const closeBaseMint = livePosition?.base_mint || pool.lbPair.tokenXMint.toString();
         const signalSnapshot = resolvePerformanceSignalSnapshot({
           poolAddress,
           baseMint: closeBaseMint,
@@ -1712,9 +1845,9 @@ export async function closePosition({ position_address, reason }) {
           entry_volume: tracked.entry_volume ?? null,
           entry_holders: tracked.entry_holders ?? null,
           ...exitMarket,
-        });
+        }).catch((error) => log("close_warn", `Could not record relay close performance: ${error.message}`));
 
-        appendDecision({
+        appendCloseDecision({
           type: "close",
           actor: "MANAGER",
           pool: poolAddress,
@@ -1744,13 +1877,16 @@ export async function closePosition({ position_address, reason }) {
           claim_txs: claimTxHashes,
           close_txs: closeTxHashes,
           txs: txHashes,
+          close_status: closeVerification.close_status,
+          close_verification: closeVerification,
+          settlement_queued: settlementQueued,
           pnl_usd: pnlUsd,
           pnl_pct: pnlPct,
           base_mint: closeBaseMint,
         };
       }
 
-      appendDecision({
+      appendCloseDecision({
         type: "close",
         actor: "MANAGER",
         pool: poolAddress,
@@ -1771,7 +1907,10 @@ export async function closePosition({ position_address, reason }) {
         claim_txs: claimTxHashes,
         close_txs: closeTxHashes,
         txs: txHashes,
-        base_mint: livePosition?.base_mint || null,
+        close_status: closeVerification.close_status,
+        close_verification: closeVerification,
+        settlement_queued: settlementQueued,
+        base_mint: closeBaseMint,
       };
       } catch (relayError) {
         if (relaySubmitted) throw relayError;
@@ -1855,39 +1994,29 @@ export async function closePosition({ position_address, reason }) {
     const txHashes = [...claimTxHashes, ...closeTxHashes];
     log("close", `Step 2 OK (close only): ${closeTxHashes.join(", ") || "none"}`);
     log("close", `SUCCESS txs: ${txHashes.join(", ")}`);
-    // Wait for RPC to reflect withdrawn balances before returning — prevents
-    // agent from seeing zero balance when attempting post-close swap
-    await new Promise(r => setTimeout(r, 5000));
     _positionsCacheAt = 0;
-
-    let closedConfirmed = false;
-    for (let attempt = 0; attempt < 4; attempt++) {
-      try {
-        const refreshed = await getMyPositions({ force: true, silent: true });
-        const stillOpen = refreshed?.positions?.some((p) => p.position === position_address);
-        if (!stillOpen) {
-          closedConfirmed = true;
-          break;
-        }
-        log("close_warn", `Position ${position_address} still appears open after close txs (attempt ${attempt + 1}/4)`);
-      } catch (e) {
-        log("close_warn", `Close verification failed (attempt ${attempt + 1}/4): ${e.message}`);
-      }
-      if (attempt < 3) await new Promise((r) => setTimeout(r, 3000));
-    }
-
-    if (!closedConfirmed) {
+    const closeVerification = await verifyPositionClosedOnChain(position_address, closeTxHashes);
+    if (!closeVerification.confirmed) {
       return {
         success: false,
-        error: "Close transactions sent but position still appears open after verification window",
+        close_status: closeVerification.close_status,
+        error: `Close transactions sent but direct on-chain verification is pending: ${closeVerification.reason}`,
         position: position_address,
         pool: poolAddress,
         claim_txs: claimTxHashes,
         close_txs: closeTxHashes,
         txs: txHashes,
+        close_verification: closeVerification,
       };
     }
 
+    const closeBaseMint = pool.lbPair.tokenXMint.toString();
+    const settlementQueued = queueCloseSettlement({
+      positionAddress: position_address,
+      baseMint: closeBaseMint,
+      closeTxHashes,
+      skipSwap: skip_swap,
+    });
     recordClose(position_address, reason || "agent decision");
 
     // Record performance for learning
@@ -1973,7 +2102,6 @@ export async function closePosition({ position_address, reason }) {
         }
       }
 
-      const closeBaseMint = pool.lbPair.tokenXMint.toString();
       const signalSnapshot = resolvePerformanceSignalSnapshot({
         poolAddress,
         baseMint: closeBaseMint,
@@ -2017,9 +2145,9 @@ export async function closePosition({ position_address, reason }) {
         entry_volume: tracked.entry_volume ?? null,
         entry_holders: tracked.entry_holders ?? null,
         ...exitMarket,
-      });
+      }).catch((error) => log("close_warn", `Could not record close performance: ${error.message}`));
 
-      appendDecision({
+      appendCloseDecision({
         type: "close",
         actor: "MANAGER",
         pool: poolAddress,
@@ -2047,13 +2175,16 @@ export async function closePosition({ position_address, reason }) {
         claim_txs: claimTxHashes,
         close_txs: closeTxHashes,
         txs: txHashes,
+        close_status: closeVerification.close_status,
+        close_verification: closeVerification,
+        settlement_queued: settlementQueued,
         pnl_usd: pnlUsd,
         pnl_pct: pnlPct,
         base_mint: closeBaseMint,
       };
     }
 
-    appendDecision({
+    appendCloseDecision({
       type: "close",
       actor: "MANAGER",
       pool: poolAddress,
@@ -2072,7 +2203,10 @@ export async function closePosition({ position_address, reason }) {
       claim_txs: claimTxHashes,
       close_txs: closeTxHashes,
       txs: txHashes,
-      base_mint: pool.lbPair.tokenXMint.toString(),
+      close_status: closeVerification.close_status,
+      close_verification: closeVerification,
+      settlement_queued: settlementQueued,
+      base_mint: closeBaseMint,
     };
   } catch (error) {
     log("close_error", error.message);

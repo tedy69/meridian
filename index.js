@@ -5,12 +5,12 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { agentLoop } from "./agent.js";
 import { log } from "./logger.js";
-import { getMyPositions, closePosition, getActiveBin } from "./tools/dlmm.js";
+import { getMyPositions, getActiveBin } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates, degenScore } from "./tools/screening.js";
 import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
 import { evolveThresholds, getPerformanceSummary } from "./lessons.js";
-import { executeTool, registerCronRestarter } from "./tools/executor.js";
+import { drainPendingAutoSwaps, executeTool, registerCronRestarter } from "./tools/executor.js";
 import {
   startPolling,
   stopPolling,
@@ -179,7 +179,14 @@ async function executeManagementActions(actionPositions, actionMap, { liveMessag
       const res = await executeTool("close_position", { position_address: p.position, reason }).catch(e => ({ error: e.message }));
       const ok = res?.success !== false && !res?.error && !res?.blocked;
       await liveMessage?.toolFinish("close_position", res, ok);
-      lines.push(`${p.pair}: ${ok ? `closed (${reason})` : `close FAILED — ${res?.error || res?.reason || "unknown"}`}`);
+      const settlement = res?.settlement_status === "pending_auto_swap"
+        ? " — close confirmed, base→SOL swap pending"
+        : res?.settlement_status === "requires_manual_review"
+        ? " — close confirmed, settlement requires manual review"
+        : res?.settlement_status === "settled_to_sol"
+        ? " — closed and settled to SOL"
+        : "";
+      lines.push(`${p.pair}: ${ok ? `closed (${reason})${settlement}` : `close FAILED — ${res?.error || res?.reason || "unknown"}`}`);
     } else if (act.action === "CLAIM") {
       await liveMessage?.toolStart("claim_fees");
       const res = await executeTool("claim_fees", { position_address: p.position }).catch(e => ({ error: e.message }));
@@ -233,6 +240,17 @@ export async function runManagementCycle({ silent = false } = {}) {
   try {
     if (!silent && telegramEnabled()) {
       liveMessage = await createLiveMessage("🔄 Management Cycle", "Evaluating positions...");
+    }
+    const settlement = await drainPendingAutoSwaps();
+    if (settlement.pending > 0) {
+      const pendingMessage = `⚠️ ${settlement.pending} close settlement(s) remain pending. New deployments are blocked until the base tokens are confirmed as SOL.`;
+      log("cron", pendingMessage);
+      mgmtReport = pendingMessage;
+      await liveMessage?.note(pendingMessage);
+      return mgmtReport;
+    }
+    if (settlement.processed > 0) {
+      await liveMessage?.note(`Settled ${settlement.settled}/${settlement.processed} pending base→SOL conversion(s).`);
     }
     const livePositions = await getMyPositions({ force: true }).catch(() => null);
     positions = livePositions?.positions || [];
@@ -718,6 +736,20 @@ Summarize the current portfolio health, total fees earned, and performance of al
     await maybeRunMissedBriefing();
   }, { timezone: 'UTC' });
 
+  // Settlement is independent from open-position management. Retry every minute
+  // so a process restart or transient Jupiter/RPC failure cannot strand the
+  // base token until the next (potentially much slower) management cycle.
+  const settlementTask = cron.schedule(`* * * * *`, async () => {
+    try {
+      const settlement = await drainPendingAutoSwaps();
+      if (settlement.processed > 0) {
+        log("cron", `Settlement retry: ${settlement.settled}/${settlement.processed} resolved, ${settlement.pending} still pending`);
+      }
+    } catch (error) {
+      log("cron_error", `Settlement retry failed: ${error.message}`);
+    }
+  });
+
   // Fast PnL poller — the real-time exit path between management cycles, no LLM.
   // Runs on public infra (RPC + Jupiter + Meteora deposits) so it can poll aggressively.
   // Exits require `confirmTicks` consecutive confirming polls (registerExitSignal) so a
@@ -824,11 +856,12 @@ Summarize the current portfolio health, total fees earned, and performance of al
     }, oppMs);
   }
 
-  _cronTasks = [mgmtTask, screenTask, healthTask, briefingTask, briefingWatchdog];
+  _cronTasks = [mgmtTask, screenTask, healthTask, briefingTask, briefingWatchdog, settlementTask];
   // Store interval refs so stopCronJobs can clear them
   _cronTasks._pnlPollInterval = pnlPollInterval;
   _cronTasks._opportunityPollInterval = opportunityPollInterval;
-  log("cron", `Cycles started — management every ${config.schedule.managementIntervalMin}m, screening every ${config.schedule.screeningIntervalMin}m${config.opportunity.enabled ? `, opportunity poll every ${config.opportunity.pollIntervalSec}s` : ""}`);
+  drainPendingAutoSwaps().catch((error) => log("cron_error", `Startup settlement retry failed: ${error.message}`));
+  log("cron", `Cycles started — management every ${config.schedule.managementIntervalMin}m, screening every ${config.schedule.screeningIntervalMin}m, settlement retry every 1m${config.opportunity.enabled ? `, opportunity poll every ${config.opportunity.pollIntervalSec}s` : ""}`);
 }
 
 // ═══════════════════════════════════════════
@@ -1495,13 +1528,26 @@ async function telegramHandler(msg) {
       if (idx < 0 || idx >= positions.length) { await sendMessage("Invalid number. Use /positions first."); return; }
       const pos = positions[idx];
       await sendMessage(`Closing ${pos.pair}...`);
-      const result = await closePosition({ position_address: pos.position });
+      const result = await executeTool("close_position", {
+        position_address: pos.position,
+        reason: "manual Telegram close",
+      });
       if (result.success) {
         const closeTxs = result.close_txs?.length ? result.close_txs : result.txs;
         const claimNote = result.claim_txs?.length ? `\nClaim txs: ${result.claim_txs.join(", ")}` : "";
-        await sendMessage(`✅ Closed ${pos.pair}\nPnL: ${config.management.solMode ? "◎" : "$"}${result.pnl_usd ?? "?"} | close txs: ${closeTxs?.join(", ") || "n/a"}${claimNote}`);
+        const settlementNote = result.settlement_status === "settled_to_sol"
+          ? "\nSettlement: ✅ base token swapped to SOL (finalized)."
+          : result.settlement_status === "settled_no_base_token" || result.settlement_status === "settled_in_sol"
+          ? "\nSettlement: ✅ no base-token swap remains."
+          : result.settlement_status === "manual_hold"
+          ? "\nSettlement: ℹ️ base token intentionally kept."
+          : "\nSettlement: ⚠️ token is NOT yet confirmed as SOL; persistent auto-swap retry is pending.";
+        await sendMessage(`✅ Close confirmed on-chain: ${pos.pair}\nPnL: ${config.management.solMode ? "◎" : "$"}${result.pnl_usd ?? "?"} | close txs: ${closeTxs?.join(", ") || "n/a"}${claimNote}${settlementNote}`);
       } else {
-        await sendMessage(`❌ Close failed: ${JSON.stringify(result)}`);
+        const verificationNote = result.close_status === "pending_verification"
+          ? "\n⚠️ The close transaction may have been sent, but the position is NOT confirmed closed on-chain yet."
+          : "";
+        await sendMessage(`❌ Close not confirmed: ${result.error || result.reason || JSON.stringify(result)}${verificationNote}`);
       }
     } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
     return;
@@ -1515,8 +1561,18 @@ async function telegramHandler(msg) {
       const results = [];
       for (const pos of positions) {
         try {
-          const result = await closePosition({ position_address: pos.position });
-          results.push(`${pos.pair}: ${result.success ? "closed" : `failed (${result.error || "unknown"})`}`);
+          const result = await executeTool("close_position", {
+            position_address: pos.position,
+            reason: "manual Telegram close-all",
+          });
+          const settlement = result.settlement_status === "settled_to_sol"
+            ? " + SOL settled"
+            : result.settlement_status === "settled_no_base_token" || result.settlement_status === "settled_in_sol"
+            ? " + settled"
+            : result.success
+            ? " + swap pending"
+            : "";
+          results.push(`${pos.pair}: ${result.success ? `closed on-chain${settlement}` : `not confirmed (${result.error || "unknown"})`}`);
         } catch (error) {
           results.push(`${pos.pair}: failed (${error.message})`);
         }

@@ -9,10 +9,16 @@ import {
   closePosition,
   searchPools,
 } from "./dlmm.js";
-import { getWalletBalances, normalizeMint, swapToken } from "./wallet.js";
+import { getTokenBalanceByMint, getWalletBalances, normalizeMint, swapToken } from "./wallet.js";
 import { studyTopLPers } from "./study.js";
 import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
-import { setPositionInstruction } from "../state.js";
+import {
+  completePendingAutoSwap,
+  getPendingAutoSwaps,
+  queuePendingAutoSwap,
+  recordPendingAutoSwapAttempt,
+  setPositionInstruction,
+} from "../state.js";
 
 import { getPoolMemory, addPoolNote } from "../pool-memory.js";
 import { addStrategy, listStrategies, getStrategy, setActiveStrategy, removeStrategy } from "../strategy-library.js";
@@ -31,6 +37,7 @@ import {
   assertLiveTradingEnabled,
   isDryRun,
 } from "../execution-guard.js";
+import { evaluateAutoSwapBalance } from "../close-settlement.js";
 import {
   commitDailyDeployReservation,
   reserveDailyDeploy,
@@ -49,7 +56,7 @@ const TIMEFRAME_MINUTES = {
   "24h": 1440,
 };
 import { log, logAction } from "../logger.js";
-import { notifyDeploy, notifyClose, notifySwap } from "../telegram.js";
+import { notifyAutoSwapPending, notifyDeploy, notifyClose, notifySwap } from "../telegram.js";
 
 function numberOrNull(value) {
   const n = Number(value);
@@ -646,39 +653,211 @@ const MANUAL_ONLY_CONFIG_KEYS = new Set([
 ]);
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+let _autoSwapDrainPromise = null;
 
 /**
- * Swap a base token back to SOL with retry. Jupiter can transiently fail (no route,
- * quote error) and a single attempt silently leaves the token unsold — this retries
- * with a delay, re-fetching the balance each attempt (amounts can shift on partial
- * fills). Treats both a throw AND result.success===false / missing tx as failure.
- * Returns { swapped, result, token } — swapped=false if nothing to do or all attempts failed.
+ * Swap a base token back to SOL with retry. Balance reads are direct finalized
+ * RPC reads, not an indexer/USD-price view, so an unavailable token index can
+ * never be mistaken for a completed settlement.
  */
-async function swapBaseToSolWithRetry(baseMint, label) {
+async function swapBaseToSolWithRetry(baseMint, label, { onFailure = null } = {}) {
+  const normalizedMint = normalizeMint(baseMint);
+  if (!normalizedMint) {
+    return { settled: false, swapped: false, error: "Missing base-token mint" };
+  }
+  if (normalizedMint === config.tokens.SOL) {
+    return {
+      settled: true,
+      swapped: false,
+      settlement_status: "settled_in_sol",
+      balance: null,
+    };
+  }
+
   const attempts = Math.max(1, Number(config.management.autoSwapRetryAttempts ?? 3));
   const delayMs = Math.max(0, Number(config.management.autoSwapRetryDelayMs ?? 3000));
-  let lastErr = null;
+  let lastError = null;
+  let lastBalance = null;
+
   for (let attempt = 1; attempt <= attempts; attempt++) {
+    let observedAmount = null;
     try {
-      const balances = await getWalletBalances({});
-      const token = balances.tokens?.find((t) => t.mint === baseMint);
-      if (!token || token.usd < 0.10) {
-        // Nothing left to swap (already sold or dust) — treat as done.
-        return { swapped: attempt > 1, result: null, token: null };
+      const balance = await getTokenBalanceByMint(normalizedMint);
+      lastBalance = balance;
+      observedAmount = balance.amount;
+      const balanceDecision = evaluateAutoSwapBalance({
+        balanceReadSucceeded: true,
+        amount: balance.amount,
+      });
+      if (balanceDecision.action === "settled") {
+        return {
+          settled: true,
+          swapped: false,
+          settlement_status: balanceDecision.settlement_status,
+          balance,
+        };
       }
-      log("executor", `Auto-swapping ${label} ${token.symbol || baseMint.slice(0, 8)} ($${token.usd.toFixed(2)}) back to SOL (attempt ${attempt}/${attempts})`);
-      const swapResult = await swapToken({ input_mint: baseMint, output_mint: "SOL", amount: token.balance });
-      const ok = swapResult && swapResult.success !== false && !swapResult.error && (swapResult.tx || swapResult.amount_out);
-      if (ok) return { swapped: true, result: swapResult, token };
-      lastErr = swapResult?.error || swapResult?.reason || "swap returned no tx";
-    } catch (e) {
-      lastErr = e.message;
+
+      log("executor", `Auto-swapping ${label} ${normalizedMint.slice(0, 8)} (${balance.amount}) back to SOL (attempt ${attempt}/${attempts})`);
+      const swapResult = await swapToken({ input_mint: normalizedMint, output_mint: "SOL", amount: balance.amount });
+      const swapFinalized = swapResult?.success === true && swapResult?.finalized === true && !!swapResult.tx;
+      if (!swapFinalized) {
+        lastError = swapResult?.error || swapResult?.reason || "swap did not finalize";
+      } else {
+        const remaining = await getTokenBalanceByMint(normalizedMint);
+        lastBalance = remaining;
+        observedAmount = remaining.amount;
+        const remainingDecision = evaluateAutoSwapBalance({
+          balanceReadSucceeded: true,
+          amount: remaining.amount,
+        });
+        if (remainingDecision.action === "settled") {
+          return {
+            settled: true,
+            swapped: true,
+            settlement_status: "settled_to_sol",
+            result: swapResult,
+            balance: remaining,
+          };
+        }
+        lastError = `Swap finalized but ${remaining.amount} ${normalizedMint.slice(0, 8)} remains on finalized RPC`;
+      }
+    } catch (error) {
+      lastError = error.message;
     }
-    log("executor_warn", `Auto-swap ${label} attempt ${attempt}/${attempts} failed: ${lastErr}`);
+
+    log("executor_warn", `Auto-swap ${label} attempt ${attempt}/${attempts} failed: ${lastError}`);
+    if (onFailure) {
+      await onFailure({ error: lastError, observed_amount: observedAmount });
+    }
     if (attempt < attempts) await sleep(delayMs);
   }
-  log("executor_warn", `Auto-swap ${label} failed after ${attempts} attempts — base token left unsold (${baseMint.slice(0, 8)})`);
-  return { swapped: false, result: null, token: null };
+
+  log("executor_warn", `Auto-swap ${label} failed after ${attempts} attempts — base token remains pending (${normalizedMint.slice(0, 8)})`);
+  return {
+    settled: false,
+    swapped: false,
+    error: lastError || "autoswap did not settle",
+    balance: lastBalance,
+  };
+}
+
+async function settleQueuedAutoSwap(entry, label) {
+  const outcome = await swapBaseToSolWithRetry(entry.base_mint, label, {
+    onFailure: ({ error, observed_amount }) => {
+      recordPendingAutoSwapAttempt(entry.key, { error, observed_amount });
+    },
+  });
+  if (outcome.settled) {
+    completePendingAutoSwap(entry.key, {
+      settlement_status: outcome.settlement_status,
+      tx: outcome.result?.tx || null,
+      observed_amount: outcome.balance?.amount ?? null,
+    });
+  }
+  return outcome;
+}
+
+/**
+ * Drain persisted close settlements. It is invoked by the management loop even
+ * when no LP positions remain, so an outage/restart cannot strand base tokens.
+ */
+export async function drainPendingAutoSwaps() {
+  if (_autoSwapDrainPromise) return _autoSwapDrainPromise;
+  _autoSwapDrainPromise = (async () => {
+    const pending = getPendingAutoSwaps();
+    if (pending.length === 0) {
+      return { processed: 0, settled: 0, pending: 0, results: [] };
+    }
+    if (isDryRun()) {
+      return {
+        processed: 0,
+        settled: 0,
+        pending: pending.length,
+        results: [],
+        skipped: "dry_run",
+      };
+    }
+
+    const results = [];
+    for (const entry of pending) {
+      const outcome = await settleQueuedAutoSwap(entry, "queued close settlement");
+      results.push({ key: entry.key, position: entry.position_address, ...outcome });
+    }
+    return {
+      processed: pending.length,
+      settled: results.filter((result) => result.settled).length,
+      pending: getPendingAutoSwaps().length,
+      results,
+    };
+  })();
+  try {
+    return await _autoSwapDrainPromise;
+  } finally {
+    _autoSwapDrainPromise = null;
+  }
+}
+
+async function settleCloseToSol(result, args) {
+  if (args.skip_swap) {
+    result.settlement_status = "manual_hold";
+    result.auto_swap_note = "Base token was intentionally kept because skip_swap=true. Do not claim it was converted to SOL.";
+    return;
+  }
+  if (result.close_status !== "confirmed_on_chain") {
+    result.settlement_status = "not_started";
+    result.auto_swap_note = "Close is not confirmed on-chain, so no settlement was attempted.";
+    return;
+  }
+  if (!result.base_mint) {
+    result.settlement_status = "requires_manual_review";
+    result.auto_swap_pending = true;
+    result.auto_swap_note = "Close is confirmed, but the returned base-token mint is unknown. Funds are not confirmed as SOL.";
+    notifyAutoSwapPending({
+      position: result.position,
+      baseMint: null,
+      error: "Base-token mint unavailable after a confirmed close",
+    }).catch(() => {});
+    return;
+  }
+
+  const baseMint = normalizeMint(result.base_mint);
+  if (baseMint === config.tokens.SOL) {
+    result.settlement_status = "settled_in_sol";
+    result.auto_swap_note = "Close proceeds are already SOL; no token swap was required.";
+    return;
+  }
+
+  const pending = queuePendingAutoSwap({
+    position_address: result.position || args.position_address,
+    base_mint: baseMint,
+    close_txs: result.close_txs || result.txs || [],
+  });
+  const drain = await drainPendingAutoSwaps();
+  const outcome = drain.results.find((entry) => entry.key === pending.key) || {
+    settled: false,
+    swapped: false,
+    error: "autoswap queue is being processed; retry remains pending",
+  };
+  result.settlement_status = outcome.settlement_status || "pending_auto_swap";
+  if (outcome.settled) {
+    result.auto_swapped = outcome.swapped;
+    result.auto_swap_note = outcome.swapped
+      ? `Base token was swapped to SOL in finalized transaction ${outcome.result?.tx || ""}. Do NOT call swap_token again.`
+      : "No residual base-token balance exists at finalized commitment; no swap was required.";
+    if (outcome.result?.amount_out) result.sol_received = outcome.result.amount_out;
+    return;
+  }
+
+  result.auto_swapped = false;
+  result.auto_swap_pending = true;
+  result.auto_swap_error = outcome.error || "auto-swap remains pending";
+  result.auto_swap_note = "Base token is NOT confirmed as SOL. Automatic retries are queued; do NOT state that all funds have been swapped.";
+  notifyAutoSwapPending({
+    position: result.position,
+    baseMint,
+    error: result.auto_swap_error,
+  }).catch(() => {});
 }
 
 /**
@@ -751,16 +930,7 @@ export async function executeTool(name, args) {
         log("budget_error", `Could not finalize deploy budget reservation; it remains fail-closed: ${budgetError.message}`);
       }
     }
-    const duration = Date.now() - startTime;
     const success = result?.success !== false && !result?.error;
-
-    logAction({
-      tool: name,
-      args,
-      result: summarizeResult(result),
-      duration_ms: duration,
-      success,
-    });
 
     if (success) {
       if (name === "swap_token" && result.tx) {
@@ -774,20 +944,33 @@ export async function executeTool(name, args) {
           const poolAddr = result.pool || args.pool_address;
           if (poolAddr) addPoolNote({ pool_address: poolAddr, note: `Closed: low yield (fee/TVL below threshold) at ${new Date().toISOString().slice(0,10)}` }).catch?.(() => {});
         }
-        // Auto-swap base token back to SOL unless user said to hold (retried).
-        if (!args.skip_swap && result.base_mint) {
-          const { swapped, result: swapResult } = await swapBaseToSolWithRetry(result.base_mint, "after close");
-          if (swapped) {
-            // Tell the model the swap already happened so it doesn't call swap_token again
-            result.auto_swapped = true;
-            result.auto_swap_note = `Base token already auto-swapped back to SOL (${result.base_mint.slice(0, 8)} → SOL). Do NOT call swap_token again.`;
-            if (swapResult?.amount_out) result.sol_received = swapResult.amount_out;
-          }
+        // Persist then settle the returned base token. A close is not reported as
+        // fully converted to SOL until a finalized balance check proves it.
+        try {
+          await settleCloseToSol(result, args);
+        } catch (settlementError) {
+          result.settlement_status = "requires_manual_review";
+          result.auto_swap_pending = true;
+          result.auto_swap_error = settlementError.message;
+          result.auto_swap_note = "Close is confirmed, but auto-swap persistence failed. Funds are NOT confirmed as SOL.";
+          notifyAutoSwapPending({
+            position: result.position,
+            baseMint: result.base_mint,
+            error: settlementError.message,
+          }).catch(() => {});
         }
       } else if (name === "claim_fees" && config.management.autoSwapAfterClaim && result.base_mint) {
         await swapBaseToSolWithRetry(result.base_mint, "after claim");
       }
     }
+
+    logAction({
+      tool: name,
+      args,
+      result: summarizeResult(result),
+      duration_ms: Date.now() - startTime,
+      success,
+    });
 
     return result;
   } catch (error) {
@@ -826,6 +1009,13 @@ export async function executeTool(name, args) {
 async function runSafetyChecks(name, args) {
   switch (name) {
     case "deploy_position": {
+      const pendingAutoSwaps = getPendingAutoSwaps();
+      if (!isDryRun() && pendingAutoSwaps.length > 0) {
+        return {
+          pass: false,
+          reason: `Cannot open a new position while ${pendingAutoSwaps.length} confirmed-close settlement(s) still await base→SOL conversion.`,
+        };
+      }
       const poolThresholds = await validateDeployPoolThresholds(args);
       if (!poolThresholds.pass) return poolThresholds;
       if (poolThresholds.entryMarketData) Object.assign(args, poolThresholds.entryMarketData);

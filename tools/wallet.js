@@ -142,6 +142,70 @@ export async function getWalletBalances() {
 }
 
 /**
+ * Read a token balance directly from Solana RPC at finalized commitment.
+ *
+ * Settlement code must not depend on an indexed portfolio response or a USD
+ * price being present: either can lag after a close and incorrectly make an
+ * unswapped token look like it no longer exists.
+ */
+export async function getTokenBalanceByMint(mint) {
+  const normalizedMint = normalizeMint(mint);
+  const wallet = getWallet();
+  const connection = getConnection();
+
+  if (normalizedMint === SOL_MINT) {
+    const lamports = await connection.getBalance(wallet.publicKey, "finalized");
+    return {
+      mint: normalizedMint,
+      amount: lamports / LAMPORTS_PER_SOL,
+      raw_amount: String(lamports),
+      decimals: 9,
+      source: "rpc-finalized",
+    };
+  }
+
+  const response = await connection.getParsedTokenAccountsByOwner(
+    wallet.publicKey,
+    { mint: new PublicKey(normalizedMint) },
+    "finalized",
+  );
+  let rawAmount = 0n;
+  let decimals = null;
+  for (const account of response.value || []) {
+    const tokenAmount = account.account?.data?.parsed?.info?.tokenAmount;
+    if (!tokenAmount?.amount) continue;
+    const accountDecimals = Number(tokenAmount.decimals);
+    if (!Number.isInteger(accountDecimals) || accountDecimals < 0) {
+      throw new Error(`Invalid decimals returned for token ${normalizedMint}`);
+    }
+    decimals = decimals ?? accountDecimals;
+    if (decimals !== accountDecimals) {
+      throw new Error(`Inconsistent token decimals returned for ${normalizedMint}`);
+    }
+    rawAmount += BigInt(String(tokenAmount.amount));
+  }
+
+  const resolvedDecimals = decimals ?? 0;
+  const rawText = rawAmount.toString();
+  const padded = rawText.padStart(resolvedDecimals + 1, "0");
+  const amountText = resolvedDecimals === 0
+    ? padded
+    : `${padded.slice(0, -resolvedDecimals)}.${padded.slice(-resolvedDecimals)}`;
+  const amount = Number(amountText);
+  if (!Number.isFinite(amount) || amount < 0) {
+    throw new Error(`Invalid token balance returned for ${normalizedMint}`);
+  }
+
+  return {
+    mint: normalizedMint,
+    amount,
+    raw_amount: rawText,
+    decimals: resolvedDecimals,
+    source: "rpc-finalized",
+  };
+}
+
+/**
  * Swap tokens via Jupiter Swap API V2 (order → sign → execute).
  */
 // Normalize any SOL-like address to the correct wrapped SOL mint
@@ -192,7 +256,11 @@ export async function swapToken({
       const mintInfo = await connection.getParsedAccountInfo(new PublicKey(input_mint));
       decimals = mintInfo.value?.data?.parsed?.info?.decimals ?? 9;
     }
-    const amountStr = Math.floor(numericAmount * Math.pow(10, decimals)).toString();
+    const amountAtomic = Math.floor(numericAmount * Math.pow(10, decimals));
+    if (!Number.isFinite(amountAtomic) || amountAtomic <= 0) {
+      throw new Error("Swap amount rounds to zero atomic units");
+    }
+    const amountStr = amountAtomic.toString();
 
     // ─── Get Swap V2 order (unsigned tx + requestId) ───────────
     const search = new URLSearchParams({
@@ -247,8 +315,16 @@ export async function swapToken({
     if (result.status === "Failed") {
       throw new Error(`Swap failed on-chain: code=${result.code}`);
     }
+    if (!result.signature) {
+      throw new Error("Swap execute response did not include a transaction signature");
+    }
 
-    log("swap", `SUCCESS tx: ${result.signature}`);
+    const confirmation = await connection.confirmTransaction(result.signature, "finalized");
+    if (confirmation.value.err) {
+      throw new Error(`Swap finalized with on-chain error: ${JSON.stringify(confirmation.value.err)}`);
+    }
+
+    log("swap", `SUCCESS finalized tx: ${result.signature}`);
     if (referralParams && order.feeBps !== referralParams.referralFee) {
       log(
         "swap_warn",
@@ -267,6 +343,7 @@ export async function swapToken({
       referral_fee_bps_requested: referralParams?.referralFee || 0,
       fee_bps_applied: order.feeBps ?? null,
       fee_mint: order.feeMint ?? null,
+      finalized: true,
     };
   } catch (error) {
     log("swap_error", error.message);

@@ -17,7 +17,7 @@
     "dev": "DRY_RUN=true node index.js",
     "test": "npm run test:syntax && npm run test:guard",
     "test:syntax": "find . -path ./node_modules -prune -o -name '*.js' -exec node --check {} \\;",
-    "test:guard": "node --test test/test-execution-guard.js test/test-execution-budget.js",
+    "test:guard": "node --test test/test-execution-guard.js test/test-execution-budget.js test/test-close-settlement.js",
     "test:screen": "node test/test-screening.js",
     "test:agent": "DRY_RUN=true node test/test-agent.js",
     "postinstall": "node scripts/patch-anchor.js"

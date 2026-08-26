@@ -269,7 +269,9 @@ WARNING: This executes a real on-chain transaction.`,
     function: {
       name: "close_position",
       description: `Remove all liquidity and close a position.
-This withdraws all tokens back to the wallet and closes the position account.
+This reports success only after the close transaction is finalized and the position account is absent on-chain.
+Unless skip_swap=true, it persistently queues any returned base token for automatic conversion to SOL.
+Inspect close_status and settlement_status in the result before describing the outcome.
 Use when:
 - Position has been out of range for > 30 minutes
 - IL exceeds accumulated fees

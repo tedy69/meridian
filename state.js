@@ -12,7 +12,7 @@ import fs from "fs";
 import { log } from "./logger.js";
 import { repoPath } from "./repo-root.js";
 
-const STATE_FILE = repoPath("state.json");
+const STATE_FILE = process.env.MERIDIAN_STATE_FILE || repoPath("state.json");
 
 const MAX_RECENT_EVENTS = 20;
 const MAX_INSTRUCTION_LENGTH = 280;
@@ -28,20 +28,35 @@ function sanitizeStoredText(text, maxLen = MAX_INSTRUCTION_LENGTH) {
   return cleaned || null;
 }
 
+function emptyState() {
+  return { positions: {}, recentEvents: [], pendingAutoSwaps: {}, lastUpdated: null };
+}
+
+function normalizeState(state) {
+  const normalized = state && typeof state === "object" ? state : emptyState();
+  if (!normalized.positions || typeof normalized.positions !== "object") normalized.positions = {};
+  if (!Array.isArray(normalized.recentEvents)) normalized.recentEvents = [];
+  if (!normalized.pendingAutoSwaps || typeof normalized.pendingAutoSwaps !== "object" || Array.isArray(normalized.pendingAutoSwaps)) {
+    normalized.pendingAutoSwaps = {};
+  }
+  return normalized;
+}
+
 function load() {
   if (!fs.existsSync(STATE_FILE)) {
-    return { positions: {}, recentEvents: [], lastUpdated: null };
+    return emptyState();
   }
   try {
-    return JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+    return normalizeState(JSON.parse(fs.readFileSync(STATE_FILE, "utf8")));
   } catch (err) {
     log("state_error", `Failed to read state.json: ${err.message}`);
-    return { positions: {}, lastUpdated: null };
+    return emptyState();
   }
 }
 
 function save(state) {
   try {
+    normalizeState(state);
     state.lastUpdated = new Date().toISOString();
     fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
   } catch (err) {
@@ -111,6 +126,7 @@ export function trackPosition({
     pending_exit_count: 0,
     pending_exit_started_at: null,
     trailing_active: false,
+    last_missing_observation_at: null,
   };
   pushEvent(state, { action: "deploy", position, pool_name: pool_name || pool });
   save(state);
@@ -194,6 +210,115 @@ export function recordClose(position_address, reason) {
   pushEvent(state, { action: "close", position: position_address, pool_name: pos.pool_name || pos.pool, reason });
   save(state);
   log("state", `Position ${position_address} marked closed: ${reason}`);
+}
+
+/**
+ * Recover a historical false-close only when the caller has separately proven
+ * that the position account still exists at finalized commitment.
+ */
+export function reopenPositionFromOnChain(position_address, reason = "position account exists at finalized commitment") {
+  const state = load();
+  const pos = state.positions[position_address];
+  if (!pos || !pos.closed) return false;
+  const now = new Date().toISOString();
+  pos.closed = false;
+  pos.closed_at = null;
+  if (!Array.isArray(pos.notes)) pos.notes = [];
+  pos.notes.push(`Reopened at ${now}: ${sanitizeStoredText(reason)}`);
+  pushEvent(state, { action: "reopen", position: position_address, pool_name: pos.pool_name || pos.pool, reason: sanitizeStoredText(reason) });
+  save(state);
+  log("state", `Position ${position_address} restored to open: ${reason}`);
+  return true;
+}
+
+// ─── Pending Auto-swap Registry ────────────────────────────────
+
+function pendingAutoSwapKey(position_address, base_mint) {
+  return `${position_address}:${base_mint}`;
+}
+
+/**
+ * Persist settlement work before attempting a swap. A process restart, RPC
+ * outage, or Jupiter route failure must not make an unsold token disappear
+ * from the agent's responsibilities.
+ */
+export function queuePendingAutoSwap({ position_address, base_mint, close_txs = [] }) {
+  if (!position_address || !base_mint) {
+    throw new Error("position_address and base_mint are required to queue an auto-swap");
+  }
+  const state = load();
+  const key = pendingAutoSwapKey(position_address, base_mint);
+  const now = new Date().toISOString();
+  const existing = state.pendingAutoSwaps[key] || {};
+  const wasAlreadyPending = existing.status === "pending_auto_swap";
+  const entry = {
+    ...existing,
+    key,
+    position_address,
+    base_mint,
+    close_txs: [...new Set([...(existing.close_txs || []), ...close_txs].filter(Boolean))],
+    status: "pending_auto_swap",
+    created_at: existing.created_at || now,
+    updated_at: now,
+    attempt_count: Number.isFinite(existing.attempt_count) ? existing.attempt_count : 0,
+    last_error: existing.last_error || null,
+    last_attempt_at: existing.last_attempt_at || null,
+    last_observed_amount: existing.last_observed_amount ?? null,
+  };
+  state.pendingAutoSwaps[key] = entry;
+  if (!wasAlreadyPending) {
+    pushEvent(state, { action: "auto_swap_queued", position: position_address, base_mint });
+  }
+  save(state);
+  log("state", `Queued base→SOL settlement for ${position_address} (${base_mint})`);
+  return entry;
+}
+
+export function getPendingAutoSwaps() {
+  const state = load();
+  return Object.values(state.pendingAutoSwaps)
+    .filter((entry) => entry?.status === "pending_auto_swap")
+    .sort((a, b) => String(a.created_at || "").localeCompare(String(b.created_at || "")));
+}
+
+export function recordPendingAutoSwapAttempt(key, { error = null, observed_amount = null } = {}) {
+  const state = load();
+  const entry = state.pendingAutoSwaps[key];
+  if (!entry) return null;
+  entry.attempt_count = (Number.isFinite(entry.attempt_count) ? entry.attempt_count : 0) + 1;
+  entry.last_attempt_at = new Date().toISOString();
+  entry.updated_at = entry.last_attempt_at;
+  entry.last_error = error ? sanitizeStoredText(error) : null;
+  entry.last_observed_amount = Number.isFinite(observed_amount) ? observed_amount : null;
+  save(state);
+  return entry;
+}
+
+export function completePendingAutoSwap(key, {
+  settlement_status = "settled_to_sol",
+  tx = null,
+  observed_amount = null,
+} = {}) {
+  const state = load();
+  const entry = state.pendingAutoSwaps[key];
+  if (!entry) return null;
+  const now = new Date().toISOString();
+  entry.status = settlement_status;
+  entry.settled_at = now;
+  entry.updated_at = now;
+  entry.tx = tx || entry.tx || null;
+  entry.last_error = null;
+  entry.last_observed_amount = Number.isFinite(observed_amount) ? observed_amount : entry.last_observed_amount ?? null;
+  pushEvent(state, {
+    action: "auto_swap_settled",
+    position: entry.position_address,
+    base_mint: entry.base_mint,
+    settlement_status,
+    tx: entry.tx,
+  });
+  save(state);
+  log("state", `Settled pending base→SOL swap for ${entry.position_address}: ${settlement_status}`);
+  return entry;
 }
 
 /**
@@ -324,6 +449,15 @@ export function getStateSummary() {
   const state = load();
   const open = Object.values(state.positions).filter((p) => !p.closed);
   const closed = Object.values(state.positions).filter((p) => p.closed);
+  const pendingAutoSwaps = Object.values(state.pendingAutoSwaps)
+    .filter((entry) => entry?.status === "pending_auto_swap")
+    .map((entry) => ({
+      position: entry.position_address,
+      base_mint: entry.base_mint,
+      attempts: entry.attempt_count || 0,
+      last_error: entry.last_error || null,
+      last_observed_amount: entry.last_observed_amount ?? null,
+    }));
   const totalFeesClaimed = Object.values(state.positions)
     .reduce((sum, p) => sum + (p.total_fees_claimed_usd || 0), 0);
 
@@ -331,6 +465,7 @@ export function getStateSummary() {
     open_positions: open.length,
     closed_positions: closed.length,
     total_fees_claimed_usd: Math.round(totalFeesClaimed * 100) / 100,
+    pending_auto_swaps: pendingAutoSwaps,
     positions: open.map((p) => ({
       position: p.position,
       pool: p.pool,
@@ -456,32 +591,37 @@ export function setLastBriefingDate() {
 }
 
 /**
- * Reconcile local state with actual on-chain positions.
- * Marks any local open positions as closed if they are not in the on-chain list.
+ * Reconcile local state with an observed open-position feed.
+ *
+ * The feed may be stale, incomplete, or unavailable. Its absence therefore only
+ * records a reconciliation warning; it can never close a tracked position.
+ * `recordClose` is reserved for direct finalized on-chain verification.
  */
-const SYNC_GRACE_MS = 5 * 60_000; // don't auto-close positions deployed < 5 min ago
-
 export function syncOpenPositions(active_addresses) {
   const state = load();
-  const activeSet = new Set(active_addresses);
+  const activeSet = new Set(active_addresses || []);
   let changed = false;
 
   for (const posId in state.positions) {
     const pos = state.positions[posId];
-    if (pos.closed || activeSet.has(posId)) continue;
-
-    // Grace period: newly deployed positions may not be indexed yet
-    const deployedAt = pos.deployed_at ? new Date(pos.deployed_at).getTime() : 0;
-    if (Date.now() - deployedAt < SYNC_GRACE_MS) {
-      log("state", `Position ${posId} not on-chain yet — within grace period, skipping auto-close`);
+    if (pos.closed) continue;
+    if (activeSet.has(posId)) {
+      if (pos.last_missing_observation_at) {
+        pos.last_missing_observation_at = null;
+        changed = true;
+        log("state", `Position ${posId} is visible in the observed feed again`);
+      }
       continue;
     }
 
-    pos.closed = true;
-    pos.closed_at = new Date().toISOString();
-    pos.notes.push(`Auto-closed during state sync (not found on-chain)`);
-    changed = true;
-    log("state", `Position ${posId} auto-closed (missing from on-chain data)`);
+    if (!pos.last_missing_observation_at) {
+      pos.last_missing_observation_at = new Date().toISOString();
+      if (!Array.isArray(pos.notes)) pos.notes = [];
+      pos.notes.push("Missing from observed open-position feed; awaiting direct on-chain close verification");
+      pushEvent(state, { action: "position_missing_observation", position: posId });
+      changed = true;
+      log("state", `Position ${posId} missing from observed feed; keeping it open pending direct verification`);
+    }
   }
 
   if (changed) save(state);

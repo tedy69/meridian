@@ -501,6 +501,23 @@ export async function notifySwap({ inputSymbol, outputSymbol, amountIn, amountOu
   );
 }
 
+/**
+ * A close is not fully settled until any returned base token is converted back
+ * to SOL. This notification intentionally uses plain text so RPC/Jupiter error
+ * text is never interpreted as Telegram HTML.
+ */
+export async function notifyAutoSwapPending({ position, baseMint, error }) {
+  if (hasActiveLiveMessage()) return;
+  const message = [
+    "⚠️ Auto-swap pending — position close is confirmed, but funds are not yet confirmed as SOL.",
+    `Position: ${String(position || "?").slice(0, 12)}…`,
+    `Base token: ${String(baseMint || "?").slice(0, 12)}…`,
+    "The agent will retry from its persistent settlement queue before opening another position.",
+    error ? `Last error: ${String(error).replace(/[\r\n]+/g, " ").slice(0, 280)}` : null,
+  ].filter(Boolean).join("\n");
+  await sendMessage(message);
+}
+
 export async function notifyOutOfRange({ pair, minutesOOR }) {
   if (hasActiveLiveMessage()) return;
   await sendHTML(
