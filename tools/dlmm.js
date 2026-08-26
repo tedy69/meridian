@@ -7,7 +7,7 @@ import {
   Transaction,
   TransactionInstruction,
   VersionedTransaction,
-  sendAndConfirmTransaction,
+  sendAndConfirmTransaction as sendAndConfirmTransactionRaw,
 } from "@solana/web3.js";
 import BN from "bn.js";
 import bs58 from "bs58";
@@ -30,6 +30,7 @@ import { appendDecision } from "../decision-log.js";
 import { agentMeridianJson, getAgentIdForRequests, getAgentMeridianHeaders } from "./agent-meridian.js";
 import { getAndClearStagedSignals } from "../signal-tracker.js";
 import { computePositions, fetchDlmmPnlForPool } from "./pnl.js";
+import { assertLiveTradingEnabled, isDryRun } from "../execution-guard.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 // @meteora-ag/dlmm → @coral-xyz/anchor uses CJS directory imports
@@ -96,6 +97,19 @@ function getWallet() {
     log("init", `Wallet: ${_wallet.publicKey.toString()}`);
   }
   return _wallet;
+}
+
+async function simulateThenSendAndConfirmTransaction(connection, transaction, signers) {
+  const simulation = await connection.simulateTransaction(transaction, signers);
+  if (simulation.value.err) {
+    const logs = Array.isArray(simulation.value.logs)
+      ? simulation.value.logs.slice(-12).join(" | ")
+      : "no simulation logs";
+    throw new Error(
+      `Local DLMM transaction simulation failed: ${JSON.stringify(simulation.value.err)} (${logs})`,
+    );
+  }
+  return sendAndConfirmTransactionRaw(connection, transaction, signers);
 }
 
 function shouldUseLpAgentRelay() {
@@ -576,7 +590,7 @@ export async function deployPosition({
     );
   }
 
-  if (process.env.DRY_RUN === "true") {
+  if (isDryRun()) {
     return {
       dry_run: true,
       would_deploy: {
@@ -593,6 +607,8 @@ export async function deployPosition({
       message: "DRY RUN — no transaction sent",
     };
   }
+
+  assertLiveTradingEnabled("deploy_position");
 
   const isWideRange = totalBins > 69;
   const minBinId = activeBin.binId - activeBinsBelow;
@@ -795,7 +811,7 @@ export async function deployPosition({
       const createTxArray = Array.isArray(createTxs) ? createTxs : [createTxs];
       for (let i = 0; i < createTxArray.length; i++) {
         const signers = i === 0 ? [wallet, newPosition] : [wallet];
-        const txHash = await sendAndConfirmTransaction(getConnection(), createTxArray[i], signers);
+        const txHash = await simulateThenSendAndConfirmTransaction(getConnection(), createTxArray[i], signers);
         txHashes.push(txHash);
         log("deploy", `Create tx ${i + 1}/${createTxArray.length}: ${txHash}`);
       }
@@ -811,7 +827,7 @@ export async function deployPosition({
       });
       const addTxArray = Array.isArray(addTxs) ? addTxs : [addTxs];
       for (let i = 0; i < addTxArray.length; i++) {
-        const txHash = await sendAndConfirmTransaction(getConnection(), addTxArray[i], [wallet]);
+        const txHash = await simulateThenSendAndConfirmTransaction(getConnection(), addTxArray[i], [wallet]);
         txHashes.push(txHash);
         log("deploy", `Add liquidity tx ${i + 1}/${addTxArray.length}: ${txHash}`);
       }
@@ -825,7 +841,7 @@ export async function deployPosition({
         strategy: { maxBinId, minBinId, strategyType },
         slippage: 1000, // 10% in bps
       });
-      const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet, newPosition]);
+      const txHash = await simulateThenSendAndConfirmTransaction(getConnection(), tx, [wallet, newPosition]);
       txHashes.push(txHash);
     }
 
@@ -1451,9 +1467,11 @@ export async function searchPools({ query, limit = 10 }) {
 // ─── Claim Fees ────────────────────────────────────────────────
 export async function claimFees({ position_address }) {
   position_address = normalizeMint(position_address);
-  if (process.env.DRY_RUN === "true") {
+  if (isDryRun()) {
     return { dry_run: true, would_claim: position_address, message: "DRY RUN — no transaction sent" };
   }
+
+  assertLiveTradingEnabled("claim_fees");
 
   const tracked = getTrackedPosition(position_address);
   if (tracked?.closed) {
@@ -1480,7 +1498,7 @@ export async function claimFees({ position_address }) {
 
     const txHashes = [];
     for (const tx of txs) {
-      const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet]);
+      const txHash = await simulateThenSendAndConfirmTransaction(getConnection(), tx, [wallet]);
       txHashes.push(txHash);
     }
     log("claim", `SUCCESS txs: ${txHashes.join(", ")}`);
@@ -1497,9 +1515,11 @@ export async function claimFees({ position_address }) {
 // ─── Close Position ────────────────────────────────────────────
 export async function closePosition({ position_address, reason }) {
   position_address = normalizeMint(position_address);
-  if (process.env.DRY_RUN === "true") {
+  if (isDryRun()) {
     return { dry_run: true, would_close: position_address, message: "DRY RUN — no transaction sent" };
   }
+
+  assertLiveTradingEnabled("close_position");
 
   const tracked = getTrackedPosition(position_address);
 
@@ -1781,7 +1801,7 @@ export async function closePosition({ position_address, reason }) {
         });
         if (claimTxs && claimTxs.length > 0) {
           for (const tx of claimTxs) {
-            const claimHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet]);
+            const claimHash = await simulateThenSendAndConfirmTransaction(getConnection(), tx, [wallet]);
             claimTxHashes.push(claimHash);
           }
           log("close", `Step 1 OK (claim only): ${claimTxHashes.join(", ")}`);
@@ -1820,7 +1840,7 @@ export async function closePosition({ position_address, reason }) {
       });
 
       for (const tx of Array.isArray(closeTx) ? closeTx : [closeTx]) {
-        const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet]);
+        const txHash = await simulateThenSendAndConfirmTransaction(getConnection(), tx, [wallet]);
         closeTxHashes.push(txHash);
       }
     } else {
@@ -1829,7 +1849,7 @@ export async function closePosition({ position_address, reason }) {
         owner: wallet.publicKey,
         position: { publicKey: positionPubKey },
       });
-      const txHash = await sendAndConfirmTransaction(getConnection(), closeTx, [wallet]);
+      const txHash = await simulateThenSendAndConfirmTransaction(getConnection(), closeTx, [wallet]);
       closeTxHashes.push(txHash);
     }
     const txHashes = [...claimTxHashes, ...closeTxHashes];

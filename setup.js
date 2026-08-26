@@ -652,6 +652,9 @@ const envMap = {
   ...(isKept(telegramToken) ? {} : { TELEGRAM_BOT_TOKEN: telegramToken }),
   ...(telegramChatId        ? { TELEGRAM_CHAT_ID: telegramChatId } : {}),
   DRY_RUN: dryRun ? "true" : "false",
+  // Setup never grants live transaction permission by itself. The operator
+  // must manually acknowledge the reviewed mainnet limits afterwards.
+  LIVE_TRADING_ENABLED: "false",
 };
 fs.writeFileSync(ENV_PATH, buildEnv(envMap));
 
@@ -672,6 +675,7 @@ const userConfig = {
   positionSizePct,
   gasReserve,
   maxDeployAmount,
+  maxDailyDeploySol: existingConfig.maxDailyDeploySol ?? 0.5,
   // Screening filters
   timeframe,
   category,
@@ -722,6 +726,7 @@ const userConfig = {
   // Modes
   dryRun,
   solMode,
+  allowAgentConfigMutation: existingConfig.allowAgentConfigMutation ?? false,
 };
 
 // Remove legacy keys if present
@@ -741,7 +746,8 @@ console.log(`
 ╚═══════════════════════════════════════════════╝
 
   Preset:       ${presetName}
-  Dry run:      ${dryRun ? "YES — no real transactions" : "NO — live trading"}
+  Dry run:      ${dryRun ? "YES — no real transactions" : "NO — mainnet requested"}
+  Execution:    ${dryRun ? "LOCKED by dry run" : "LOCKED — requires explicit mainnet acknowledgement"}
   SOL mode:     ${solMode ? "YES" : "NO"}
 
   Strategy:     ${strategy}
@@ -777,5 +783,7 @@ console.log(`
   Config:       ${CONFIG_PATH}
 
 Run "npm start" to launch the agent.
-${dryRun ? '\n  ⚠ DRY RUN is ON — set dryRun: false in user-config.json when ready for live trading.\n' : ""}
+${dryRun
+  ? "\n  ⚠ DRY RUN is ON — set DRY_RUN=false and LIVE_TRADING_ENABLED=true in .env only after reviewing your limits.\n"
+  : "\n  ⚠ Mainnet execution remains locked. Review the generated config, then set LIVE_TRADING_ENABLED=true in .env to acknowledge it.\n"}
 `);

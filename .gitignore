@@ -24,6 +24,7 @@ pool-memory.json
 token-blacklist.json
 strategy-library.json
 decision-log.json
+execution-budget.json
 hivemind-cache.json
 signal-weights.json
 

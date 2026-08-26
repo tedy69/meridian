@@ -48,9 +48,11 @@ if (isMain) {
   if (path.resolve(process.cwd()) !== path.resolve(REPO_ROOT)) {
     log("startup_warn", `process.cwd() differs from repo root — use "npm run pm2:start" (not "pm2 start index.js" from another directory)`);
   }
-  log("startup", `Mode: ${process.env.DRY_RUN === "true" ? "DRY RUN" : "LIVE"}`);
+  const dryRun = process.env.DRY_RUN === "true";
+  const liveTradingEnabled = !dryRun && process.env.LIVE_TRADING_ENABLED === "true";
+  log("startup", `Mode: ${dryRun ? "DRY RUN" : liveTradingEnabled ? "LIVE" : "LIVE CONFIGURATION — EXECUTION LOCKED"}`);
   log("startup", `Model: ${process.env.LLM_MODEL || "hermes-3-405b"}`);
-  ensureAgentId();
+  if (isHiveMindEnabled()) ensureAgentId();
   bootstrapHiveMind().catch((error) => log("hivemind_warn", `Bootstrap failed: ${error.message}`));
   startHiveMindBackgroundSync();
 }
@@ -990,6 +992,7 @@ function formatWalletStatus(wallet, positions) {
     `Open positions: ${positions.total_positions}/${config.risk.maxPositions}`,
     `Next deploy amount: ${deployAmount} SOL`,
     `Dry run: ${process.env.DRY_RUN === "true" ? "yes" : "no"}`,
+    `Mainnet execution: ${process.env.DRY_RUN !== "true" && process.env.LIVE_TRADING_ENABLED === "true" ? "enabled" : "locked"}`,
     `HiveMind: ${hive}`,
   ].join("\n");
 }

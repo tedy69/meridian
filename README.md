@@ -77,7 +77,7 @@ The wizard writes **both** files at the repo root:
 |---|---|
 | `WALLET_PRIVATE_KEY`, `OPENROUTER_API_KEY`, `RPC_URL`, `HELIUS_API_KEY` | Risk preset, deploy size, max positions |
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `TELEGRAM_ALLOWED_USER_IDS` | Strategy, screening filters, exit rules, trailing TP |
-| `DRY_RUN` | Position sizing, cycle intervals, per-role LLM models, `solMode` |
+| `DRY_RUN`, `LIVE_TRADING_ENABLED` | Position sizing, cycle intervals, per-role LLM models, `solMode` |
 
 `TELEGRAM_CHAT_ID` only needs to live in `.env` — setup also copies it to `user-config.json` when provided. Takes about 2 minutes.
 
@@ -92,7 +92,8 @@ OPENROUTER_API_KEY=sk-or-...
 HELIUS_API_KEY=your_helius_key          # for wallet balance lookups
 TELEGRAM_BOT_TOKEN=123456:ABC...        # optional — for notifications + chat
 TELEGRAM_CHAT_ID=                       # auto-filled on first message
-DRY_RUN=true                            # set false for live trading
+DRY_RUN=true                            # leave true while reviewing behavior
+LIVE_TRADING_ENABLED=false              # set true only together with DRY_RUN=false for mainnet
 ```
 
 > Never put your private key or API keys in `user-config.json` — use `.env` only. Both files are gitignored.
@@ -119,8 +120,17 @@ See [Config reference](#config-reference) below.
 
 ```bash
 npm run dev    # dry run — no on-chain transactions
-npm start      # live mode
+npm start      # starts the agent; execution still requires both live flags below
 ```
+
+For mainnet execution, both flags must be explicit after you review `user-config.json`:
+
+```env
+DRY_RUN=false
+LIVE_TRADING_ENABLED=true
+```
+
+The default limits are deliberately conservative: one position, 0.5 SOL maximum per position, and 0.5 SOL maximum deploy attempts per UTC day. Set `maxPositions`, `maxDeployAmount`, and `maxDailyDeploySol` yourself only after deciding the maximum loss you accept. The agent cannot change those execution limits through an LLM tool.
 
 On startup Meridian fetches your wallet balance, open positions, and top pool candidates, then begins autonomous cycles immediately.
 
@@ -495,7 +505,9 @@ All fields are optional — defaults shown. Edit `user-config.json`.
 |---|---|---|
 | `deployAmountSol` | `0.5` | Base SOL per new position |
 | `positionSizePct` | `0.35` | Fraction of deployable balance to use |
-| `maxDeployAmount` | `50` | Maximum SOL cap per position |
+| `maxPositions` | `1` | Maximum simultaneously open positions |
+| `maxDeployAmount` | `0.5` | Maximum SOL cap per position |
+| `maxDailyDeploySol` | `0.5` | Maximum deploy attempts per UTC day; uncertain attempts remain counted |
 | `gasReserve` | `0.2` | Minimum SOL to keep for gas |
 | `minSolToOpen` | `0.55` | Minimum wallet SOL before opening |
 | `outOfRangeWaitMinutes` | `30` | Minutes OOR before acting |
@@ -525,14 +537,14 @@ All fields are optional — defaults shown. Edit `user-config.json`.
 
 ### Jupiter swap fee (referral)
 
-Every token swap the agent makes (auto-swap base→SOL after a close/claim, manual `swap_token`) goes through **Jupiter Ultra**. Jupiter's referral program lets a referral wallet collect a small fee, expressed in **basis points (bps)** — `1 bps = 0.01%`, so `50 bps = 0.5%`. Meridian ships with this enabled by default.
+Every token swap the agent makes (auto-swap base→SOL after a close/claim) goes through **Jupiter Ultra**. Autonomous swaps are deliberately restricted to selling a position token back to SOL; the agent cannot spend SOL buying an arbitrary token from model-provided input. Referral fees are disabled by default.
 
 **Settings** (env only — *not* in `user-config.json`):
 
 | Env var | Default | Description |
 |---|---|---|
-| `JUPITER_REFERRAL_ACCOUNT` | built-in account | A **Jupiter referral account** (not just any wallet). Create one on the Jupiter referral dashboard (`referral.jup.ag`) — it generates a referral account and the per-token fee accounts that actually collect the fee. Paste that referral account address here to collect the fee yourself. |
-| `JUPITER_REFERRAL_FEE_BPS` | `50` | Fee in basis points. **Jupiter Ultra requires 50–255 bps** — values outside that range (or `0`) are ignored and the swap runs with no referral fee. |
+| `JUPITER_REFERRAL_ACCOUNT` | empty | A **Jupiter referral account** (not just any wallet). Set only if you intentionally want to collect referral fees yourself. |
+| `JUPITER_REFERRAL_FEE_BPS` | `0` | Fee in basis points. **Jupiter Ultra requires 50–255 bps**; `0` leaves referrals off. |
 
 ```bash
 # .env — collect the referral fee on your own Jupiter referral account
@@ -540,11 +552,7 @@ JUPITER_REFERRAL_ACCOUNT=<your-jupiter-referral-account>
 JUPITER_REFERRAL_FEE_BPS=50
 ```
 
-**To turn the referral off**, just remove/blank it — set `JUPITER_REFERRAL_ACCOUNT=` (empty) **or** `JUPITER_REFERRAL_FEE_BPS=0`. Either one drops the referral and the swap proceeds at Jupiter's normal rate. The referral is also silently dropped if the fee is below `50`, above `255`, or the account isn't a valid Solana address (`tools/wallet.js#getJupiterReferralParams`). **`50` is the minimum Jupiter allows and the Meridian default.**
-
-> If you leave the referral enabled on the **built-in default account**, the fee goes toward **Meridian server maintenance** (HiveMind, Agent Meridian API, hosting). Override `JUPITER_REFERRAL_ACCOUNT` with your own Jupiter referral account to collect it yourself instead, or disable it entirely as above. Either way, on new tokens (<24h) it's the same 0.5% Jupiter charges regardless — so leaving the default on costs you nothing extra there.
-
-> **Why 50 bps is effectively free on new tokens.** Jupiter's own platform fee already varies by pair — and for **new tokens (within 24h of token age) Jupiter charges 50 bps (0.5%)** on its UI regardless. So on those tokens the swap costs the same 0.5% **whether or not you attach a referral** — adding the referral just redirects that fee to your wallet instead of leaving it at Jupiter's default. (Jupiter's full platform-fee schedule: `0` bps buying Jupiter tokens / pegged LST-LST & stable-stable, `2` SOL-stable, `5` LST-stable, `10` everything else, `50` new tokens <24h.)
+To collect a referral intentionally, configure both values yourself. Invalid accounts or fees outside 50–255 bps are ignored and the swap proceeds without a referral.
 
 ---
 
@@ -572,7 +580,7 @@ This analyzes closed position performance (win rate, avg PnL, fee yields) and au
 
 ## HiveMind
 
-HiveMind sync uses Agent Meridian at `https://api.agentmeridian.xyz` by default with the built-in public key. Agents can register, pull shared lessons/presets, and push learning events without a separate registration flow.
+HiveMind is opt-in. Configure both a URL and API key if you want the agent to register, pull shared lessons/presets, and push learning events.
 
 **What you get:**
 - Shared lessons from other Meridian agents
@@ -589,9 +597,7 @@ HiveMind failures are non-blocking. If Agent Meridian is unavailable, the agent 
 
 ### Setup
 
-No manual HiveMind registration command is required for the shared Agent Meridian setup. `agentId` is generated automatically on startup if it is missing.
-
-To use a private HiveMind API key, check the Telegram announcement channel and set it as `hiveMindApiKey`.
+No manual HiveMind registration command is required after you configure a trusted endpoint. `agentId` is generated automatically on first enabled startup if it is missing.
 
 Relevant config fields:
 
@@ -604,11 +610,7 @@ Relevant config fields:
 }
 ```
 
-Blank `hiveMindUrl` and `hiveMindApiKey` values intentionally fall back to the Agent Meridian defaults. Set `hiveMindPullMode` to `manual` if you do not want shared lessons and presets pulled automatically.
-
-### Disable
-
-There is currently no empty-string disable path for HiveMind; blank values fall back to the built-in Agent Meridian defaults. A true off switch should be implemented as an explicit config flag before documenting HiveMind as disabled by clearing fields.
+Leave either `hiveMindUrl` or `hiveMindApiKey` blank to keep HiveMind disabled. Set `hiveMindPullMode` to `manual` if you only want to pull shared lessons and presets on demand.
 
 ---
 

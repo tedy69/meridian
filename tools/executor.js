@@ -9,7 +9,7 @@ import {
   closePosition,
   searchPools,
 } from "./dlmm.js";
-import { getWalletBalances, swapToken } from "./wallet.js";
+import { getWalletBalances, normalizeMint, swapToken } from "./wallet.js";
 import { studyTopLPers } from "./study.js";
 import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
 import { setPositionInstruction } from "../state.js";
@@ -26,6 +26,15 @@ import fs from "fs";
 import { execSync, spawn } from "child_process";
 import { REPO_ROOT, repoPath } from "../repo-root.js";
 import { normalizeTimeframe, scaleScreeningToTimeframe } from "../screening-scales.js";
+import {
+  assertAutonomousSwapAllowed,
+  assertLiveTradingEnabled,
+  isDryRun,
+} from "../execution-guard.js";
+import {
+  commitDailyDeployReservation,
+  reserveDailyDeploy,
+} from "../execution-budget.js";
 
 const USER_CONFIG_PATH = repoPath("user-config.json");
 const POOL_DISCOVERY_BASE = "https://pool-discovery-api.datapi.meteora.ag";
@@ -341,6 +350,15 @@ const toolMap = {
     return { error: "invalid mode" };
   },
   update_config: ({ changes, reason = "" }) => {
+    if (!config.security.allowAgentConfigMutation) {
+      return {
+        success: false,
+        blocked: true,
+        error: "Agent configuration mutation is disabled. Edit user-config.json manually after review.",
+        reason,
+      };
+    }
+
     // Flat key → config section mapping (covers everything in config.js)
     const CONFIG_MAP = {
       // screening
@@ -593,6 +611,38 @@ const WRITE_TOOLS = new Set([
 const PROTECTED_TOOLS = new Set([
   ...WRITE_TOOLS,
   "self_update",
+  "update_config",
+]);
+
+const MANUAL_ONLY_CONFIG_KEYS = new Set([
+  "maxPositions",
+  "maxDeployAmount",
+  "maxDailyDeploySol",
+  "minClaimAmount",
+  "autoSwapAfterClaim",
+  "autoSwapRetryAttempts",
+  "autoSwapRetryDelayMs",
+  "outOfRangeBinsToClose",
+  "outOfRangeWaitMinutes",
+  "oorCooldownTriggerCount",
+  "oorCooldownHours",
+  "repeatDeployCooldownEnabled",
+  "repeatDeployCooldownTriggerCount",
+  "repeatDeployCooldownHours",
+  "repeatDeployCooldownScope",
+  "repeatDeployCooldownMinFeeEarnedPct",
+  "minVolumeToRebalance",
+  "stopLossPct",
+  "takeProfitPct",
+  "takeProfitFeePct",
+  "trailingTakeProfit",
+  "trailingTriggerPct",
+  "trailingDropPct",
+  "pnlSanityMaxDiffPct",
+  "minSolToOpen",
+  "deployAmountSol",
+  "gasReserve",
+  "positionSizePct",
 ]);
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -636,6 +686,7 @@ async function swapBaseToSolWithRetry(baseMint, label) {
  */
 export async function executeTool(name, args) {
   const startTime = Date.now();
+  let deployBudgetReservation = null;
 
   // Strip model artifacts like "<|channel|>commentary" appended to tool names
   name = name.replace(/<.*$/, "").trim();
@@ -646,6 +697,15 @@ export async function executeTool(name, args) {
     const error = `Unknown tool: ${name}`;
     log("error", error);
     return { error };
+  }
+
+  if (WRITE_TOOLS.has(name) && !isDryRun()) {
+    try {
+      assertLiveTradingEnabled(name);
+    } catch (error) {
+      log("safety_block", `${name} blocked: ${error.message}`);
+      return { blocked: true, reason: error.message };
+    }
   }
 
   // ─── Pre-execution safety checks ──────────
@@ -660,9 +720,37 @@ export async function executeTool(name, args) {
     }
   }
 
+  if (name === "deploy_position" && !isDryRun()) {
+    try {
+      const amountSol = Number(args?.amount_y ?? args?.amount_sol ?? 0);
+      deployBudgetReservation = reserveDailyDeploy({
+        amountSol,
+        maxDailyDeploySol: config.risk.maxDailyDeploySol,
+      });
+      log(
+        "budget",
+        `Reserved ${amountSol} SOL of ${config.risk.maxDailyDeploySol} SOL daily deploy cap (${deployBudgetReservation.usedSol.toFixed(6)} SOL used/reserved).`,
+      );
+    } catch (error) {
+      log("safety_block", `deploy_position blocked: ${error.message}`);
+      return { blocked: true, reason: error.message };
+    }
+  }
+
   // ─── Execute ──────────────────────────────
   try {
     const result = await fn(args);
+    if (deployBudgetReservation) {
+      try {
+        const committed = commitDailyDeployReservation(deployBudgetReservation);
+        log(
+          "budget",
+          `Counted ${deployBudgetReservation.amountSol} SOL against today's deploy cap (${committed.usedSol.toFixed(6)} SOL used).`,
+        );
+      } catch (budgetError) {
+        log("budget_error", `Could not finalize deploy budget reservation; it remains fail-closed: ${budgetError.message}`);
+      }
+    }
     const duration = Date.now() - startTime;
     const success = result?.success !== false && !result?.error;
 
@@ -703,6 +791,17 @@ export async function executeTool(name, args) {
 
     return result;
   } catch (error) {
+    if (deployBudgetReservation) {
+      try {
+        const committed = commitDailyDeployReservation(deployBudgetReservation);
+        log(
+          "budget_warn",
+          `Deploy ended with an error; conservatively counted ${deployBudgetReservation.amountSol} SOL against today's cap (${committed.usedSol.toFixed(6)} SOL used).`,
+        );
+      } catch (budgetError) {
+        log("budget_error", `Could not finalize uncertain deploy budget reservation; it remains fail-closed: ${budgetError.message}`);
+      }
+    }
     const duration = Date.now() - startTime;
 
     logAction({
@@ -871,8 +970,33 @@ async function runSafetyChecks(name, args) {
     }
 
     case "swap_token": {
-      // Basic check — prevent swapping when DRY_RUN is true
-      // (handled inside swapToken itself, but belt-and-suspenders)
+      try {
+        assertAutonomousSwapAllowed({
+          inputMint: normalizeMint(args?.input_mint),
+          outputMint: normalizeMint(args?.output_mint),
+          amount: args?.amount,
+        });
+      } catch (error) {
+        return { pass: false, reason: error.message };
+      }
+      return { pass: true };
+    }
+
+    case "update_config": {
+      if (!config.security.allowAgentConfigMutation) {
+        return {
+          pass: false,
+          reason: "Agent configuration mutation is disabled. Edit user-config.json manually after review.",
+        };
+      }
+      const requestedKeys = Object.keys(args?.changes || {});
+      const manualOnly = requestedKeys.filter((key) => MANUAL_ONLY_CONFIG_KEYS.has(key));
+      if (manualOnly.length > 0) {
+        return {
+          pass: false,
+          reason: `Risk and execution settings are manual-only: ${manualOnly.join(", ")}.`,
+        };
+      }
       return { pass: true };
     }
 

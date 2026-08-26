@@ -8,6 +8,12 @@ import {
 import bs58 from "bs58";
 import { log } from "../logger.js";
 import { config } from "../config.js";
+import {
+  assertAutonomousSwapAllowed,
+  assertLiveTradingEnabled,
+  isDryRun,
+  SOL_MINT,
+} from "../execution-guard.js";
 
 let _connection = null;
 let _wallet = null;
@@ -27,10 +33,8 @@ function getWallet() {
 
 const JUPITER_PRICE_API = "https://api.jup.ag/price/v3";
 const JUPITER_SWAP_V2_API = "https://api.jup.ag/swap/v2";
-const DEFAULT_JUPITER_API_KEY = "b15d42e9-e0e4-4f90-a424-ae41ceeaa382";
-
 function getJupiterApiKey() {
-  return config.jupiter.apiKey || process.env.JUPITER_API_KEY || DEFAULT_JUPITER_API_KEY;
+  return config.jupiter.apiKey || process.env.JUPITER_API_KEY || "";
 }
 
 function getJupiterReferralParams() {
@@ -50,6 +54,21 @@ function getJupiterReferralParams() {
     return null;
   }
   return { referralAccount, referralFee: Math.round(referralFee) };
+}
+
+async function simulateJupiterTransaction(connection, transaction) {
+  const simulation = await connection.simulateTransaction(transaction, {
+    sigVerify: true,
+    commitment: "confirmed",
+  });
+  if (simulation.value.err) {
+    const logs = Array.isArray(simulation.value.logs)
+      ? simulation.value.logs.slice(-12).join(" | ")
+      : "no simulation logs";
+    throw new Error(
+      `Jupiter swap simulation failed: ${JSON.stringify(simulation.value.err)} (${logs})`,
+    );
+  }
 }
 
 /**
@@ -125,12 +144,9 @@ export async function getWalletBalances() {
 /**
  * Swap tokens via Jupiter Swap API V2 (order → sign → execute).
  */
-const SOL_MINT = "So11111111111111111111111111111111111111112";
-
 // Normalize any SOL-like address to the correct wrapped SOL mint
 export function normalizeMint(mint) {
   if (!mint) return mint;
-  const SOL_MINT = "So11111111111111111111111111111111111111112";
   if (
     mint === "SOL" || 
     mint === "native" || 
@@ -149,17 +165,24 @@ export async function swapToken({
 }) {
   input_mint  = normalizeMint(input_mint);
   output_mint = normalizeMint(output_mint);
+  const numericAmount = assertAutonomousSwapAllowed({
+    inputMint: input_mint,
+    outputMint: output_mint,
+    amount,
+  });
 
-  if (process.env.DRY_RUN === "true") {
+  if (isDryRun()) {
     return {
       dry_run: true,
-      would_swap: { input_mint, output_mint, amount },
+      would_swap: { input_mint, output_mint, amount: numericAmount },
       message: "DRY RUN — no transaction sent",
     };
   }
 
+  assertLiveTradingEnabled("swap_token");
+
   try {
-    log("swap", `${amount} of ${input_mint} → ${output_mint}`);
+    log("swap", `${numericAmount} of ${input_mint} → ${output_mint}`);
     const wallet = getWallet();
     const connection = getConnection();
 
@@ -169,7 +192,7 @@ export async function swapToken({
       const mintInfo = await connection.getParsedAccountInfo(new PublicKey(input_mint));
       decimals = mintInfo.value?.data?.parsed?.info?.decimals ?? 9;
     }
-    const amountStr = Math.floor(amount * Math.pow(10, decimals)).toString();
+    const amountStr = Math.floor(numericAmount * Math.pow(10, decimals)).toString();
 
     // ─── Get Swap V2 order (unsigned tx + requestId) ───────────
     const search = new URLSearchParams({
@@ -204,6 +227,7 @@ export async function swapToken({
     // ─── Deserialize and sign ─────────────────────────────────
     const tx = VersionedTransaction.deserialize(Buffer.from(unsignedTx, "base64"));
     tx.sign([wallet]);
+    await simulateJupiterTransaction(connection, tx);
     const signedTx = Buffer.from(tx.serialize()).toString("base64");
 
     // ─── Execute ───────────────────────────────────────────────

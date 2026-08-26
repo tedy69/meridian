@@ -7,9 +7,10 @@
   "dryRun": true,
 
   "deployAmountSol": 0.5,
-  "maxPositions": 3,
+  "maxPositions": 1,
   "minSolToOpen": 0.55,
-  "maxDeployAmount": 50,
+  "maxDeployAmount": 0.5,
+  "maxDailyDeploySol": 0.5,
   "gasReserve": 0.2,
   "positionSizePct": 0.35,
 
@@ -72,7 +73,7 @@
   "screeningModel": "minimax/minimax-m2.5",
   "generalModel": "minimax/minimax-m2.7",
 
-  "darwinEnabled": true,
+  "darwinEnabled": false,
   "darwinWindowDays": 60,
   "darwinRecalcEvery": 5,
   "darwinBoost": 1.05,
@@ -108,5 +109,6 @@
   "telegramChatId": "",
   "hiveMindUrl": "",
   "hiveMindApiKey": "",
-  "hiveMindPullMode": "auto"
+  "hiveMindPullMode": "auto",
+  "allowAgentConfigMutation": false
 }

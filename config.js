@@ -5,10 +5,8 @@ import { getScreeningDefaultsForTimeframe, normalizeTimeframe, scaleScreeningToT
 export { REPO_ROOT, repoPath, getScreeningDefaultsForTimeframe, normalizeTimeframe, scaleScreeningToTimeframe, TIMEFRAME_SCREENING_SCALES };
 
 const USER_CONFIG_PATH = repoPath("user-config.json");
-const DEFAULT_HIVEMIND_URL = "https://api.agentmeridian.xyz";
 const DEFAULT_AGENT_MERIDIAN_API_URL = "https://api.agentmeridian.xyz/api";
 const DEFAULT_AGENT_MERIDIAN_PUBLIC_KEY = "bWVyaWRpYW4taXMtdGhlLWJlc3QtYWdlbnRz";
-const DEFAULT_HIVEMIND_API_KEY = DEFAULT_AGENT_MERIDIAN_PUBLIC_KEY;
 
 const u = fs.existsSync(USER_CONFIG_PATH)
   ? JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8"))
@@ -66,8 +64,9 @@ function nonEmptyString(...values) {
 export const config = {
   // ─── Risk Limits ─────────────────────────
   risk: {
-    maxPositions:    u.maxPositions    ?? 3,
-    maxDeployAmount: u.maxDeployAmount ?? 50,
+    maxPositions:    u.maxPositions    ?? 1,
+    maxDeployAmount: u.maxDeployAmount ?? u.deployAmountSol ?? 0.5,
+    maxDailyDeploySol: u.maxDailyDeploySol ?? 0.5,
   },
 
   // ─── Pool Screening Thresholds ───────────
@@ -160,7 +159,7 @@ export const config = {
 
   // ─── Darwinian Signal Weighting ───────
   darwin: {
-    enabled:        u.darwinEnabled     ?? true,
+    enabled:        u.darwinEnabled     ?? false,
     windowDays:     u.darwinWindowDays  ?? 60,
     recalcEvery:    u.darwinRecalcEvery ?? 5,    // recalc every N closes
     boostFactor:    u.darwinBoost       ?? 1.05,
@@ -179,8 +178,8 @@ export const config = {
 
   // ─── HiveMind ─────────────────────────
   hiveMind: {
-    url: nonEmptyString(u.hiveMindUrl, DEFAULT_HIVEMIND_URL),
-    apiKey: nonEmptyString(u.hiveMindApiKey, process.env.HIVEMIND_API_KEY, DEFAULT_HIVEMIND_API_KEY),
+    url: nonEmptyString(u.hiveMindUrl, process.env.HIVEMIND_URL),
+    apiKey: nonEmptyString(u.hiveMindApiKey, process.env.HIVEMIND_API_KEY),
     agentId: u.agentId ?? null,
     pullMode: u.hiveMindPullMode ?? "auto",
   },
@@ -241,12 +240,16 @@ export const config = {
   jupiter: {
     // Internal Jupiter Ultra settings; override by env only, do not expose in user-config.
     apiKey: process.env.JUPITER_API_KEY ?? "",
-    referralAccount:
-      process.env.JUPITER_REFERRAL_ACCOUNT ??
-      "9MzhDUnq3KxecyPzvhguQMMPbooXQ3VAoCMPDnoijwey",
+    referralAccount: process.env.JUPITER_REFERRAL_ACCOUNT ?? "",
     referralFeeBps: Number(
-      process.env.JUPITER_REFERRAL_FEE_BPS ?? 50,
+      process.env.JUPITER_REFERRAL_FEE_BPS ?? 0,
     ),
+  },
+
+  // LLM-originated configuration changes are disabled until explicitly opted in.
+  // Risk and execution limits remain manual-only even when this is enabled.
+  security: {
+    allowAgentConfigMutation: u.allowAgentConfigMutation === true,
   },
 
   indicators: {
