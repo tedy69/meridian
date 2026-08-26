@@ -1,4 +1,7 @@
 export const SOL_MINT = "So11111111111111111111111111111111111111112";
+export const SOLANA_MAINNET_GENESIS_HASH = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
+
+const mainnetRpcChecks = new WeakMap();
 
 function isTrue(value) {
   return String(value || "").trim().toLowerCase() === "true";
@@ -20,6 +23,69 @@ export function assertLiveTradingEnabled(operation, env = process.env) {
   throw new Error(
     `${operation} blocked: set LIVE_TRADING_ENABLED=true only after reviewing your mainnet risk limits.`,
   );
+}
+
+/**
+ * Fail closed unless the configured RPC proves that it serves Solana mainnet.
+ * Endpoint hostnames are not chain identities. Cache only successful checks
+ * per connection so a repaired RPC is always checked again after a failure.
+ */
+export async function assertMainnetRpc(connection, operation) {
+  if (!connection || typeof connection.getGenesisHash !== "function") {
+    throw new Error(`${operation} blocked: Solana mainnet RPC verification is unavailable.`);
+  }
+
+  let check = mainnetRpcChecks.get(connection);
+  if (!check) {
+    check = Promise.resolve().then(async () => {
+      let genesisHash;
+      try {
+        genesisHash = await connection.getGenesisHash();
+      } catch {
+        throw new Error(`${operation} blocked: Solana mainnet RPC verification failed.`);
+      }
+      if (genesisHash !== SOLANA_MAINNET_GENESIS_HASH) {
+        throw new Error(`${operation} blocked: Solana mainnet RPC verification failed.`);
+      }
+    });
+    mainnetRpcChecks.set(connection, check);
+  }
+
+  try {
+    await check;
+  } catch (error) {
+    mainnetRpcChecks.delete(connection);
+    throw error;
+  }
+}
+
+/**
+ * Guard the last irreversible step in every transaction path. Callers must
+ * use this immediately before simulation/signing/submission so a process
+ * cannot submit a transaction if DRY_RUN changes after an earlier preflight.
+ */
+export function assertOnChainWriteAllowed(operation, env = process.env) {
+  if (isDryRun(env)) {
+    throw new Error(`${operation} blocked: DRY_RUN=true; on-chain submission is disabled.`);
+  }
+  assertLiveTradingEnabled(operation, env);
+}
+
+/**
+ * A confirmed close is not economically settled until its base token has
+ * either been converted to SOL or verified absent. Fail closed in live mode
+ * when that state cannot be determined.
+ */
+export function assertNoPendingCloseSettlement(pendingSettlements, env = process.env) {
+  if (isDryRun(env)) return;
+  if (!Array.isArray(pendingSettlements)) {
+    throw new Error("Cannot verify confirmed-close settlements; refusing to open a new position.");
+  }
+  if (pendingSettlements.length > 0) {
+    throw new Error(
+      `Cannot open a new position while ${pendingSettlements.length} confirmed-close settlement(s) still await base→SOL conversion.`,
+    );
+  }
 }
 
 /**

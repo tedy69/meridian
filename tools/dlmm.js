@@ -33,7 +33,7 @@ import { appendDecision } from "../decision-log.js";
 import { agentMeridianJson, getAgentIdForRequests, getAgentMeridianHeaders } from "./agent-meridian.js";
 import { getAndClearStagedSignals } from "../signal-tracker.js";
 import { computePositions, fetchDlmmPnlForPool } from "./pnl.js";
-import { assertLiveTradingEnabled, isDryRun } from "../execution-guard.js";
+import { assertLiveTradingEnabled, assertMainnetRpc, assertOnChainWriteAllowed, isDryRun } from "../execution-guard.js";
 import { evaluateCloseProof } from "../close-settlement.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
@@ -103,7 +103,9 @@ function getWallet() {
   return _wallet;
 }
 
-async function simulateThenSendAndConfirmTransaction(connection, transaction, signers) {
+export async function simulateThenSendAndConfirmTransaction(connection, transaction, signers) {
+  assertOnChainWriteAllowed("DLMM transaction submission");
+  await assertMainnetRpc(connection, "DLMM transaction submission");
   const simulation = await connection.simulateTransaction(transaction, signers);
   if (simulation.value.err) {
     const logs = Array.isArray(simulation.value.logs)
@@ -354,6 +356,10 @@ async function signAndSimulateRelayTransactions(serializedTxs, wallet, {
   maxSolLoss = 0.05,
   requiredStaticAccounts = [],
 } = {}) {
+  assertOnChainWriteAllowed(`Relay ${label || "transaction"}`);
+  const connection = getConnection();
+  await assertMainnetRpc(connection, `Relay ${label || "transaction"}`);
+
   const signed = [];
   const owner = wallet.publicKey.toString();
   const allowedMints = new Set(allowedDebitMints.filter(Boolean).map(String));
@@ -373,7 +379,7 @@ async function signAndSimulateRelayTransactions(serializedTxs, wallet, {
     }
 
     const ownerIndex = staticKeys.indexOf(owner);
-    const simulation = await getConnection().simulateTransaction(tx, {
+    const simulation = await connection.simulateTransaction(tx, {
       sigVerify: false,
       replaceRecentBlockhash: false,
     });
@@ -554,8 +560,13 @@ async function getPool(poolAddress) {
   return poolCache.get(key);
 }
 
-setInterval(() => poolCache.clear(), 5 * 60 * 1000);
-setInterval(() => poolMetadataCache.clear(), 15 * 60 * 1000);
+const poolCacheCleanupTimer = setInterval(() => poolCache.clear(), 5 * 60 * 1000);
+const poolMetadataCleanupTimer = setInterval(() => poolMetadataCache.clear(), 15 * 60 * 1000);
+
+// Cache eviction is best-effort housekeeping. It must not keep a CLI or test
+// process alive after all meaningful work has completed.
+poolCacheCleanupTimer.unref?.();
+poolMetadataCleanupTimer.unref?.();
 
 async function getPoolMetadata(poolAddress) {
   const key = String(poolAddress);
@@ -818,8 +829,12 @@ export async function deployPosition({
       }
       assertNoInitializeBinArrayInstructions(addLiquidityUnsigned);
 
+      assertOnChainWriteAllowed("deploy_position");
+      await assertMainnetRpc(getConnection(), "deploy_position");
       const addLiquidity = signSerializedTransactions(addLiquidityUnsigned, wallet);
       const swap = signSerializedTransactions(swapUnsigned, wallet);
+      assertOnChainWriteAllowed("deploy_position");
+      await assertMainnetRpc(getConnection(), "deploy_position");
       const submit = await agentMeridianJson("/execution/zap-in/submit", {
         method: "POST",
         headers: getAgentMeridianHeaders({ json: true }),
@@ -1723,6 +1738,8 @@ export async function closePosition({ position_address, reason, skip_swap = fals
       });
 
       relaySubmitted = true;
+      assertOnChainWriteAllowed("close_position");
+      await assertMainnetRpc(getConnection(), "close_position");
       const submit = await agentMeridianJson("/execution/zap-out/submit", {
         method: "POST",
         headers: getAgentMeridianHeaders({ json: true }),

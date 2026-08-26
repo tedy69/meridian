@@ -11,6 +11,8 @@ import { config } from "../config.js";
 import {
   assertAutonomousSwapAllowed,
   assertLiveTradingEnabled,
+  assertMainnetRpc,
+  assertOnChainWriteAllowed,
   isDryRun,
   SOL_MINT,
 } from "../execution-guard.js";
@@ -293,12 +295,16 @@ export async function swapToken({
     const { transaction: unsignedTx, requestId } = order;
 
     // ─── Deserialize and sign ─────────────────────────────────
+    assertOnChainWriteAllowed("swap_token");
+    await assertMainnetRpc(connection, "swap_token");
     const tx = VersionedTransaction.deserialize(Buffer.from(unsignedTx, "base64"));
     tx.sign([wallet]);
     await simulateJupiterTransaction(connection, tx);
     const signedTx = Buffer.from(tx.serialize()).toString("base64");
 
     // ─── Execute ───────────────────────────────────────────────
+    assertOnChainWriteAllowed("swap_token");
+    await assertMainnetRpc(connection, "swap_token");
     const execRes = await fetch(`${JUPITER_SWAP_V2_API}/execute`, {
       method: "POST",
       headers: {

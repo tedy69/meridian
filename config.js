@@ -1,8 +1,11 @@
 import fs from "fs";
 import { REPO_ROOT, repoPath } from "./repo-root.js";
 import { getScreeningDefaultsForTimeframe, normalizeTimeframe, scaleScreeningToTimeframe, TIMEFRAME_SCREENING_SCALES } from "./screening-scales.js";
+import { assertNoVulnerableBigintBufferNativeBinding } from "./scripts/dependency-safety.js";
 
 export { REPO_ROOT, repoPath, getScreeningDefaultsForTimeframe, normalizeTimeframe, scaleScreeningToTimeframe, TIMEFRAME_SCREENING_SCALES };
+
+assertNoVulnerableBigintBufferNativeBinding();
 
 const USER_CONFIG_PATH = repoPath("user-config.json");
 const DEFAULT_AGENT_MERIDIAN_API_URL = "https://api.agentmeridian.xyz/api";

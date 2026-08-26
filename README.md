@@ -62,8 +62,13 @@ Agents are powered via **OpenRouter** and can be swapped for any compatible mode
 ```bash
 git clone https://github.com/yunus-0x/meridian
 cd meridian
-npm install
+npm ci --ignore-scripts
+npm run postinstall
 ```
+
+The committed `.npmrc` also disables dependency lifecycle scripts by default.
+Run the reviewed root postinstall explicitly as shown above; do not use a
+plain `npm install` for production.
 
 ### 2. Run the setup wizard
 
@@ -139,7 +144,8 @@ On startup Meridian fetches your wallet balance, open positions, and top pool ca
 PM2 is the recommended way to keep Telegram control online on a VPS. **Always start via the ecosystem file** so the working directory and script path stay pinned to the repo:
 
 ```bash
-npm install
+npm ci --ignore-scripts
+npm run postinstall
 npm run pm2:start    # uses ecosystem.config.cjs — do NOT use "pm2 start index.js"
 pm2 save
 ```
@@ -154,8 +160,9 @@ npm run pm2:logs
 To update an existing PM2 install:
 
 ```bash
-git pull
-npm install
+git pull --ff-only
+npm ci --ignore-scripts
+npm run postinstall
 npm run pm2:restart
 pm2 save
 ```
@@ -183,7 +190,7 @@ On startup, logs show `Repo: ... | cwd: ... | PM2 id: ...`. **Repo and cwd must 
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| Crash loop after `git pull` | `npm install` skipped | `npm install && npm run pm2:restart` |
+| Crash loop after `git pull` | Safe dependency install skipped | Run `npm ci --ignore-scripts`, `npm run postinstall`, then `npm run pm2:restart` |
 | Missing wallet / API keys | Started with `pm2 start index.js` from wrong directory | `pm2 delete meridian && npm run pm2:start` |
 | `.env` changes ignored | Old PM2 env snapshot | `npm run pm2:restart` (`.env` now overrides stale PM2 env) |
 | Telegram `401 Unauthorized` | Invalid `TELEGRAM_BOT_TOKEN` (not chat ID) | Fix token in `.env`; if encrypted, ensure `.envrypt` exists |
@@ -680,3 +687,16 @@ discord-listener/
 This software is provided as-is, with no warranty. Running an autonomous trading agent carries real financial risk — you can lose funds. Always start with `DRY_RUN=true` to verify behavior before going live. Never deploy more capital than you can afford to lose. This is not financial advice.
 
 The authors are not responsible for any losses incurred through use of this software.
+
+### Docker deployment
+
+The production Compose service exposes no ports and runs as a non-root Node user. Build contexts exclude `.env`, `user-config.json`, and all runtime state; provision those files directly on the host with mode `0600`, never through Git.
+
+For a host-mounted deployment, create the `node_modules` symlink once before the first start:
+
+```sh
+ln -s /opt/meridian-node_modules /opt/meridian/node_modules
+docker compose up -d --build
+```
+
+The process verifies the Solana mainnet genesis hash before it starts cron cycles or Telegram long polling. It repeats that check immediately before every simulation, signing, relay submission, or Jupiter execution. A non-mainnet or unverifiable endpoint leaves the process fail-closed.

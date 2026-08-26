@@ -35,6 +35,7 @@ import { normalizeTimeframe, scaleScreeningToTimeframe } from "../screening-scal
 import {
   assertAutonomousSwapAllowed,
   assertLiveTradingEnabled,
+  assertNoPendingCloseSettlement,
   isDryRun,
 } from "../execution-guard.js";
 import { evaluateAutoSwapBalance } from "../close-settlement.js";
@@ -1006,14 +1007,16 @@ export async function executeTool(name, args) {
 /**
  * Run safety checks before executing write operations.
  */
-async function runSafetyChecks(name, args) {
+export async function runSafetyChecks(name, args) {
   switch (name) {
     case "deploy_position": {
       const pendingAutoSwaps = getPendingAutoSwaps();
-      if (!isDryRun() && pendingAutoSwaps.length > 0) {
+      try {
+        assertNoPendingCloseSettlement(pendingAutoSwaps);
+      } catch (error) {
         return {
           pass: false,
-          reason: `Cannot open a new position while ${pendingAutoSwaps.length} confirmed-close settlement(s) still await base→SOL conversion.`,
+          reason: error.message,
         };
       }
       const poolThresholds = await validateDeployPoolThresholds(args);

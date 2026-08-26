@@ -3,6 +3,7 @@ import cron from "node-cron";
 import readline from "readline";
 import path from "path";
 import { fileURLToPath } from "url";
+import { Connection } from "@solana/web3.js";
 import { agentLoop } from "./agent.js";
 import { log } from "./logger.js";
 import { getMyPositions, getActiveBin } from "./tools/dlmm.js";
@@ -34,6 +35,7 @@ import { stageSignals } from "./signal-tracker.js";
 import { getWeightsSummary } from "./signal-weights.js";
 import { bootstrapHiveMind, ensureAgentId, getHiveMindPullMode, isHiveMindEnabled, pullHiveMindLessons, pullHiveMindPresets, registerHiveMindAgent, startHiveMindBackgroundSync } from "./hivemind.js";
 import { appendDecision } from "./decision-log.js";
+import { assertMainnetRpc } from "./execution-guard.js";
 
 import { REPO_ROOT, repoPath } from "./repo-root.js";
 
@@ -42,6 +44,7 @@ const indexPath = fileURLToPath(import.meta.url);
 const isMain = process.env.pm_id != null
   || (entrypointPath ? path.resolve(entrypointPath) === indexPath : false);
 
+let runtimeRpcVerified = true;
 if (isMain) {
   log("startup", "DLMM LP Agent starting...");
   log("startup", `Repo: ${REPO_ROOT} | cwd: ${process.cwd()}${process.env.pm_id ? ` | PM2 id: ${process.env.pm_id}` : ""}`);
@@ -52,9 +55,15 @@ if (isMain) {
   const liveTradingEnabled = !dryRun && process.env.LIVE_TRADING_ENABLED === "true";
   log("startup", `Mode: ${dryRun ? "DRY RUN" : liveTradingEnabled ? "LIVE" : "LIVE CONFIGURATION — EXECUTION LOCKED"}`);
   log("startup", `Model: ${process.env.LLM_MODEL || "hermes-3-405b"}`);
-  if (isHiveMindEnabled()) ensureAgentId();
-  bootstrapHiveMind().catch((error) => log("hivemind_warn", `Bootstrap failed: ${error.message}`));
-  startHiveMindBackgroundSync();
+  try {
+    await assertMainnetRpc(new Connection(process.env.RPC_URL, "confirmed"), "runtime startup");
+    if (isHiveMindEnabled()) ensureAgentId();
+    bootstrapHiveMind().catch((error) => log("hivemind_warn", `Bootstrap failed: ${error.message}`));
+    startHiveMindBackgroundSync();
+  } catch (error) {
+    runtimeRpcVerified = false;
+    log("startup_error", error.message);
+  }
 }
 
 const TP_PCT = config.management.takeProfitPct;
@@ -1784,7 +1793,7 @@ function computeBinsBelow(volatility) {
 // Register restarter — when update_config changes intervals, running cron jobs get replaced
 registerCronRestarter(() => { if (cronStarted) startCronJobs(); });
 
-if (isMain && isTTY) {
+if (isMain && runtimeRpcVerified && isTTY) {
   const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
@@ -2075,7 +2084,7 @@ Focus on: hold duration, entry/exit timing, what win rates look like, whether sc
 
   rl.on("close", () => shutdown("stdin closed"));
 
-} else if (isMain) {
+} else if (isMain && runtimeRpcVerified) {
   // Non-TTY: start immediately
   log("startup", "Non-TTY mode — starting cron cycles immediately.");
   startCronJobs();
@@ -2088,4 +2097,6 @@ Focus on: hold duration, entry/exit timing, what win rates look like, whether sc
       log("startup_error", e.message);
     }
   })();
+} else if (isMain) {
+  log("startup_error", "Autonomous cycles and Telegram polling are disabled until a Solana mainnet RPC is verified.");
 }
