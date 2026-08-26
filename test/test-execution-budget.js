@@ -8,6 +8,7 @@ import {
   getDailyDeployBudget,
   reserveDailyDeploy,
 } from "../execution-budget.js";
+import { logDailyDeployReservation } from "../tools/executor.js";
 
 function withBudgetFile(callback) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "meridian-budget-"));
@@ -69,6 +70,19 @@ test("an explicit null daily cap permits deploys without consuming budget", () =
     assert.equal(budget.deployedSol, 0);
     assert.equal(budget.reservedSol, 0);
   });
+});
+
+test("a disabled daily cap does not read fields from a missing reservation", () => {
+  const entries = [];
+  logDailyDeployReservation(null, {
+    amountSol: 0.85,
+    maxDailyDeploySol: null,
+  }, (level, message) => entries.push({ level, message }));
+
+  assert.deepEqual(entries, [{
+    level: "budget",
+    message: "Daily deploy cap disabled; 0.85 SOL is not reserved.",
+  }]);
 });
 
 test("a committed deploy remains counted until the next UTC day", () => {

@@ -864,6 +864,20 @@ async function settleCloseToSol(result, args) {
 /**
  * Execute a tool call with safety checks and logging.
  */
+export function logDailyDeployReservation(reservation, {
+  amountSol,
+  maxDailyDeploySol,
+}, writeLog = log) {
+  if (!reservation) {
+    writeLog("budget", `Daily deploy cap disabled; ${amountSol} SOL is not reserved.`);
+    return;
+  }
+  writeLog(
+    "budget",
+    `Reserved ${amountSol} SOL of ${maxDailyDeploySol} SOL daily deploy cap (${reservation.usedSol.toFixed(6)} SOL used/reserved).`,
+  );
+}
+
 export async function executeTool(name, args) {
   const startTime = Date.now();
   let deployBudgetReservation = null;
@@ -907,10 +921,10 @@ export async function executeTool(name, args) {
         amountSol,
         maxDailyDeploySol: config.risk.maxDailyDeploySol,
       });
-      log(
-        "budget",
-        `Reserved ${amountSol} SOL of ${config.risk.maxDailyDeploySol} SOL daily deploy cap (${deployBudgetReservation.usedSol.toFixed(6)} SOL used/reserved).`,
-      );
+      logDailyDeployReservation(deployBudgetReservation, {
+        amountSol,
+        maxDailyDeploySol: config.risk.maxDailyDeploySol,
+      });
     } catch (error) {
       log("safety_block", `deploy_position blocked: ${error.message}`);
       return { blocked: true, reason: error.message };
