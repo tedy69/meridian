@@ -299,7 +299,14 @@ export function computeDeployAmount(walletSol, overrides = {}) {
   const dynamic    = deployable * pct;
   const uncapped   = Math.min(deployable, Math.max(floor, dynamic));
   const result     = ceil === null ? uncapped : Math.min(ceil, uncapped);
-  return parseFloat(result.toFixed(2));
+  // Floor, rather than round, so full-wallet sizing never consumes part of
+  // the configured gas reserve through a half-cent-style rounding increase.
+  return Math.floor((result + Number.EPSILON) * 100) / 100;
+}
+
+export function formatSolAmount(amount) {
+  const numeric = Number(amount);
+  return Number.isFinite(numeric) ? numeric.toFixed(2) : "?";
 }
 
 /**

@@ -9,7 +9,7 @@ import { log } from "./logger.js";
 import { getMyPositions, getActiveBin } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates, degenScore } from "./tools/screening.js";
-import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
+import { config, reloadScreeningThresholds, computeDeployAmount, formatSolAmount } from "./config.js";
 import { evolveThresholds, getPerformanceSummary } from "./lessons.js";
 import { drainPendingAutoSwaps, executeTool, registerCronRestarter } from "./tools/executor.js";
 import {
@@ -441,7 +441,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
     // Reuse pre-fetched balance — no extra RPC call needed
     const currentBalance = preBalance;
     const deployAmount = computeDeployAmount(currentBalance.sol);
-    log("cron", `Computed deploy amount: ${deployAmount} SOL (wallet: ${currentBalance.sol} SOL)`);
+    log("cron", `Computed deploy amount: ${formatSolAmount(deployAmount)} SOL (wallet: ${currentBalance.sol} SOL)`);
 
     // Load active strategy
     const activeStrategy = getActiveStrategy();
@@ -1032,7 +1032,7 @@ function formatWalletStatus(wallet, positions) {
     `Wallet: ${wallet.sol} SOL ($${wallet.sol_usd})`,
     `SOL price: $${wallet.sol_price}`,
     `Open positions: ${positions.total_positions}/${config.risk.maxPositions}`,
-    `Next deploy amount: ${deployAmount} SOL`,
+    `Next deploy amount: ${formatSolAmount(deployAmount)} SOL`,
     `Dry run: ${process.env.DRY_RUN === "true" ? "yes" : "no"}`,
     `Mainnet execution: ${process.env.DRY_RUN !== "true" && process.env.LIVE_TRADING_ENABLED === "true" ? "enabled" : "locked"}`,
     `HiveMind: ${hive}`,
