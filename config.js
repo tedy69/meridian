@@ -68,8 +68,12 @@ export const config = {
   // ─── Risk Limits ─────────────────────────
   risk: {
     maxPositions:    u.maxPositions    ?? 1,
-    maxDeployAmount: u.maxDeployAmount ?? u.deployAmountSol ?? 0.5,
-    maxDailyDeploySol: u.maxDailyDeploySol ?? 0.5,
+    // `null` deliberately disables the per-position SOL ceiling. An absent
+    // value retains the conservative default.
+    maxDeployAmount: u.maxDeployAmount === null ? null : (u.maxDeployAmount ?? u.deployAmountSol ?? 0.5),
+    // `null` deliberately disables the aggregate daily deploy cap. An absent
+    // value retains the conservative default.
+    maxDailyDeploySol: u.maxDailyDeploySol === null ? null : (u.maxDailyDeploySol ?? 0.5),
   },
 
   // ─── Pool Screening Thresholds ───────────
@@ -274,7 +278,9 @@ export const config = {
  * Compute the optimal deploy amount for a given wallet balance.
  * Scales position size with wallet growth (compounding).
  *
- * Formula: clamp(deployable × positionSizePct, floor=deployAmountSol, ceil=maxDeployAmount)
+ * Formula: clamp(deployable × positionSizePct, floor=deployAmountSol,
+ * ceil=maxDeployAmount when configured). The result never spends the gas
+ * reserve even when the per-position ceiling is disabled.
  *
  * Examples (defaults: gasReserve=0.2, positionSizePct=0.35, floor=0.5):
  *   0.8 SOL wallet → 0.6 SOL deploy  (floor)
@@ -282,14 +288,17 @@ export const config = {
  *   3.0 SOL wallet → 0.98 SOL deploy
  *   4.0 SOL wallet → 1.33 SOL deploy
  */
-export function computeDeployAmount(walletSol) {
-  const reserve  = config.management.gasReserve      ?? 0.2;
-  const pct      = config.management.positionSizePct ?? 0.35;
-  const floor    = config.management.deployAmountSol;
-  const ceil     = config.risk.maxDeployAmount;
+export function computeDeployAmount(walletSol, overrides = {}) {
+  const reserve  = overrides.gasReserve ?? config.management.gasReserve ?? 0.2;
+  const pct      = overrides.positionSizePct ?? config.management.positionSizePct ?? 0.35;
+  const floor    = overrides.deployAmountSol ?? config.management.deployAmountSol;
+  const ceil     = Object.hasOwn(overrides, "maxDeployAmount")
+    ? overrides.maxDeployAmount
+    : config.risk.maxDeployAmount;
   const deployable = Math.max(0, walletSol - reserve);
   const dynamic    = deployable * pct;
-  const result     = Math.min(ceil, Math.max(floor, dynamic));
+  const uncapped   = Math.min(deployable, Math.max(floor, dynamic));
+  const result     = ceil === null ? uncapped : Math.min(ceil, uncapped);
   return parseFloat(result.toFixed(2));
 }
 

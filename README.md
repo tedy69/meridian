@@ -135,7 +135,7 @@ DRY_RUN=false
 LIVE_TRADING_ENABLED=true
 ```
 
-The default limits are deliberately conservative: one position, 0.5 SOL maximum per position, and 0.5 SOL maximum deploy attempts per UTC day. Set `maxPositions`, `maxDeployAmount`, and `maxDailyDeploySol` yourself only after deciding the maximum loss you accept. The agent cannot change those execution limits through an LLM tool.
+The default limits are deliberately conservative: one position, 0.5 SOL maximum per position, and 0.5 SOL maximum deploy attempts per UTC day. Set `maxPositions`, `maxDeployAmount`, and `maxDailyDeploySol` yourself only after deciding the maximum loss you accept. Set either cap to `null` only to intentionally disable it. With `maxDeployAmount: null` and `positionSizePct: 1`, a deploy uses the wallet balance less `gasReserve`; settlement and position-count guards remain active. The agent cannot change those execution limits through an LLM tool.
 
 On startup Meridian fetches your wallet balance, open positions, and top pool candidates, then begins autonomous cycles immediately.
 
@@ -511,10 +511,10 @@ All fields are optional — defaults shown. Edit `user-config.json`.
 | Field | Default | Description |
 |---|---|---|
 | `deployAmountSol` | `0.5` | Base SOL per new position |
-| `positionSizePct` | `0.35` | Fraction of deployable balance to use |
+| `positionSizePct` | `0.35` | Fraction of deployable balance to use; set `1` to use all SOL after gas reserve |
 | `maxPositions` | `1` | Maximum simultaneously open positions |
-| `maxDeployAmount` | `0.5` | Maximum SOL cap per position |
-| `maxDailyDeploySol` | `0.5` | Maximum deploy attempts per UTC day; uncertain attempts remain counted |
+| `maxDeployAmount` | `0.5` | Maximum SOL cap per position; set `null` to disable this ceiling |
+| `maxDailyDeploySol` | `0.5` | Maximum deploy attempts per UTC day; set `null` to disable this aggregate cap. Uncertain attempts remain counted when enabled. |
 | `gasReserve` | `0.2` | Minimum SOL to keep for gas |
 | `minSolToOpen` | `0.55` | Minimum wallet SOL before opening |
 | `outOfRangeWaitMinutes` | `30` | Minutes OOR before acting |

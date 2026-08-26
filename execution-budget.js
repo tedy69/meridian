@@ -102,6 +102,9 @@ export function reserveDailyDeploy({
   now = new Date(),
 } = {}) {
   const amount = asPositiveFinite(amountSol, "Deploy amount");
+  // An explicit null is the opt-out value for the aggregate daily cap. Keep
+  // validating the requested amount so this does not weaken deploy validation.
+  if (maxDailyDeploySol === null) return null;
   const cap = asPositiveFinite(maxDailyDeploySol, "maxDailyDeploySol");
   const budget = readBudget(budgetPath, now);
   const used = budget.deployedSol + reservedSol(budget);

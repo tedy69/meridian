@@ -42,6 +42,35 @@ test("daily deploy budget blocks the amount above its cap", () => {
   });
 });
 
+test("an explicit null daily cap permits deploys without consuming budget", () => {
+  withBudgetFile((budgetPath) => {
+    const now = new Date("2026-08-26T10:00:00.000Z");
+
+    assert.equal(
+      reserveDailyDeploy({
+        amountSol: 0.5,
+        maxDailyDeploySol: null,
+        budgetPath,
+        now,
+      }),
+      null,
+    );
+    assert.equal(
+      reserveDailyDeploy({
+        amountSol: 0.5,
+        maxDailyDeploySol: null,
+        budgetPath,
+        now,
+      }),
+      null,
+    );
+
+    const budget = getDailyDeployBudget({ budgetPath, now });
+    assert.equal(budget.deployedSol, 0);
+    assert.equal(budget.reservedSol, 0);
+  });
+});
+
 test("a committed deploy remains counted until the next UTC day", () => {
   withBudgetFile((budgetPath) => {
     const dayOne = new Date("2026-08-26T10:00:00.000Z");
