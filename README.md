@@ -475,6 +475,8 @@ Meridian sends notifications automatically for:
 |---|---|
 | `/positions` | List open positions with progress bar |
 | `/close <n>` | Close position by list index |
+| `/claimall` | Preview all positions with positive reported unclaimed fees; no transaction is sent |
+| `/claimall confirm` | Claim each eligible position sequentially; stops at the first failure |
 | `/set <n> <note>` | Set a note on a position |
 
 You can also chat freely via Telegram using the same interface as the REPL. Only allowed user IDs can issue commands in groups.

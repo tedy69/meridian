@@ -36,6 +36,7 @@ import { getWeightsSummary } from "./signal-weights.js";
 import { bootstrapHiveMind, ensureAgentId, getHiveMindPullMode, isHiveMindEnabled, pullHiveMindLessons, pullHiveMindPresets, registerHiveMindAgent, startHiveMindBackgroundSync } from "./hivemind.js";
 import { appendDecision } from "./decision-log.js";
 import { assertMainnetRpc } from "./execution-guard.js";
+import { executeClaimAll, formatClaimAllOutcome, formatClaimAllPreflight, prepareClaimAll } from "./claim-all.js";
 
 import { REPO_ROOT, repoPath } from "./repo-root.js";
 
@@ -102,6 +103,7 @@ function buildPrompt() {
 let _cronTasks = [];
 let _managementBusy = false; // prevents overlapping management cycles
 let _screeningBusy = false;  // prevents overlapping screening cycles
+let _claimAllBusy = false;   // prevents claim-all from racing another transaction loop
 let _screeningLastTriggered = 0; // epoch ms — prevents management from spamming screening
 // Exit/peak confirmation is now done by consecutive-tick counting in state.js
 // (registerExitSignal / confirmPeak), driven by the 3s RPC poller — no setTimeout rechecks.
@@ -237,7 +239,7 @@ After evaluating, write a brief one-line result per position.
 }
 
 export async function runManagementCycle({ silent = false } = {}) {
-  if (_managementBusy) return null;
+  if (_managementBusy || _claimAllBusy) return null;
   _managementBusy = true;
   timers.managementLastRun = Date.now();
   log("cron", "Starting management cycle");
@@ -387,7 +389,7 @@ export async function runManagementCycle({ silent = false } = {}) {
 }
 
 export async function runScreeningCycle({ silent = false } = {}) {
-  if (_screeningBusy) {
+  if (_screeningBusy || _claimAllBusy) {
     log("cron", "Screening skipped — previous cycle still running");
     return null;
   }
@@ -711,7 +713,7 @@ export function startCronJobs() {
   stopCronJobs(); // stop any running tasks before (re)starting
 
   const mgmtTask = cron.schedule(`*/${Math.max(1, config.schedule.managementIntervalMin)} * * * *`, async () => {
-    if (_managementBusy) return;
+    if (_managementBusy || _claimAllBusy) return;
     timers.managementLastRun = Date.now();
     await runManagementCycle();
   });
@@ -719,7 +721,7 @@ export function startCronJobs() {
   const screenTask = cron.schedule(`*/${Math.max(1, config.schedule.screeningIntervalMin)} * * * *`, runScreeningCycle);
 
   const healthTask = cron.schedule(`0 * * * *`, async () => {
-    if (_managementBusy) return;
+    if (_managementBusy || _claimAllBusy) return;
     _managementBusy = true;
     log("cron", "Starting health check");
     try {
@@ -749,6 +751,7 @@ Summarize the current portfolio health, total fees earned, and performance of al
   // so a process restart or transient Jupiter/RPC failure cannot strand the
   // base token until the next (potentially much slower) management cycle.
   const settlementTask = cron.schedule(`* * * * *`, async () => {
+    if (_claimAllBusy) return;
     try {
       const settlement = await drainPendingAutoSwaps();
       if (settlement.processed > 0) {
@@ -768,7 +771,7 @@ Summarize the current portfolio health, total fees earned, and performance of al
   const confirmTicks = Math.max(1, Number(config.pnl.confirmTicks ?? 2));
   let _pnlPollBusy = false;
   const pnlPollInterval = setInterval(async () => {
-    if (_managementBusy || _screeningBusy || _pnlPollBusy) return;
+    if (_managementBusy || _screeningBusy || _claimAllBusy || _pnlPollBusy) return;
     if (getTrackedPositions(true).length === 0) return;
     _pnlPollBusy = true;
     try {
@@ -817,7 +820,7 @@ Summarize the current portfolio health, total fees earned, and performance of al
     const oppCooldownMs = 5 * 60 * 1000; // don't re-trigger the deploy LLM more than every 5m
     let _opportunityPollBusy = false;
     opportunityPollInterval = setInterval(async () => {
-      if (_screeningBusy || _managementBusy || _opportunityPollBusy) return;
+      if (_screeningBusy || _managementBusy || _claimAllBusy || _opportunityPollBusy) return;
       if (Date.now() - _screeningLastTriggered < oppCooldownMs) return;
       _opportunityPollBusy = true;
       try {
@@ -1320,6 +1323,8 @@ function formatHelpText() {
     "/pool <n> — detailed info for one open position",
     "/close <n> — close one position by index",
     "/closeall — close all open positions",
+    "/claimall — preview all reported unclaimed fees",
+    "/claimall confirm — claim every eligible position",
     "/set <n> <note> — set note/instruction on position",
     "/config — show important runtime config",
     "/settings — button menu for common config",
@@ -1447,7 +1452,7 @@ async function telegramHandler(msg) {
     await showSettingsMenu().catch((e) => sendMessage(`Settings error: ${e.message}`).catch(() => {}));
     return;
   }
-  if (_managementBusy || _screeningBusy || busy) {
+  if (_managementBusy || _screeningBusy || _claimAllBusy || busy) {
     if (_telegramQueue.length < 5) {
       _telegramQueue.push(msg);
       sendMessage(`⏳ Queued (${_telegramQueue.length} in queue): "${text.slice(0, 60)}"`).catch(() => {});
@@ -1501,7 +1506,7 @@ async function telegramHandler(msg) {
         const oor = !p.in_range ? " ⚠️OOR" : "";
         return `${i + 1}. ${p.pair} | ${cur}${p.total_value_usd} | PnL: ${pnl} | fees: ${cur}${p.unclaimed_fees_usd} | ${age}${oor}`;
       });
-      await sendMessage(`📊 Open Positions (${total_positions}):\n\n${lines.join("\n")}\n\n/close <n> to close | /set <n> <note> to set instruction`);
+      await sendMessage(`📊 Open Positions (${total_positions}):\n\n${lines.join("\n")}\n\n/close <n> to close | /claimall to review fees | /set <n> <note> to set instruction`);
     } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
     return;
   }
@@ -1589,6 +1594,53 @@ async function telegramHandler(msg) {
       await sendMessage(`Close-all finished.\n\n${results.join("\n")}`).catch(() => {});
     } catch (e) {
       await sendMessage(`Error: ${e.message}`).catch(() => {});
+    }
+    return;
+  }
+
+  if (text === "/claimall") {
+    try {
+      const { positions } = await getMyPositions({ force: true });
+      const plan = prepareClaimAll(positions);
+      await sendMessage(formatClaimAllPreflight(plan, {
+        solMode: config.management.solMode,
+        autoSwapAfterClaim: config.management.autoSwapAfterClaim,
+      })).catch(() => {});
+    } catch (error) {
+      await sendMessage(`Error: ${error.message}`).catch(() => {});
+    }
+    return;
+  }
+
+  if (text === "/claimall confirm") {
+    _claimAllBusy = true;
+    busy = true;
+    try {
+      const { positions } = await getMyPositions({ force: true });
+      const plan = prepareClaimAll(positions);
+      if (plan.claimable.length === 0) {
+        await sendMessage(formatClaimAllPreflight(plan, {
+          solMode: config.management.solMode,
+          autoSwapAfterClaim: config.management.autoSwapAfterClaim,
+        })).catch(() => {});
+        return;
+      }
+
+      log("telegram", `Claim-all confirmed for ${plan.claimable.length} position(s)`);
+      await sendMessage(`Claiming fees from ${plan.claimable.length} position(s). Execution stops after the first unsuccessful claim.`).catch(() => {});
+      const outcome = await executeClaimAll(plan.claimable, ({ position_address }) => (
+        executeTool("claim_fees", { position_address })
+      ));
+      await sendMessage(formatClaimAllOutcome(outcome, {
+        solMode: config.management.solMode,
+        autoSwapAfterClaim: config.management.autoSwapAfterClaim,
+      })).catch(() => {});
+    } catch (error) {
+      await sendMessage(`Error: ${error.message}`).catch(() => {});
+    } finally {
+      _claimAllBusy = false;
+      busy = false;
+      drainTelegramQueue().catch(() => {});
     }
     return;
   }

@@ -416,6 +416,7 @@ const BOT_COMMANDS = [
   { command: "pool",       description: "Detailed info for one open position" },
   { command: "close",      description: "Close one position by index" },
   { command: "closeall",   description: "Close all open positions" },
+  { command: "claimall",   description: "Preview and claim all accrued fees" },
   { command: "set",        description: "Set note/instruction on position" },
   { command: "config",     description: "Show important runtime config" },
   { command: "settings",   description: "Button menu for common config" },
