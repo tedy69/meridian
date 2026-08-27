@@ -187,7 +187,7 @@ The management cycle is **mostly deterministic in JS, LLM only for the hard case
 2. `recordPositionSnapshot` per pool.
 3. JS `updatePnlAndCheckExits(position, …)` for each:
    - `STOP_LOSS` if `pnl_pct <= stopLossPct`
-   - `TRAILING_TP` if `trailing_active && (peak - current) >= trailingDropPct` (queued for 15s recheck)
+   - `TRAILING_TP` if `trailing_active && (peak - current) >= trailingDropPct && current >= trailingMinClosePnlPct`; it is then re-read from RPC immediately before submission and skipped if the fresh PnL is unavailable, suspicious, or below the floor.
    - `OUT_OF_RANGE` if `minutes_out_of_range >= outOfRangeWaitMinutes`
    - `LOW_YIELD` if `fee_per_tvl_24h < minFeePerTvl24h && age >= minAgeBeforeYieldCheck`
 4. For positions with no exit alert: `getDeterministicCloseRule(p, mgmtConfig)` applies the **5 hard rules** (`index.js:895`):
@@ -196,10 +196,11 @@ The management cycle is **mostly deterministic in JS, LLM only for the hard case
 6. Positions with `instruction` set are marked `INSTRUCTION` and deferred to the LLM.
 7. **LLM is invoked only if any actionMap value is not `STAY`**, with a hard-coded goal that already lists positions + their assigned action. The LLM just executes (no re-evaluation). This saves tokens and prevents hallucinated rules.
 
-**Trailing TP two-phase confirmation** (15s recheck):
-- First poll: candidate drop queued in state.
-- 15s later: re-fetch positions, `resolvePendingTrailingDrop` — if the drop still holds (within 1% tolerance), fire `confirmed_trailing_exit` and trigger management cycle.
-- Mirror pattern for peak confirmation (`queuePeakConfirmation` / `resolvePendingPeak`).
+**Trailing TP confirmation and profit lock:**
+- The fast PnL poller requires the configured consecutive confirmations before it invokes a close.
+- A trailing signal must still be at or above `trailingMinClosePnlPct`.
+- Immediately before any trailing-close submission, the position is fetched again. Missing/suspicious/below-floor data fails closed.
+- A trailing close which settles at a loss applies `trailingLossCooldownHours` to the pool and base token before another deploy can be considered.
 
 ### The screening cycle (multi-stage pipeline)
 
@@ -292,7 +293,7 @@ All persistent files are loaded/saved on each call — no in-memory caching laye
 |---|---|---|
 | `risk` | `maxPositions`, `maxDeployAmount` | 3, 50 |
 | `screening` | `excludeHighSupplyConcentration`, `minFeeActiveTvlRatio`, `minTvl`, `maxTvl`, `minVolume`, `minOrganic`, `minQuoteOrganic`, `minHolders`, `minMcap`, `maxMcap`, `minBinStep`, `maxBinStep`, `timeframe`, `category`, `minTokenFeesSol`, `useDiscordSignals`, `discordSignalMode`, `avoidPvpSymbols`, `blockPvpSymbols`, `maxBotHoldersPct`, `maxTop10Pct`, `allowedLaunchpads`, `blockedLaunchpads`, `minTokenAgeHours`, `maxTokenAgeHours` | see `user-config.example.json` |
-| `management` | `minClaimAmount`, `autoSwapAfterClaim`, `outOfRangeBinsToClose`, `outOfRangeWaitMinutes`, `oorCooldownTriggerCount`, `oorCooldownHours`, `repeatDeployCooldownEnabled`, `repeatDeployCooldownTriggerCount`, `repeatDeployCooldownHours`, `repeatDeployCooldownScope`, `repeatDeployCooldownMinFeeEarnedPct`, `minVolumeToRebalance`, `stopLossPct`, `takeProfitPct`, `minFeePerTvl24h`, `minAgeBeforeYieldCheck`, `minSolToOpen`, `deployAmountSol`, `gasReserve`, `positionSizePct`, `trailingTakeProfit`, `trailingTriggerPct`, `trailingDropPct`, `pnlSanityMaxDiffPct`, `solMode` | 5, false, 10, 30, 3, 12, true, 3, 12, "token", 0, 1000, -50, 5, 7, 60, 0.55, 0.5, 0.2, 0.35, true, 3, 1.5, 5, false |
+| `management` | `minClaimAmount`, `autoSwapAfterClaim`, `autoSwapSlippageBps`, `closeSlippageBps`, `outOfRangeBinsToClose`, `outOfRangeWaitMinutes`, `oorCooldownTriggerCount`, `oorCooldownHours`, `repeatDeployCooldownEnabled`, `repeatDeployCooldownTriggerCount`, `repeatDeployCooldownHours`, `repeatDeployCooldownScope`, `repeatDeployCooldownMinFeeEarnedPct`, `minVolumeToRebalance`, `stopLossPct`, `takeProfitPct`, `minFeePerTvl24h`, `minAgeBeforeYieldCheck`, `minSolToOpen`, `deployAmountSol`, `gasReserve`, `positionSizePct`, `trailingTakeProfit`, `trailingTriggerPct`, `trailingDropPct`, `trailingMinClosePnlPct`, `trailingLossCooldownHours`, `pnlSanityMaxDiffPct`, `solMode` | 5, true, 500, 500, 10, 30, 3, 12, true, 3, 12, "token", 0, 1000, -15, 5, 7, 60, 0.55, 0.5, 0.2, 0.35, true, 3, 1.5, 1, 12, 5, false |
 | `strategy` | `strategy`, `minBinsBelow`, `maxBinsBelow`, `defaultBinsBelow` | bid_ask, 35, 69, 69 |
 | `schedule` | `managementIntervalMin`, `screeningIntervalMin`, `healthCheckIntervalMin` | 10, 30, 60 |
 | `llm` | `temperature`, `maxTokens`, `maxSteps`, `managementModel`, `screeningModel`, `generalModel` | 0.373, 4096, 20, healer-alpha, hunter-alpha, healer-alpha |

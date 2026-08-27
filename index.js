@@ -37,6 +37,7 @@ import { bootstrapHiveMind, ensureAgentId, getHiveMindPullMode, isHiveMindEnable
 import { appendDecision } from "./decision-log.js";
 import { assertMainnetRpc } from "./execution-guard.js";
 import { executeClaimAll, formatClaimAllOutcome, formatClaimAllPreflight, prepareClaimAll } from "./claim-all.js";
+import { revalidateTrailingProfitFloor } from "./trailing-safety.js";
 
 import { REPO_ROOT, repoPath } from "./repo-root.js";
 
@@ -186,6 +187,21 @@ async function executeManagementActions(actionPositions, actionMap, { liveMessag
 
     if (act.action === "CLOSE") {
       const reason = act.reason || (act.rule ? `Rule ${act.rule}` : "rule close");
+      if (act.exitAction === "TRAILING_TP") {
+        const fresh = await revalidateTrailingProfitFloor({
+          positionAddress: p.position,
+          minimumPnlPct: config.management.trailingMinClosePnlPct,
+          fetchPositions: () => getMyPositions({ force: true, silent: true }),
+        });
+        if (!fresh.allowed) {
+          const observed = fresh.currentPnlPct == null ? "unavailable" : `${fresh.currentPnlPct.toFixed(2)}%`;
+          const skipped = `trailing close skipped — ${fresh.reason} (fresh PnL ${observed}; floor ${fresh.minimumPnlPct.toFixed(2)}%)`;
+          log("state", `${p.pair}: ${skipped}`);
+          await liveMessage?.note(`${p.pair}: ${skipped}`);
+          lines.push(`${p.pair}: ${skipped}`);
+          continue;
+        }
+      }
       await liveMessage?.toolStart("close_position");
       const res = await executeTool("close_position", { position_address: p.position, reason }).catch(e => ({ error: e.message }));
       const ok = res?.success !== false && !res?.error && !res?.blocked;
@@ -287,7 +303,7 @@ export async function runManagementCycle({ silent = false } = {}) {
       confirmPeak(p.position, p.pnl_pct, 1);
       const exit = updatePnlAndCheckExits(p.position, p, config.management);
       if (exit) {
-        exitMap.set(p.position, exit.reason);
+        exitMap.set(p.position, exit);
         log("state", `Exit alert for ${p.pair}: ${exit.reason}`);
       }
     }
@@ -298,7 +314,13 @@ export async function runManagementCycle({ silent = false } = {}) {
     for (const p of positionData) {
       // Hard exit — highest priority
       if (exitMap.has(p.position)) {
-        actionMap.set(p.position, { action: "CLOSE", rule: "exit", reason: exitMap.get(p.position) });
+        const exit = exitMap.get(p.position);
+        actionMap.set(p.position, {
+          action: "CLOSE",
+          rule: "exit",
+          reason: exit.reason,
+          exitAction: exit.action,
+        });
         continue;
       }
       // Instruction-set — pass to LLM, can't parse in JS
@@ -791,11 +813,19 @@ Summarize the current portfolio health, total fees earned, and performance of al
         const { fire } = registerExitSignal(p.position, signal, confirmTicks);
         if (!signal || !fire) continue;
 
-        log("state", `[PnL poll] ${signal} confirmed (${confirmTicks} ticks): ${p.pair} — ${reason} — closing directly`);
+        const nextStep = signal === "TRAILING_TP"
+          ? "revalidating fresh PnL before close"
+          : "closing directly";
+        log("state", `[PnL poll] ${signal} confirmed (${confirmTicks} ticks): ${p.pair} — ${reason} — ${nextStep}`);
         // Hold the management lock so the cron cycle can't double-act on this position.
         _managementBusy = true;
         try {
-          const actMap = new Map([[p.position, { action: "CLOSE", rule, reason }]]);
+          const actMap = new Map([[p.position, {
+            action: "CLOSE",
+            rule,
+            reason,
+            exitAction: signal,
+          }]]);
           const rpt = await executeManagementActions([p], actMap, {});
           log("state", `[PnL poll] ${p.pair}: ${rpt || "closed"}`);
         } catch (e) {

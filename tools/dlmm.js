@@ -35,6 +35,7 @@ import { getAndClearStagedSignals } from "../signal-tracker.js";
 import { computePositions, fetchDlmmPnlForPool } from "./pnl.js";
 import { assertLiveTradingEnabled, assertMainnetRpc, assertOnChainWriteAllowed, isDryRun } from "../execution-guard.js";
 import { evaluateCloseProof } from "../close-settlement.js";
+import { normalizeSlippageBps } from "../trailing-safety.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 // @meteora-ag/dlmm → @coral-xyz/anchor uses CJS directory imports
@@ -659,7 +660,7 @@ export async function deployPosition({
   const baseMint = pool.lbPair.tokenXMint.toString();
   if (isBaseMintOnCooldown(baseMint)) {
     log("deploy", `Base mint ${baseMint.slice(0, 8)} is on cooldown — skipping deploy for pool ${pool_address.slice(0, 8)}`);
-    return { success: false, error: "Token on cooldown — recently closed out-of-range too many times. Try a different token." };
+    return { success: false, error: "Token on cooldown — recently closed with a cooldown reason. Try a different token." };
   }
   const activeBin = await pool.getActiveBin();
   const actualBinStep = pool.lbPair.binStep;
@@ -1685,7 +1686,14 @@ export async function closePosition({ position_address, reason, skip_swap = fals
     const wallet = getWallet();
     const poolAddress = await lookupPoolForPosition(position_address, wallet.publicKey.toString());
     const poolMeta = await getPoolMetadata(poolAddress);
-    if (shouldUseLpAgentRelay()) {
+    const useLpAgentRelay = shouldUseLpAgentRelay();
+    const closeSlippageBps = useLpAgentRelay
+      ? normalizeSlippageBps(config.management.closeSlippageBps)
+      : null;
+    if (useLpAgentRelay && closeSlippageBps == null) {
+      return { success: false, error: "Invalid closeSlippageBps: use an integer from 0 to 10000" };
+    }
+    if (useLpAgentRelay) {
       let relaySubmitted = false;
       try {
       const pool = await getPool(poolAddress);
@@ -1709,7 +1717,7 @@ export async function closePosition({ position_address, reason, skip_swap = fals
           positionId: position_address,
           owner: wallet.publicKey.toString(),
           bps: 10000,
-          slippageBps: 5000,
+          slippageBps: closeSlippageBps,
           output: closeOutput,
           provider: "OKX",
           type: "meteora",

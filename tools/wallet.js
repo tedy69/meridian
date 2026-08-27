@@ -16,6 +16,7 @@ import {
   isDryRun,
   SOL_MINT,
 } from "../execution-guard.js";
+import { normalizeSlippageBps } from "../trailing-safety.js";
 
 let _connection = null;
 let _wallet = null;
@@ -228,6 +229,7 @@ export async function swapToken({
   input_mint,
   output_mint,
   amount,
+  slippage_bps = undefined,
 }) {
   input_mint  = normalizeMint(input_mint);
   output_mint = normalizeMint(output_mint);
@@ -236,6 +238,12 @@ export async function swapToken({
     outputMint: output_mint,
     amount,
   });
+  const normalizedSlippageBps = slippage_bps === undefined
+    ? null
+    : normalizeSlippageBps(slippage_bps);
+  if (slippage_bps !== undefined && normalizedSlippageBps == null) {
+    return { success: false, error: "Invalid slippage_bps: use an integer from 0 to 10000" };
+  }
 
   if (isDryRun()) {
     return {
@@ -271,6 +279,9 @@ export async function swapToken({
       amount: amountStr,
       taker: wallet.publicKey.toString(),
     });
+    if (normalizedSlippageBps != null) {
+      search.set("slippageBps", String(normalizedSlippageBps));
+    }
     const referralParams = getJupiterReferralParams();
     if (referralParams) {
       search.set("referralAccount", referralParams.referralAccount);
@@ -345,6 +356,8 @@ export async function swapToken({
       output_mint,
       amount_in: result.inputAmountResult,
       amount_out: result.outputAmountResult,
+      minimum_output_amount: order.otherAmountThreshold ?? null,
+      slippage_bps: normalizedSlippageBps,
       referral_account: referralParams?.referralAccount || null,
       referral_fee_bps_requested: referralParams?.referralFee || 0,
       fee_bps_applied: order.feeBps ?? null,

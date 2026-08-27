@@ -11,6 +11,7 @@
 import fs from "fs";
 import { log } from "./logger.js";
 import { repoPath } from "./repo-root.js";
+import { evaluateTrailingProfitFloor } from "./trailing-safety.js";
 
 const STATE_FILE = process.env.MERIDIAN_STATE_FILE || repoPath("state.json");
 
@@ -528,12 +529,16 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
   }
 
   // ── Trailing TP ────────────────────────────────────────────────
-  if (!pnl_pct_suspicious && pos.trailing_active) {
+  if (!pnl_pct_suspicious && pos.trailing_active && currentPnlPct != null) {
     const dropFromPeak = pos.peak_pnl_pct - currentPnlPct;
-    if (dropFromPeak >= mgmtConfig.trailingDropPct) {
+    const profitFloor = evaluateTrailingProfitFloor({
+      currentPnlPct,
+      minimumPnlPct: mgmtConfig.trailingMinClosePnlPct,
+    });
+    if (dropFromPeak >= mgmtConfig.trailingDropPct && profitFloor.allowed) {
       return {
         action: "TRAILING_TP",
-        reason: `Trailing TP: peak ${pos.peak_pnl_pct.toFixed(2)}% → current ${currentPnlPct.toFixed(2)}% (dropped ${dropFromPeak.toFixed(2)}% >= ${mgmtConfig.trailingDropPct}%)`,
+        reason: `Trailing TP: peak ${pos.peak_pnl_pct.toFixed(2)}% → current ${currentPnlPct.toFixed(2)}% (dropped ${dropFromPeak.toFixed(2)}% >= ${mgmtConfig.trailingDropPct}%, profit floor ${profitFloor.minimumPnlPct.toFixed(2)}%)`,
         needs_confirmation: true,
         peak_pnl_pct: pos.peak_pnl_pct,
         current_pnl_pct: currentPnlPct,

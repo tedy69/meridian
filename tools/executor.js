@@ -402,6 +402,8 @@ const toolMap = {
       autoSwapAfterClaim: ["management", "autoSwapAfterClaim"],
       autoSwapRetryAttempts: ["management", "autoSwapRetryAttempts"],
       autoSwapRetryDelayMs: ["management", "autoSwapRetryDelayMs"],
+      autoSwapSlippageBps: ["management", "autoSwapSlippageBps"],
+      closeSlippageBps: ["management", "closeSlippageBps"],
       outOfRangeBinsToClose: ["management", "outOfRangeBinsToClose"],
       outOfRangeWaitMinutes: ["management", "outOfRangeWaitMinutes"],
       oorCooldownTriggerCount: ["management", "oorCooldownTriggerCount"],
@@ -418,6 +420,8 @@ const toolMap = {
       trailingTakeProfit: ["management", "trailingTakeProfit"],
       trailingTriggerPct: ["management", "trailingTriggerPct"],
       trailingDropPct: ["management", "trailingDropPct"],
+      trailingMinClosePnlPct: ["management", "trailingMinClosePnlPct"],
+      trailingLossCooldownHours: ["management", "trailingLossCooldownHours"],
       pnlSanityMaxDiffPct: ["management", "pnlSanityMaxDiffPct"],
       // pnl poller
       pnlConfirmTicks: ["pnl", "confirmTicks"],
@@ -630,6 +634,8 @@ const MANUAL_ONLY_CONFIG_KEYS = new Set([
   "autoSwapAfterClaim",
   "autoSwapRetryAttempts",
   "autoSwapRetryDelayMs",
+  "autoSwapSlippageBps",
+  "closeSlippageBps",
   "outOfRangeBinsToClose",
   "outOfRangeWaitMinutes",
   "oorCooldownTriggerCount",
@@ -646,6 +652,8 @@ const MANUAL_ONLY_CONFIG_KEYS = new Set([
   "trailingTakeProfit",
   "trailingTriggerPct",
   "trailingDropPct",
+  "trailingMinClosePnlPct",
+  "trailingLossCooldownHours",
   "pnlSanityMaxDiffPct",
   "minSolToOpen",
   "deployAmountSol",
@@ -700,7 +708,12 @@ async function swapBaseToSolWithRetry(baseMint, label, { onFailure = null } = {}
       }
 
       log("executor", `Auto-swapping ${label} ${normalizedMint.slice(0, 8)} (${balance.amount}) back to SOL (attempt ${attempt}/${attempts})`);
-      const swapResult = await swapToken({ input_mint: normalizedMint, output_mint: "SOL", amount: balance.amount });
+      const swapResult = await swapToken({
+        input_mint: normalizedMint,
+        output_mint: "SOL",
+        amount: balance.amount,
+        slippage_bps: config.management.autoSwapSlippageBps,
+      });
       const swapFinalized = swapResult?.success === true && swapResult?.finalized === true && !!swapResult.tx;
       if (!swapFinalized) {
         lastError = swapResult?.error || swapResult?.reason || "swap did not finalize";

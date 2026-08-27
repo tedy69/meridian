@@ -8,10 +8,11 @@
 import fs from "fs";
 import { log } from "./logger.js";
 import { config } from "./config.js";
+import { isLosingTrailingExit } from "./trailing-safety.js";
 
 import { repoPath } from "./repo-root.js";
 
-const POOL_MEMORY_FILE = repoPath("pool-memory.json");
+const POOL_MEMORY_FILE = process.env.MERIDIAN_POOL_MEMORY_FILE || repoPath("pool-memory.json");
 const MAX_NOTE_LENGTH = 280;
 
 function sanitizeStoredNote(text, maxLen = MAX_NOTE_LENGTH) {
@@ -167,6 +168,26 @@ export function recordPoolDeploy(poolAddress, deployData) {
 
   if (deployData.base_mint && !entry.base_mint) {
     entry.base_mint = deployData.base_mint;
+  }
+
+  // A trailing exit that settles negative indicates that the market moved too
+  // fast between the signal and the fill. Do not immediately re-enter either
+  // the same pool or token while that behavior is still fresh.
+  if (isLosingTrailingExit({
+    closeReason: deploy.close_reason,
+    pnlPct: deploy.pnl_pct,
+  })) {
+    const cooldownHours = Math.max(0, Number(config.management.trailingLossCooldownHours ?? 12));
+    if (cooldownHours > 0) {
+      const pnlText = Number(deploy.pnl_pct).toFixed(2);
+      const reason = `losing trailing exit (${pnlText}%)`;
+      const poolCooldownUntil = setPoolCooldown(entry, cooldownHours, reason);
+      const mintCooldownUntil = setBaseMintCooldown(db, entry.base_mint, cooldownHours, reason);
+      log("pool-memory", `Cooldown set for ${entry.name} until ${poolCooldownUntil} (${reason})`);
+      if (entry.base_mint && mintCooldownUntil) {
+        log("pool-memory", `Base mint cooldown set for ${entry.base_mint.slice(0, 8)} until ${mintCooldownUntil} (${reason})`);
+      }
+    }
   }
 
   // Set cooldown for low yield closes — pool wasn't profitable enough, don't redeploy soon
