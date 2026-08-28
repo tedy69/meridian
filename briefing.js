@@ -6,11 +6,33 @@ import { repoPath } from "./repo-root.js";
 const STATE_FILE = repoPath("state.json");
 const LESSONS_FILE = repoPath("lessons.json");
 
+/** Escape data-originated text while preserving the briefing's own HTML tags. */
+export function escapeTelegramHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (character) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+  })[character]);
+}
+
 export async function generateBriefing() {
   const state = loadJson(STATE_FILE) || { positions: {}, recentEvents: [] };
   const lessonsData = loadJson(LESSONS_FILE) || { lessons: [], performance: [] };
+  return formatBriefing({
+    state,
+    lessonsData,
+    perfSummary: getPerformanceSummary(),
+  });
+}
 
-  const now = new Date();
+export function formatBriefing({
+  state = { positions: {}, recentEvents: [] },
+  lessonsData = { lessons: [], performance: [] },
+  perfSummary = null,
+  now = new Date(),
+} = {}) {
   const last24h = new Date(now.getTime() - 24 * 60 * 60 * 1000);
 
   // 1. Positions Activity
@@ -28,7 +50,6 @@ export async function generateBriefing() {
 
   // 4. Current State
   const openPositions = allPositions.filter(p => !p.closed);
-  const perfSummary = getPerformanceSummary();
 
   // 5. Format Message
   const lines = [
@@ -47,7 +68,7 @@ export async function generateBriefing() {
     "",
     `<b>Lessons Learned:</b>`,
     lessonsLast24h.length > 0
-      ? lessonsLast24h.map(l => `• ${l.rule}`).join("\n")
+      ? lessonsLast24h.map(l => `• ${escapeTelegramHtml(l.rule)}`).join("\n")
       : "• No new lessons recorded overnight.",
     "",
     `<b>Current Portfolio:</b>`,

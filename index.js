@@ -131,7 +131,8 @@ async function runBriefing() {
   try {
     const briefing = await generateBriefing();
     if (telegramEnabled()) {
-      await sendHTML(briefing);
+      const sent = await sendHTML(briefing);
+      if (!sent?.ok) throw new Error("Telegram rejected the briefing delivery");
     }
     setLastBriefingDate();
   } catch (error) {
@@ -1495,7 +1496,8 @@ async function telegramHandler(msg) {
   if (text === "/briefing") {
     try {
       const briefing = await generateBriefing();
-      await sendHTML(briefing);
+      const sent = await sendHTML(briefing);
+      if (!sent?.ok) throw new Error("Telegram rejected the briefing delivery");
     } catch (e) {
       await sendMessage(`Error: ${e.message}`).catch(() => {});
     }
