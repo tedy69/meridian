@@ -21,7 +21,27 @@ function numericConfig(value) {
   return Number.isFinite(n) ? n : null;
 }
 
+const DEFAULT_STOP_LOSS_PCT = -15;
+const DEFAULT_STOP_LOSS_TRIGGER_PCT = -8;
+
+function configuredStopLossPolicy(userConfig) {
+  const maximumPnlPct = numericConfig(userConfig.stopLossPct ?? userConfig.emergencyPriceDropPct) ?? DEFAULT_STOP_LOSS_PCT;
+  // Existing configurations that only have stopLossPct inherit a seven-point
+  // execution buffer, e.g. target -15% → trigger -8%.
+  const triggerPnlPct = numericConfig(userConfig.stopLossTriggerPct) ?? (maximumPnlPct + 7);
+  const valid = maximumPnlPct < 0 && triggerPnlPct < 0 && triggerPnlPct > maximumPnlPct;
+  return valid
+    ? { maximumPnlPct, triggerPnlPct }
+    : { maximumPnlPct: DEFAULT_STOP_LOSS_PCT, triggerPnlPct: DEFAULT_STOP_LOSS_TRIGGER_PCT };
+}
+
+function positiveIntegerConfig(value, fallback) {
+  const numeric = numericConfig(value);
+  return numeric != null && numeric >= 1 ? Math.max(1, Math.round(numeric)) : fallback;
+}
+
 const legacyBinsBelow = numericConfig(u.binsBelow);
+const stopLossPolicy = configuredStopLossPolicy(u);
 const configuredMinBinsBelow = numericConfig(u.minBinsBelow) ?? MIN_SAFE_BINS_BELOW;
 const configuredMaxBinsBelow = numericConfig(u.maxBinsBelow)
   ?? (legacyBinsBelow != null ? Math.max(legacyBinsBelow, configuredMinBinsBelow) : 69);
@@ -124,7 +144,11 @@ export const config = {
     repeatDeployCooldownScope: u.repeatDeployCooldownScope ?? "token", // pool | token | both
     repeatDeployCooldownMinFeeEarnedPct: u.repeatDeployCooldownMinFeeEarnedPct ?? u.repeatDeployCooldownMinFeeYieldPct ?? 0,
     minVolumeToRebalance:  u.minVolumeToRebalance  ?? 1000,
-    stopLossPct:           u.stopLossPct           ?? u.emergencyPriceDropPct ?? -15,
+    // stopLossPct is the intended maximum loss. The bot exits earlier at
+    // stopLossTriggerPct to reserve room for finality and market movement.
+    stopLossPct:           stopLossPolicy.maximumPnlPct,
+    stopLossTriggerPct:    stopLossPolicy.triggerPnlPct,
+    stopLossConfirmTicks:  positiveIntegerConfig(u.stopLossConfirmTicks, 1),
     takeProfitPct:         u.takeProfitPct         ?? u.takeProfitFeePct ?? 5,
     minFeePerTvl24h:       u.minFeePerTvl24h       ?? 7,
     minAgeBeforeYieldCheck: u.minAgeBeforeYieldCheck ?? 60, // minutes before low yield can trigger close

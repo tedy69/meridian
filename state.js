@@ -521,10 +521,13 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
   if (changed) save(state);
 
   // ── Stop loss ──────────────────────────────────────────────────
-  if (!pnl_pct_suspicious && currentPnlPct != null && mgmtConfig.stopLossPct != null && currentPnlPct <= mgmtConfig.stopLossPct) {
+  // The trigger intentionally sits above the intended maximum loss, leaving
+  // time for finality/market movement while the close is being submitted.
+  const stopLossTriggerPct = mgmtConfig.stopLossTriggerPct ?? mgmtConfig.stopLossPct;
+  if (!pnl_pct_suspicious && currentPnlPct != null && stopLossTriggerPct != null && currentPnlPct <= stopLossTriggerPct) {
     return {
       action: "STOP_LOSS",
-      reason: `Stop loss: PnL ${currentPnlPct.toFixed(2)}% <= ${mgmtConfig.stopLossPct}%`,
+      reason: `Stop loss: PnL ${currentPnlPct.toFixed(2)}% <= trigger ${stopLossTriggerPct}% (target max ${mgmtConfig.stopLossPct}%)`,
     };
   }
 

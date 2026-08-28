@@ -36,6 +36,7 @@ import { computePositions, fetchDlmmPnlForPool } from "./pnl.js";
 import { assertLiveTradingEnabled, assertMainnetRpc, assertOnChainWriteAllowed, isDryRun } from "../execution-guard.js";
 import { evaluateCloseProof } from "../close-settlement.js";
 import { normalizeSlippageBps } from "../trailing-safety.js";
+import { isUrgentStopLossClose } from "../stop-loss-safety.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 // @meteora-ag/dlmm → @coral-xyz/anchor uses CJS directory imports
@@ -1950,12 +1951,32 @@ export async function closePosition({ position_address, reason, skip_swap = fals
     const positionPubKey = new PublicKey(position_address);
     const claimTxHashes = [];
     const closeTxHashes = [];
+    const urgentStopLoss = isUrgentStopLossClose(reason);
+    let canClaimAndCloseTogether = false;
+
+    // Claiming in a separate transaction adds avoidable market exposure before
+    // a stop-loss. Only skip it when the position is confirmed to have
+    // liquidity, because removeLiquidity(... shouldClaimAndClose: true) claims
+    // its fees in the same close path.
+    if (urgentStopLoss) {
+      try {
+        const positionDataForPriorityClose = await pool.getPosition(positionPubKey);
+        const bins = Array.isArray(positionDataForPriorityClose?.positionData?.positionBinData)
+          ? positionDataForPriorityClose.positionData.positionBinData
+          : [];
+        canClaimAndCloseTogether = bins.some((bin) => new BN(bin.positionLiquidity || "0").gt(new BN(0)));
+      } catch (error) {
+        log("close_warn", `Could not verify liquidity for priority stop-loss close; retaining separate claim safety: ${error.message}`);
+      }
+    }
 
     // ─── Step 1: Claim Fees (to clear account state) ───────────
     const recentlyClaimed = tracked?.last_claim_at && (Date.now() - new Date(tracked.last_claim_at).getTime()) < 60_000;
     try {
       if (recentlyClaimed) {
         log("close", `Step 1: Skipping claim — fees already claimed ${Math.round((Date.now() - new Date(tracked.last_claim_at).getTime()) / 1000)}s ago`);
+      } else if (canClaimAndCloseTogether) {
+        log("close", "Step 1: Priority stop-loss — skipping separate claim; remove-liquidity will claim and close together");
       } else {
         log("close", `Step 1: Claiming fees for ${position_address}`);
         const positionData = await pool.getPosition(positionPubKey);

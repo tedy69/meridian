@@ -38,6 +38,7 @@ import { appendDecision } from "./decision-log.js";
 import { assertMainnetRpc } from "./execution-guard.js";
 import { executeClaimAll, formatClaimAllOutcome, formatClaimAllPreflight, prepareClaimAll } from "./claim-all.js";
 import { revalidateTrailingProfitFloor } from "./trailing-safety.js";
+import { revalidateStopLossExecution, selectExitConfirmationTicks } from "./stop-loss-safety.js";
 
 import { REPO_ROOT, repoPath } from "./repo-root.js";
 
@@ -187,8 +188,29 @@ async function executeManagementActions(actionPositions, actionMap, { liveMessag
     if (act.action === "INSTRUCTION") { instructionPositions.push(p); continue; }
 
     if (act.action === "CLOSE") {
-      const reason = act.reason || (act.rule ? `Rule ${act.rule}` : "rule close");
-      if (act.exitAction === "TRAILING_TP") {
+      let reason = act.reason || (act.rule ? `Rule ${act.rule}` : "rule close");
+      if (act.exitAction === "STOP_LOSS") {
+        const fresh = await revalidateStopLossExecution({
+          positionAddress: p.position,
+          triggerPnlPct: config.management.stopLossTriggerPct,
+          maximumPnlPct: config.management.stopLossPct,
+          fetchPositions: () => getMyPositions({ force: true, silent: true }),
+        });
+        if (!fresh.allowed) {
+          const observed = fresh.currentPnlPct == null ? "unavailable" : `${fresh.currentPnlPct.toFixed(2)}%`;
+          const skipped = `stop-loss close skipped — ${fresh.reason} (fresh PnL ${observed}; trigger ${fresh.triggerPnlPct ?? "?"}%; target max ${fresh.maximumPnlPct ?? "?"}%)`;
+          log("state", `${p.pair}: ${skipped}`);
+          await liveMessage?.note(`${p.pair}: ${skipped}`);
+          lines.push(`${p.pair}: ${skipped}`);
+          continue;
+        }
+        if (fresh.atOrBeyondMaximum) {
+          const emergency = `fresh PnL ${fresh.currentPnlPct.toFixed(2)}% is at/beyond target max ${fresh.maximumPnlPct.toFixed(2)}% — submitting stop-loss close immediately`;
+          log("state", `${p.pair}: ${emergency}`);
+          await liveMessage?.note(`${p.pair}: ${emergency}`);
+        }
+        reason = `${reason} | fresh PnL ${fresh.currentPnlPct.toFixed(2)}%`;
+      } else if (act.exitAction === "TRAILING_TP") {
         const fresh = await revalidateTrailingProfitFloor({
           positionAddress: p.position,
           minimumPnlPct: config.management.trailingMinClosePnlPct,
@@ -355,7 +377,10 @@ export async function runManagementCycle({ silent = false } = {}) {
       const statusLabel = act.action === "INSTRUCTION" ? "HOLD (instruction)" : act.action;
       let line = `**${p.pair}** | Age: ${p.age_minutes ?? "?"}m | Val: ${val} | Unclaimed: ${unclaimed} | PnL: ${p.pnl_pct ?? "?"}% | Yield: ${p.fee_per_tvl_24h ?? "?"}% | ${inRange} | ${statusLabel}`;
       if (p.instruction) line += `\nNote: "${p.instruction}"`;
-      if (act.action === "CLOSE" && act.rule === "exit") line += `\n⚡ Trailing TP: ${act.reason}`;
+      if (act.action === "CLOSE" && act.rule === "exit") {
+        const exitLabel = act.exitAction === "STOP_LOSS" ? "Stop loss" : "Trailing TP";
+        line += `\n⚡ ${exitLabel}: ${act.reason}`;
+      }
       if (act.action === "CLOSE" && act.rule && act.rule !== "exit") line += `\nRule ${act.rule}: ${act.reason}`;
       if (act.action === "CLAIM") line += `\n→ Claiming fees`;
       return line;
@@ -806,18 +831,31 @@ Summarize the current portfolio health, total fees earned, and performance of al
         // Detect an exit signal this tick (rule-based exits, then deterministic close rules).
         const exit = updatePnlAndCheckExits(p.position, p, config.management);
         const closeRule = exit ? null : getDeterministicCloseRule(p, config.management);
-        let signal = null, reason = null, rule = "exit";
-        if (exit) { signal = exit.action; reason = exit.reason; }
-        else if (closeRule) { signal = `RULE_${closeRule.rule}`; reason = closeRule.reason; rule = closeRule.rule; }
+        let signal = null, reason = null, rule = "exit", exitAction = null;
+        if (exit) {
+          signal = exit.action;
+          reason = exit.reason;
+          exitAction = exit.action;
+        } else if (closeRule) {
+          signal = closeRule.exitAction ?? `RULE_${closeRule.rule}`;
+          reason = closeRule.reason;
+          rule = closeRule.rule;
+          exitAction = closeRule.exitAction ?? signal;
+        }
 
         // Require N consecutive confirming ticks before acting.
-        const { fire } = registerExitSignal(p.position, signal, confirmTicks);
+        const requiredConfirmTicks = selectExitConfirmationTicks({
+          exitAction,
+          defaultConfirmTicks: confirmTicks,
+          stopLossConfirmTicks: config.management.stopLossConfirmTicks,
+        });
+        const { fire } = registerExitSignal(p.position, signal, requiredConfirmTicks);
         if (!signal || !fire) continue;
 
-        const nextStep = signal === "TRAILING_TP"
+        const nextStep = signal === "TRAILING_TP" || signal === "STOP_LOSS"
           ? "revalidating fresh PnL before close"
           : "closing directly";
-        log("state", `[PnL poll] ${signal} confirmed (${confirmTicks} ticks): ${p.pair} — ${reason} — ${nextStep}`);
+        log("state", `[PnL poll] ${signal} confirmed (${requiredConfirmTicks} ticks): ${p.pair} — ${reason} — ${nextStep}`);
         // Hold the management lock so the cron cycle can't double-act on this position.
         _managementBusy = true;
         try {
@@ -825,7 +863,7 @@ Summarize the current portfolio health, total fees earned, and performance of al
             action: "CLOSE",
             rule,
             reason,
-            exitAction: signal,
+            exitAction,
           }]]);
           const rpt = await executeManagementActions([p], actMap, {});
           log("state", `[PnL poll] ${p.pair}: ${rpt || "closed"}`);
@@ -989,8 +1027,14 @@ function getDeterministicCloseRule(position, managementConfig) {
     return false;
   })();
 
-  if (!pnlSuspect && position.pnl_pct != null && position.pnl_pct <= managementConfig.stopLossPct) {
-    return { action: "CLOSE", rule: 1, reason: "stop loss" };
+  const stopLossTriggerPct = managementConfig.stopLossTriggerPct ?? managementConfig.stopLossPct;
+  if (!pnlSuspect && position.pnl_pct != null && stopLossTriggerPct != null && position.pnl_pct <= stopLossTriggerPct) {
+    return {
+      action: "CLOSE",
+      rule: 1,
+      exitAction: "STOP_LOSS",
+      reason: `stop loss: PnL ${position.pnl_pct.toFixed(2)}% <= trigger ${stopLossTriggerPct}% (target max ${managementConfig.stopLossPct}%)`,
+    };
   }
   if (!pnlSuspect && position.pnl_pct != null && position.pnl_pct >= managementConfig.takeProfitPct) {
     return { action: "CLOSE", rule: 2, reason: "take profit" };
@@ -1079,7 +1123,8 @@ function formatConfigSnapshot() {
     "",
     `Strategy: ${config.strategy.strategy} | binsBelow: ${config.strategy.minBinsBelow}-${config.strategy.maxBinsBelow} | default ${config.strategy.defaultBinsBelow}`,
     `Deploy: ${config.management.deployAmountSol} SOL | gasReserve: ${config.management.gasReserve} | maxPositions: ${config.risk.maxPositions}`,
-    `Stop loss: ${config.management.stopLossPct}% | take profit: ${config.management.takeProfitPct}%`,
+    `Stop loss: trigger ${config.management.stopLossTriggerPct}% → target max ${config.management.stopLossPct}% | confirmation ${config.management.stopLossConfirmTicks} tick`,
+    `Take profit: ${config.management.takeProfitPct}%`,
     `Trailing: ${config.management.trailingTakeProfit ? "on" : "off"} | trigger ${config.management.trailingTriggerPct}% | drop ${config.management.trailingDropPct}%`,
     `OOR: ${config.management.outOfRangeWaitMinutes}m | cooldown ${config.management.oorCooldownTriggerCount}x / ${config.management.oorCooldownHours}h`,
     `Repeat deploy cooldown: ${config.management.repeatDeployCooldownEnabled ? "on" : "off"} | ${config.management.repeatDeployCooldownTriggerCount}x / ${config.management.repeatDeployCooldownHours}h | min fee earned ${config.management.repeatDeployCooldownMinFeeEarnedPct}% | ${config.management.repeatDeployCooldownScope}`,
@@ -1120,6 +1165,8 @@ function settingValue(key) {
     maxDeployAmount: config.risk.maxDeployAmount,
     takeProfitPct: config.management.takeProfitPct,
     stopLossPct: config.management.stopLossPct,
+    stopLossTriggerPct: config.management.stopLossTriggerPct,
+    stopLossConfirmTicks: config.management.stopLossConfirmTicks,
     trailingTriggerPct: config.management.trailingTriggerPct,
     trailingDropPct: config.management.trailingDropPct,
     repeatDeployCooldownEnabled: config.management.repeatDeployCooldownEnabled,
@@ -1168,7 +1215,7 @@ function renderSettingsMenu(page = "main") {
     "",
     `Mode: ${config.management.solMode ? "SOL" : "USD"} | Relay: ${config.api.lpAgentRelayEnabled ? "on" : "off"}`,
     `Strategy: ${config.strategy.strategy} | bins ${config.strategy.minBinsBelow}-${config.strategy.maxBinsBelow} | deploy ${config.management.deployAmountSol} SOL`,
-    `TP/SL: ${config.management.takeProfitPct}% / ${config.management.stopLossPct}% | trailing ${config.management.trailingTakeProfit ? "on" : "off"}`,
+    `TP/SL: ${config.management.takeProfitPct}% / trigger ${config.management.stopLossTriggerPct}% → max ${config.management.stopLossPct}% | trailing ${config.management.trailingTakeProfit ? "on" : "off"}`,
     `Indicators: ${config.indicators.enabled ? "on" : "off"} | entry ${config.indicators.entryPreset} | ${fmtSettingValue(config.indicators.intervals)}`,
   ].join("\n");
 
@@ -1196,7 +1243,8 @@ function renderSettingsMenu(page = "main") {
       stepButtons("maxPositions", "Max pos", 1, { digits: 0 }),
       stepButtons("maxDeployAmount", "Max SOL", 1, { digits: 0 }),
       stepButtons("takeProfitPct", "TP %", 1, { digits: 0 }),
-      stepButtons("stopLossPct", "SL %", 5, { digits: 0 }),
+      stepButtons("stopLossTriggerPct", "SL trigger", 1, { digits: 0 }),
+      stepButtons("stopLossPct", "SL max", 1, { digits: 0 }),
       [toggleButton("trailingTakeProfit", "Trailing TP")],
       stepButtons("trailingTriggerPct", "Trail trigger", 0.5, { digits: 1 }),
       stepButtons("trailingDropPct", "Trail drop", 0.5, { digits: 1 }),

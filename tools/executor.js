@@ -258,6 +258,11 @@ function normalizeConfigValue(key, value) {
   if (booleanKeys.has(key)) return coerceBoolean(value, key);
   if (arrayKeys.has(key)) return coerceStringArray(value, key);
   if (stringKeys.has(key)) return coerceString(value, key);
+  if (key === "stopLossConfirmTicks") {
+    const ticks = coerceFiniteNumber(value, key);
+    if (!Number.isInteger(ticks) || ticks < 1) throw new Error(`${key} must be a positive integer`);
+    return ticks;
+  }
   return coerceFiniteNumber(value, key);
 }
 
@@ -415,6 +420,8 @@ const toolMap = {
       repeatDeployCooldownMinFeeEarnedPct: ["management", "repeatDeployCooldownMinFeeEarnedPct"],
       minVolumeToRebalance: ["management", "minVolumeToRebalance"],
       stopLossPct: ["management", "stopLossPct"],
+      stopLossTriggerPct: ["management", "stopLossTriggerPct"],
+      stopLossConfirmTicks: ["management", "stopLossConfirmTicks"],
       takeProfitPct: ["management", "takeProfitPct"],
       takeProfitFeePct: ["management", "takeProfitPct"],
       trailingTakeProfit: ["management", "trailingTakeProfit"],
@@ -526,6 +533,19 @@ const toolMap = {
     if (Object.keys(applied).length === 0) {
       log("config", `update_config failed — unknown keys: ${JSON.stringify(unknown)}, raw changes: ${JSON.stringify(changes)}`);
       return { success: false, unknown, reason };
+    }
+
+    const changesStopLossPolicy = applied.stopLossPct != null || applied.stopLossTriggerPct != null;
+    if (changesStopLossPolicy) {
+      const maximumPnlPct = Number(applied.stopLossPct ?? config.management.stopLossPct);
+      const triggerPnlPct = Number(applied.stopLossTriggerPct ?? config.management.stopLossTriggerPct);
+      if (!Number.isFinite(maximumPnlPct) || !Number.isFinite(triggerPnlPct) || maximumPnlPct >= 0 || triggerPnlPct >= 0 || triggerPnlPct <= maximumPnlPct) {
+        return {
+          success: false,
+          error: "stopLossTriggerPct must be below 0 and above stopLossPct (for example trigger -8 with target max -15).",
+          reason,
+        };
+      }
     }
 
     let userConfig = {};
@@ -647,6 +667,8 @@ const MANUAL_ONLY_CONFIG_KEYS = new Set([
   "repeatDeployCooldownMinFeeEarnedPct",
   "minVolumeToRebalance",
   "stopLossPct",
+  "stopLossTriggerPct",
+  "stopLossConfirmTicks",
   "takeProfitPct",
   "takeProfitFeePct",
   "trailingTakeProfit",
