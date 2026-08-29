@@ -152,7 +152,7 @@ export const config = {
     // Stop a fresh re-entry into the same collapsing token after a loss.
     // Set to 0 only to explicitly disable this risk cooldown.
     stopLossCooldownHours: u.stopLossCooldownHours ?? 12,
-    takeProfitPct:         u.takeProfitPct         ?? u.takeProfitFeePct ?? 5,
+    takeProfitPct:         u.takeProfitPct         ?? u.takeProfitFeePct ?? 3,
     minFeePerTvl24h:       u.minFeePerTvl24h       ?? 7,
     minAgeBeforeYieldCheck: u.minAgeBeforeYieldCheck ?? 60, // minutes before low yield can trigger close
     minSolToOpen:          u.minSolToOpen          ?? 0.55,

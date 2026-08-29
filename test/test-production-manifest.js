@@ -19,3 +19,12 @@ test("the runtime dependency volume is mounted at a node_modules path", () => {
   assert.match(compose, /target:\s*\/runtime\/node_modules/);
   assert.match(dockerfile, /\/runtime\/node_modules/);
 });
+
+test("new configurations default to a three percent take-profit target", () => {
+  const source = fs.readFileSync(new URL("../config.js", import.meta.url), "utf8");
+
+  assert.match(
+    source,
+    /takeProfitPct:\s*u\.takeProfitPct\s*\?\?\s*u\.takeProfitFeePct\s*\?\?\s*3,/,
+  );
+});
