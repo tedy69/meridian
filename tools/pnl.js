@@ -107,6 +107,16 @@ async function getJupiterPrices(mints) {
 const _meteoraCache = new Map(); // pool -> { at, byPosition, sigByPosition }
 let _pollCount = 0;
 
+// A new position can be visible on-chain before Meteora's history index has
+// its deposit record. Never cache that partial response: doing so turns a
+// short indexing delay into five minutes of unavailable cost basis.
+export function hasCompleteMeteoraDepositHistory(byPosition, positionAddrs) {
+  return positionAddrs.every((address) => {
+    const deposits = byPosition?.[address]?.allTimeDeposits?.total;
+    return safeNum(deposits?.usd) > 0 || safeNum(deposits?.sol) > 0;
+  });
+}
+
 async function getLatestSig(conn, addr) {
   try {
     const sigs = await conn.getSignaturesForAddress(new PublicKey(addr), { limit: 1 });
@@ -132,13 +142,18 @@ async function getMeteoraData(conn, walletAddress, flat) {
 
     const ageOk = cached && Date.now() - cached.at < ttlMs;
     const sigsMatch = cached && positionAddrs.every((a) => cached.sigByPosition?.[a] === sigByPosition[a]);
+    const cachedHistoryComplete = cached && hasCompleteMeteoraDepositHistory(cached.byPosition, positionAddrs);
 
     let data;
-    if (ageOk && sigsMatch) {
+    if (ageOk && sigsMatch && cachedHistoryComplete) {
       data = cached.byPosition;
     } else {
       data = await fetchDlmmPnlForPool(pool, walletAddress);
-      _meteoraCache.set(pool, { at: Date.now(), byPosition: data, sigByPosition });
+      if (hasCompleteMeteoraDepositHistory(data, positionAddrs)) {
+        _meteoraCache.set(pool, { at: Date.now(), byPosition: data, sigByPosition });
+      } else {
+        _meteoraCache.delete(pool);
+      }
     }
     for (const addr of positionAddrs) byPosition[addr] = data[addr] || null;
   }));
@@ -243,13 +258,18 @@ function buildPosition(f, prices, solUsd, meteora, solMode) {
     total_value_true_usd: round(balancesUsd),
     collected_fees_usd: round(solMode ? claimedSol : claimedUsd),
     collected_fees_true_usd: round(claimedUsd),
-    pnl_usd:            round(solMode ? pnlSol : pnlUsd),
-    pnl_true_usd:       round(pnlUsd),
-    pnl_pct:            round(ourPct, 2),
-    pnl_pct_derived:    round(ourPct, 2),
+    // Never expose a fabricated zero as a valid PnL when prices or the
+    // deposit cost basis are unavailable. Exit guards already fail closed on
+    // pnl_pct_suspicious; null keeps the UI and LLM equally honest.
+    pnl_usd:            accountingAvailable ? round(solMode ? pnlSol : pnlUsd) : null,
+    pnl_true_usd:       accountingAvailable ? round(pnlUsd) : null,
+    pnl_pct:            accountingAvailable ? round(ourPct, 2) : null,
+    pnl_pct_derived:    accountingAvailable ? round(ourPct, 2) : null,
     pnl_pct_reported:   reportedPct != null ? round(reportedPct, 2) : null,
-    pnl_pct_diff:       pnlPctDiff != null ? round(pnlPctDiff, 2) : null,
+    pnl_pct_diff:       accountingAvailable && pnlPctDiff != null ? round(pnlPctDiff, 2) : null,
     pnl_pct_suspicious: !!pnlPctSuspicious,
+    pnl_price_missing:  !!priceMissing,
+    pnl_deposits_missing: !!depositsMissing,
     // Canonical accounting fields for the LLM/UI. The sign is never inferred
     // from fees alone: net = current balances + withdrawals + all fees - deposits.
     net_pnl_usd:         accountingAvailable ? round(usdPerformance.netPnlUsd) : null,

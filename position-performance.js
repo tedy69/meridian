@@ -12,6 +12,22 @@ function status(value, positive, negative, neutral) {
 }
 
 /**
+ * Render the percentage only when the canonical open-position accounting is
+ * usable. A zero fallback would look like a real break-even result and can
+ * lead an operator to misread an incomplete Meteora history response.
+ */
+export function formatNetPnlPercent(position = {}) {
+  if (position.net_pnl_status === "UNKNOWN" || position.pnl_pct_suspicious) {
+    if (position.pnl_deposits_missing) return "N/A (cost basis pending)";
+    if (position.pnl_price_missing) return "N/A (price pending)";
+    return "N/A (valuation pending)";
+  }
+
+  const pct = finiteNumber(position.net_pnl_pct ?? position.pnl_pct);
+  return pct == null ? "N/A (valuation pending)" : `${pct}%`;
+}
+
+/**
  * Calculate the economics of one still-open LP position in a single currency.
  *
  * Fees are deliberately separate from the mark-to-market capital component:

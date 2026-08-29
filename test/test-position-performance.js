@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { buildSystemPrompt } from "../prompt.js";
-import { calculateOpenPositionPerformance } from "../position-performance.js";
+import {
+  calculateOpenPositionPerformance,
+  formatNetPnlPercent,
+} from "../position-performance.js";
+import { hasCompleteMeteoraDepositHistory } from "../tools/pnl.js";
 
 test("positive LP fees do not turn a larger capital loss into floating profit", () => {
   const performance = calculateOpenPositionPerformance({
@@ -59,4 +63,27 @@ test("the OpenRouter prompt requires net PnL classification and fee disclosure",
   assert.match(prompt, /net_pnl_status/);
   assert.match(prompt, /FLOATING_NET_LOSS/);
   assert.match(prompt, /positive fee.*not.*profit/i);
+});
+
+test("missing Meteora cost basis is retried and never displayed as a real 0% PnL", () => {
+  const address = "Position111";
+
+  assert.equal(hasCompleteMeteoraDepositHistory({
+    [address]: { allTimeDeposits: { total: { usd: 0, sol: 0 } } },
+  }, [address]), false);
+  assert.equal(hasCompleteMeteoraDepositHistory({
+    [address]: { allTimeDeposits: { total: { usd: 100, sol: 1 } } },
+  }, [address]), true);
+
+  assert.equal(formatNetPnlPercent({
+    net_pnl_status: "UNKNOWN",
+    pnl_pct_suspicious: true,
+    pnl_deposits_missing: true,
+    pnl_pct: 0,
+  }), "N/A (cost basis pending)");
+  assert.equal(formatNetPnlPercent({
+    net_pnl_status: "FLOATING_NET_LOSS",
+    net_pnl_pct: -1.25,
+    pnl_pct: -1.25,
+  }), "-1.25%");
 });

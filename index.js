@@ -40,6 +40,7 @@ import { executeClaimAll, formatClaimAllOutcome, formatClaimAllPreflight, prepar
 import { revalidateTrailingProfitFloor } from "./trailing-safety.js";
 import { revalidateStopLossExecution, selectExitConfirmationTicks } from "./stop-loss-safety.js";
 import { getPnlWatchdogGate } from "./pnl-watchdog-safety.js";
+import { formatNetPnlPercent } from "./position-performance.js";
 
 import { REPO_ROOT, repoPath } from "./repo-root.js";
 
@@ -92,6 +93,15 @@ function formatCountdown(seconds) {
   const m = Math.floor(seconds / 60);
   const s = Math.floor(seconds % 60);
   return m > 0 ? `${m}m ${s}s` : `${s}s`;
+}
+
+function formatPositionNetPnlValue(position, currency) {
+  if (position?.net_pnl_status === "UNKNOWN" || position?.pnl_pct_suspicious) return "N/A";
+  // pnl_usd follows the configured display currency (USD or SOL mode), while
+  // net_pnl_usd is always USD and must not be rendered with a SOL symbol.
+  const value = Number(position?.pnl_usd);
+  if (!Number.isFinite(value)) return "N/A";
+  return `${value >= 0 ? "+" : "-"}${currency}${Math.abs(value)}`;
 }
 
 function buildPrompt() {
@@ -253,7 +263,7 @@ async function executeManagementActions(actionPositions, actionMap, { liveMessag
     const actionBlocks = instructionPositions.map((p) => [
       `POSITION: ${p.pair} (${p.position})`,
       `  pool: ${p.pool}`,
-      `  NET PnL: ${cur}${p.pnl_usd ?? "?"} (${p.pnl_pct ?? "?"}%; ${p.net_pnl_status ?? "UNKNOWN"}) | value: ${cur}${p.total_value_usd}`,
+      `  NET PnL: ${formatPositionNetPnlValue(p, cur)} (${formatNetPnlPercent(p)}; ${p.net_pnl_status ?? "UNKNOWN"}) | value: ${cur}${p.total_value_usd}`,
       `  capital PnL excl. fees (USD): $${p.capital_pnl_usd ?? "?"} | fee contribution (USD): $${p.fee_contribution_usd ?? "?"} | unclaimed fees: ${cur}${p.unclaimed_fees_usd} | fee_per_tvl_24h: ${p.fee_per_tvl_24h ?? "?"}%`,
       `  bins: lower=${p.lower_bin} upper=${p.upper_bin} active=${p.active_bin} | oor_minutes: ${p.minutes_out_of_range ?? 0}`,
       `  instruction: "${p.instruction}"`,
@@ -377,7 +387,7 @@ export async function runManagementCycle({ silent = false } = {}) {
       const val = config.management.solMode ? `◎${p.total_value_usd ?? "?"}` : `$${p.total_value_usd ?? "?"}`;
       const unclaimed = config.management.solMode ? `◎${p.unclaimed_fees_usd ?? "?"}` : `$${p.unclaimed_fees_usd ?? "?"}`;
       const statusLabel = act.action === "INSTRUCTION" ? "HOLD (instruction)" : act.action;
-      let line = `**${p.pair}** | Age: ${p.age_minutes ?? "?"}m | Val: ${val} | Unclaimed: ${unclaimed} | Net PnL: ${p.pnl_pct ?? "?"}% (${p.net_pnl_status ?? "UNKNOWN"}) | Yield: ${p.fee_per_tvl_24h ?? "?"}% | ${inRange} | ${statusLabel}`;
+      let line = `**${p.pair}** | Age: ${p.age_minutes ?? "?"}m | Val: ${val} | Unclaimed: ${unclaimed} | Net PnL: ${formatNetPnlPercent(p)} (${p.net_pnl_status ?? "UNKNOWN"}) | Yield: ${p.fee_per_tvl_24h ?? "?"}% | ${inRange} | ${statusLabel}`;
       if (p.instruction) line += `\nNote: "${p.instruction}"`;
       if (act.action === "CLOSE" && act.rule === "exit") {
         const exitLabel = act.exitAction === "STOP_LOSS" ? "Stop loss" : "Trailing TP";
@@ -1607,13 +1617,10 @@ async function telegramHandler(msg) {
       if (total_positions === 0) { await sendMessage("No open positions."); return; }
       const cur = config.management.solMode ? "◎" : "$";
       const lines = positions.map((p, i) => {
-        const pnlValue = Number(p.pnl_usd);
-        const pnl = Number.isFinite(pnlValue)
-          ? `${pnlValue >= 0 ? "+" : "-"}${cur}${Math.abs(pnlValue)}`
-          : "?";
+        const pnl = formatPositionNetPnlValue(p, cur);
         const age = p.age_minutes != null ? `${p.age_minutes}m` : "?";
         const oor = !p.in_range ? " ⚠️OOR" : "";
-        return `${i + 1}. ${p.pair} | ${cur}${p.total_value_usd} | Net PnL: ${pnl} (${p.pnl_pct ?? "?"}%; ${p.net_pnl_status ?? "UNKNOWN"}) | fees: ${cur}${p.unclaimed_fees_usd} | ${age}${oor}`;
+        return `${i + 1}. ${p.pair} | ${cur}${p.total_value_usd} | Net PnL: ${pnl} (${formatNetPnlPercent(p)}; ${p.net_pnl_status ?? "UNKNOWN"}) | fees: ${cur}${p.unclaimed_fees_usd} | ${age}${oor}`;
       });
       await sendMessage(`📊 Open Positions (${total_positions}):\n\n${lines.join("\n")}\n\n/close <n> to close | /claimall to review fees | /set <n> <note> to set instruction`);
     } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
@@ -1632,7 +1639,7 @@ async function telegramHandler(msg) {
         `Pool: ${pos.pool}`,
         `Position: ${pos.position}`,
         `Range: ${pos.lower_bin} → ${pos.upper_bin} | active ${pos.active_bin}`,
-        `Net PnL: ${pos.pnl_pct ?? "?"}% (${pos.net_pnl_status ?? "UNKNOWN"}) | fees: ${config.management.solMode ? "◎" : "$"}${pos.unclaimed_fees_usd ?? "?"}`,
+        `Net PnL: ${formatNetPnlPercent(pos)} (${pos.net_pnl_status ?? "UNKNOWN"}) | fees: ${config.management.solMode ? "◎" : "$"}${pos.unclaimed_fees_usd ?? "?"}`,
         `Capital PnL excl. fees: $${pos.capital_pnl_usd ?? "?"} | Fee contribution: $${pos.fee_contribution_usd ?? "?"}`,
         `Value: ${config.management.solMode ? "◎" : "$"}${pos.total_value_usd ?? "?"}`,
         `Age: ${pos.age_minutes ?? "?"}m | ${pos.in_range ? "IN RANGE" : `OOR ${pos.minutes_out_of_range ?? 0}m`}`,
