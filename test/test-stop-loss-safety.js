@@ -6,6 +6,7 @@ import test from "node:test";
 import {
   evaluateStopLossExecution,
   isUrgentStopLossClose,
+  isLosingStopLossExit,
   revalidateStopLossExecution,
   selectExitConfirmationTicks,
 } from "../stop-loss-safety.js";
@@ -141,4 +142,19 @@ test("only an automatic stop-loss close qualifies for claim-and-close prioritiza
   assert.equal(isUrgentStopLossClose("Stop loss: PnL -8.20% <= trigger -8%"), true);
   assert.equal(isUrgentStopLossClose("manual Telegram close"), false);
   assert.equal(isUrgentStopLossClose("Trailing TP: peak 5%"), false);
+});
+
+test("only a negative settled stop-loss qualifies for re-entry cooldown", () => {
+  assert.equal(isLosingStopLossExit({
+    closeReason: "Stop loss: PnL -8.20% <= trigger -8%",
+    pnlPct: -5.1,
+  }), true);
+  assert.equal(isLosingStopLossExit({
+    closeReason: "Stop loss: PnL -8.20% <= trigger -8%",
+    pnlPct: 0.2,
+  }), false);
+  assert.equal(isLosingStopLossExit({
+    closeReason: "manual close",
+    pnlPct: -5.1,
+  }), false);
 });

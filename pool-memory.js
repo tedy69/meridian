@@ -9,6 +9,7 @@ import fs from "fs";
 import { log } from "./logger.js";
 import { config } from "./config.js";
 import { isLosingTrailingExit } from "./trailing-safety.js";
+import { isLosingStopLossExit } from "./stop-loss-safety.js";
 
 import { repoPath } from "./repo-root.js";
 
@@ -181,6 +182,26 @@ export function recordPoolDeploy(poolAddress, deployData) {
     if (cooldownHours > 0) {
       const pnlText = Number(deploy.pnl_pct).toFixed(2);
       const reason = `losing trailing exit (${pnlText}%)`;
+      const poolCooldownUntil = setPoolCooldown(entry, cooldownHours, reason);
+      const mintCooldownUntil = setBaseMintCooldown(db, entry.base_mint, cooldownHours, reason);
+      log("pool-memory", `Cooldown set for ${entry.name} until ${poolCooldownUntil} (${reason})`);
+      if (entry.base_mint && mintCooldownUntil) {
+        log("pool-memory", `Base mint cooldown set for ${entry.base_mint.slice(0, 8)} until ${mintCooldownUntil} (${reason})`);
+      }
+    }
+  }
+
+  // A real stop-loss is a stronger warning than an ordinary negative close.
+  // Block the same pool and token from being immediately re-entered while the
+  // post-drop price discovery is still unstable.
+  if (isLosingStopLossExit({
+    closeReason: deploy.close_reason,
+    pnlPct: deploy.pnl_pct,
+  })) {
+    const cooldownHours = Math.max(0, Number(config.management.stopLossCooldownHours ?? 12));
+    if (cooldownHours > 0) {
+      const pnlText = Number(deploy.pnl_pct).toFixed(2);
+      const reason = `losing stop-loss exit (${pnlText}%)`;
       const poolCooldownUntil = setPoolCooldown(entry, cooldownHours, reason);
       const mintCooldownUntil = setBaseMintCooldown(db, entry.base_mint, cooldownHours, reason);
       log("pool-memory", `Cooldown set for ${entry.name} until ${poolCooldownUntil} (${reason})`);

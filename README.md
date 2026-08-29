@@ -523,13 +523,14 @@ All fields are optional — defaults shown. Edit `user-config.json`.
 | `stopLossPct` | `-15` | Intended maximum-loss target; the final on-chain outcome can still move during execution |
 | `stopLossTriggerPct` | `-8` | Early stop-loss trigger, deliberately above `stopLossPct` to leave execution room |
 | `stopLossConfirmTicks` | `1` | Authoritative PnL ticks required for stop loss; a fresh RPC recheck still occurs before submission |
+| `stopLossCooldownHours` | `12` | Blocks re-entry to the same pool and token after a stop-loss that settles negative; set `0` only to disable it explicitly |
 | `takeProfitPct` | `5` | Close when fees earned reach this % of capital |
 | `trailingTakeProfit` | `true` | Enable trailing take-profit |
 | `trailingTriggerPct` | `3` | Activate trailing TP at this PnL % |
 | `trailingDropPct` | `1.5` | Close when PnL drops this % from peak |
 | `strategy` | `bid_ask` | LP strategy: `spot`, `bid_ask`, or `curve` |
 
-`stopLossTriggerPct` must stay above `stopLossPct` (for example, `-8` and `-15`). This reduces execution overshoot, but a direct on-chain close cannot mathematically guarantee the final PnL during a sudden market move. When the LP relay is enabled and returns a valid zap-out order, Meridian uses the relay's configured minimum-output slippage bound before any local fallback.
+`stopLossTriggerPct` must stay above `stopLossPct` (for example, `-8` and `-15`). This reduces execution overshoot, but a direct on-chain close cannot mathematically guarantee the final PnL during a sudden market move. The fast PnL watchdog keeps sampling while other workflows are busy and defers only transaction submission until the transaction lane is free. A negative settled stop-loss starts the pool/token cooldown so the bot does not immediately re-enter the same collapsing asset. When the LP relay is enabled and returns a valid zap-out order, Meridian uses the relay's configured minimum-output slippage bound before any local fallback.
 
 ### Schedule
 

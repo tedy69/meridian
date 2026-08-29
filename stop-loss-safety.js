@@ -137,3 +137,12 @@ export function selectExitConfirmationTicks({ exitAction, defaultConfirmTicks, s
 export function isUrgentStopLossClose(closeReason) {
   return /^stop loss\b/i.test(String(closeReason || "").trim());
 }
+
+/**
+ * A stop-loss that really settles below entry is a market-risk signal, not an
+ * invitation to immediately re-enter the same pool or token.
+ */
+export function isLosingStopLossExit({ closeReason, pnlPct }) {
+  const settledPnlPct = finiteNumber(pnlPct);
+  return isUrgentStopLossClose(closeReason) && settledPnlPct != null && settledPnlPct < 0;
+}

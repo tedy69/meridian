@@ -39,6 +39,7 @@ import { assertMainnetRpc } from "./execution-guard.js";
 import { executeClaimAll, formatClaimAllOutcome, formatClaimAllPreflight, prepareClaimAll } from "./claim-all.js";
 import { revalidateTrailingProfitFloor } from "./trailing-safety.js";
 import { revalidateStopLossExecution, selectExitConfirmationTicks } from "./stop-loss-safety.js";
+import { getPnlWatchdogGate } from "./pnl-watchdog-safety.js";
 
 import { REPO_ROOT, repoPath } from "./repo-root.js";
 
@@ -819,7 +820,13 @@ Summarize the current portfolio health, total fees earned, and performance of al
   const confirmTicks = Math.max(1, Number(config.pnl.confirmTicks ?? 2));
   let _pnlPollBusy = false;
   const pnlPollInterval = setInterval(async () => {
-    if (_managementBusy || _screeningBusy || _claimAllBusy || _pnlPollBusy) return;
+    const pollGate = getPnlWatchdogGate({
+      pnlPollBusy: _pnlPollBusy,
+      managementBusy: _managementBusy,
+      screeningBusy: _screeningBusy,
+      claimAllBusy: _claimAllBusy,
+    });
+    if (!pollGate.shouldPoll) return;
     if (getTrackedPositions(true).length === 0) return;
     _pnlPollBusy = true;
     try {
@@ -851,6 +858,21 @@ Summarize the current portfolio health, total fees earned, and performance of al
         });
         const { fire } = registerExitSignal(p.position, signal, requiredConfirmTicks);
         if (!signal || !fire) continue;
+
+        // Keep sampling during a slow workflow, but never submit a close that
+        // races its transaction. The next 3s tick retries as soon as the lane
+        // is free; a stop loss needs only one confirming tick.
+        const executionGate = getPnlWatchdogGate({
+          managementBusy: _managementBusy,
+          screeningBusy: _screeningBusy,
+          claimAllBusy: _claimAllBusy,
+        });
+        if (!executionGate.canExecuteExit) {
+          if (signal === "STOP_LOSS") {
+            log("state", `[PnL poll] STOP_LOSS for ${p.pair} deferred while ${executionGate.executionBlocker} owns the transaction lane`);
+          }
+          continue;
+        }
 
         const nextStep = signal === "TRAILING_TP" || signal === "STOP_LOSS"
           ? "revalidating fresh PnL before close"
@@ -1123,7 +1145,7 @@ function formatConfigSnapshot() {
     "",
     `Strategy: ${config.strategy.strategy} | binsBelow: ${config.strategy.minBinsBelow}-${config.strategy.maxBinsBelow} | default ${config.strategy.defaultBinsBelow}`,
     `Deploy: ${config.management.deployAmountSol} SOL | gasReserve: ${config.management.gasReserve} | maxPositions: ${config.risk.maxPositions}`,
-    `Stop loss: trigger ${config.management.stopLossTriggerPct}% → target max ${config.management.stopLossPct}% | confirmation ${config.management.stopLossConfirmTicks} tick`,
+    `Stop loss: trigger ${config.management.stopLossTriggerPct}% → target max ${config.management.stopLossPct}% | confirmation ${config.management.stopLossConfirmTicks} tick | re-entry cooldown ${config.management.stopLossCooldownHours}h`,
     `Take profit: ${config.management.takeProfitPct}%`,
     `Trailing: ${config.management.trailingTakeProfit ? "on" : "off"} | trigger ${config.management.trailingTriggerPct}% | drop ${config.management.trailingDropPct}%`,
     `OOR: ${config.management.outOfRangeWaitMinutes}m | cooldown ${config.management.oorCooldownTriggerCount}x / ${config.management.oorCooldownHours}h`,
@@ -1167,6 +1189,7 @@ function settingValue(key) {
     stopLossPct: config.management.stopLossPct,
     stopLossTriggerPct: config.management.stopLossTriggerPct,
     stopLossConfirmTicks: config.management.stopLossConfirmTicks,
+    stopLossCooldownHours: config.management.stopLossCooldownHours,
     trailingTriggerPct: config.management.trailingTriggerPct,
     trailingDropPct: config.management.trailingDropPct,
     repeatDeployCooldownEnabled: config.management.repeatDeployCooldownEnabled,
@@ -1215,7 +1238,7 @@ function renderSettingsMenu(page = "main") {
     "",
     `Mode: ${config.management.solMode ? "SOL" : "USD"} | Relay: ${config.api.lpAgentRelayEnabled ? "on" : "off"}`,
     `Strategy: ${config.strategy.strategy} | bins ${config.strategy.minBinsBelow}-${config.strategy.maxBinsBelow} | deploy ${config.management.deployAmountSol} SOL`,
-    `TP/SL: ${config.management.takeProfitPct}% / trigger ${config.management.stopLossTriggerPct}% → max ${config.management.stopLossPct}% | trailing ${config.management.trailingTakeProfit ? "on" : "off"}`,
+    `TP/SL: ${config.management.takeProfitPct}% / trigger ${config.management.stopLossTriggerPct}% → max ${config.management.stopLossPct}% | cooldown ${config.management.stopLossCooldownHours}h | trailing ${config.management.trailingTakeProfit ? "on" : "off"}`,
     `Indicators: ${config.indicators.enabled ? "on" : "off"} | entry ${config.indicators.entryPreset} | ${fmtSettingValue(config.indicators.intervals)}`,
   ].join("\n");
 
@@ -1245,6 +1268,7 @@ function renderSettingsMenu(page = "main") {
       stepButtons("takeProfitPct", "TP %", 1, { digits: 0 }),
       stepButtons("stopLossTriggerPct", "SL trigger", 1, { digits: 0 }),
       stepButtons("stopLossPct", "SL max", 1, { digits: 0 }),
+      stepButtons("stopLossCooldownHours", "SL cooldown hrs", 1, { digits: 0 }),
       [toggleButton("trailingTakeProfit", "Trailing TP")],
       stepButtons("trailingTriggerPct", "Trail trigger", 0.5, { digits: 1 }),
       stepButtons("trailingDropPct", "Trail drop", 0.5, { digits: 1 }),
@@ -1365,6 +1389,7 @@ async function applySettingsMenuCallback(msg) {
     if (key === "repeatDeployCooldownTriggerCount") value = Math.max(1, Math.round(value));
     if (key === "repeatDeployCooldownHours") value = Math.max(0, Math.round(value));
     if (key === "repeatDeployCooldownMinFeeEarnedPct") value = Math.max(0, value);
+    if (key === "stopLossCooldownHours") value = Math.max(0, Math.round(value));
     if (["minBinsBelow", "maxBinsBelow", "defaultBinsBelow"].includes(key)) value = Math.max(35, Math.round(value));
     if (["deployAmountSol", "gasReserve", "maxDeployAmount"].includes(key)) value = Math.max(0, value);
   } else if (action === "set") {

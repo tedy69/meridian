@@ -57,6 +57,7 @@
   "stopLossPct": -15,
   "stopLossTriggerPct": -8,
   "stopLossConfirmTicks": 1,
+  "stopLossCooldownHours": 12,
   "takeProfitPct": 5,
   "minFeePerTvl24h": 7,
   "minAgeBeforeYieldCheck": 60,
