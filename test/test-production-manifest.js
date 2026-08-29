@@ -7,6 +7,11 @@ test("runtime node-fetch fallback is declared directly", () => {
   assert.match(manifest.dependencies?.["node-fetch"] || "", /^\^?2\./);
 });
 
+test("syntax test script propagates parse failures", () => {
+  const manifest = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+  assert.match(manifest.scripts?.["test:syntax"] || "", /xargs -0 -n 1 node --check/);
+});
+
 test("the runtime dependency volume is mounted at a node_modules path", () => {
   const compose = fs.readFileSync(new URL("../compose.yaml", import.meta.url), "utf8");
   const dockerfile = fs.readFileSync(new URL("../Dockerfile", import.meta.url), "utf8");
