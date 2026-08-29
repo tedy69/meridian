@@ -1,6 +1,7 @@
 import { Connection, PublicKey } from "@solana/web3.js";
 import { config } from "../config.js";
 import { log } from "../logger.js";
+import { calculateOpenPositionPerformance } from "../position-performance.js";
 import {
   getTrackedPosition,
   markOutOfRange,
@@ -170,10 +171,24 @@ function buildPosition(f, prices, solUsd, meteora, solMode) {
   const claimedUsd = safeNum(meteora?.allTimeFees?.total?.usd);
   const claimedSol = safeNum(meteora?.allTimeFees?.total?.sol);
 
-  const pnlUsd = balancesUsd + withdrawUsd + claimableUsd + claimedUsd - depositsUsd;
-  const pnlSol = balancesSol + withdrawSol + claimableSol + claimedSol - depositsSol;
-  const pctUsd = depositsUsd > 0 ? (pnlUsd / depositsUsd) * 100 : 0;
-  const pctSol = depositsSol > 0 ? (pnlSol / depositsSol) * 100 : 0;
+  const usdPerformance = calculateOpenPositionPerformance({
+    depositsUsd,
+    balancesUsd,
+    withdrawalsUsd: withdrawUsd,
+    claimedFeesUsd: claimedUsd,
+    unclaimedFeesUsd: claimableUsd,
+  });
+  const solPerformance = calculateOpenPositionPerformance({
+    depositsUsd: depositsSol,
+    balancesUsd: balancesSol,
+    withdrawalsUsd: withdrawSol,
+    claimedFeesUsd: claimedSol,
+    unclaimedFeesUsd: claimableSol,
+  });
+  const pnlUsd = usdPerformance.netPnlUsd ?? 0;
+  const pnlSol = solPerformance.netPnlUsd ?? 0;
+  const pctUsd = usdPerformance.netPnlPct ?? 0;
+  const pctSol = solPerformance.netPnlPct ?? 0;
 
   const ourPct = solMode ? pctSol : pctUsd;
 
@@ -209,6 +224,9 @@ function buildPosition(f, prices, solUsd, meteora, solMode) {
     ? Math.floor((Date.now() - new Date(tracked.deployed_at).getTime()) / 60000)
     : null;
   const ageMinutes = meteora?.createdAt ? Math.floor((Date.now() - meteora.createdAt * 1000) / 60000) : ageFromState;
+  const accountingAvailable = usdPerformance.available && !pnlPctSuspicious;
+  const netPnlStatus = accountingAvailable ? usdPerformance.netPnlStatus : "UNKNOWN";
+  const capitalStatus = accountingAvailable ? usdPerformance.capitalStatus : "UNKNOWN";
 
   return {
     position:           f.position,
@@ -229,8 +247,17 @@ function buildPosition(f, prices, solUsd, meteora, solMode) {
     pnl_true_usd:       round(pnlUsd),
     pnl_pct:            round(ourPct, 2),
     pnl_pct_derived:    round(ourPct, 2),
+    pnl_pct_reported:   reportedPct != null ? round(reportedPct, 2) : null,
     pnl_pct_diff:       pnlPctDiff != null ? round(pnlPctDiff, 2) : null,
     pnl_pct_suspicious: !!pnlPctSuspicious,
+    // Canonical accounting fields for the LLM/UI. The sign is never inferred
+    // from fees alone: net = current balances + withdrawals + all fees - deposits.
+    net_pnl_usd:         accountingAvailable ? round(usdPerformance.netPnlUsd) : null,
+    net_pnl_pct:         accountingAvailable ? round(usdPerformance.netPnlPct, 2) : null,
+    capital_pnl_usd:     accountingAvailable ? round(usdPerformance.capitalPnlUsd) : null,
+    fee_contribution_usd: accountingAvailable ? round(usdPerformance.feeContributionUsd) : null,
+    net_pnl_status:      netPnlStatus,
+    capital_pnl_status:  capitalStatus,
     fee_per_tvl_24h:    meteora ? Math.round(safeNum(meteora.feePerTvl24h) * 100) / 100 : null,
     age_minutes:        ageMinutes,
     minutes_out_of_range: minutesOutOfRange(f.position),

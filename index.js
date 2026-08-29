@@ -253,7 +253,8 @@ async function executeManagementActions(actionPositions, actionMap, { liveMessag
     const actionBlocks = instructionPositions.map((p) => [
       `POSITION: ${p.pair} (${p.position})`,
       `  pool: ${p.pool}`,
-      `  pnl_pct: ${p.pnl_pct}% | unclaimed_fees: ${cur}${p.unclaimed_fees_usd} | value: ${cur}${p.total_value_usd} | fee_per_tvl_24h: ${p.fee_per_tvl_24h ?? "?"}%`,
+      `  NET PnL: ${cur}${p.pnl_usd ?? "?"} (${p.pnl_pct ?? "?"}%; ${p.net_pnl_status ?? "UNKNOWN"}) | value: ${cur}${p.total_value_usd}`,
+      `  capital PnL excl. fees (USD): $${p.capital_pnl_usd ?? "?"} | fee contribution (USD): $${p.fee_contribution_usd ?? "?"} | unclaimed fees: ${cur}${p.unclaimed_fees_usd} | fee_per_tvl_24h: ${p.fee_per_tvl_24h ?? "?"}%`,
       `  bins: lower=${p.lower_bin} upper=${p.upper_bin} active=${p.active_bin} | oor_minutes: ${p.minutes_out_of_range ?? 0}`,
       `  instruction: "${p.instruction}"`,
     ].join("\n")).join("\n\n");
@@ -376,7 +377,7 @@ export async function runManagementCycle({ silent = false } = {}) {
       const val = config.management.solMode ? `◎${p.total_value_usd ?? "?"}` : `$${p.total_value_usd ?? "?"}`;
       const unclaimed = config.management.solMode ? `◎${p.unclaimed_fees_usd ?? "?"}` : `$${p.unclaimed_fees_usd ?? "?"}`;
       const statusLabel = act.action === "INSTRUCTION" ? "HOLD (instruction)" : act.action;
-      let line = `**${p.pair}** | Age: ${p.age_minutes ?? "?"}m | Val: ${val} | Unclaimed: ${unclaimed} | PnL: ${p.pnl_pct ?? "?"}% | Yield: ${p.fee_per_tvl_24h ?? "?"}% | ${inRange} | ${statusLabel}`;
+      let line = `**${p.pair}** | Age: ${p.age_minutes ?? "?"}m | Val: ${val} | Unclaimed: ${unclaimed} | Net PnL: ${p.pnl_pct ?? "?"}% (${p.net_pnl_status ?? "UNKNOWN"}) | Yield: ${p.fee_per_tvl_24h ?? "?"}% | ${inRange} | ${statusLabel}`;
       if (p.instruction) line += `\nNote: "${p.instruction}"`;
       if (act.action === "CLOSE" && act.rule === "exit") {
         const exitLabel = act.exitAction === "STOP_LOSS" ? "Stop loss" : "Trailing TP";
@@ -1606,10 +1607,13 @@ async function telegramHandler(msg) {
       if (total_positions === 0) { await sendMessage("No open positions."); return; }
       const cur = config.management.solMode ? "◎" : "$";
       const lines = positions.map((p, i) => {
-        const pnl = p.pnl_usd >= 0 ? `+${cur}${p.pnl_usd}` : `-${cur}${Math.abs(p.pnl_usd)}`;
+        const pnlValue = Number(p.pnl_usd);
+        const pnl = Number.isFinite(pnlValue)
+          ? `${pnlValue >= 0 ? "+" : "-"}${cur}${Math.abs(pnlValue)}`
+          : "?";
         const age = p.age_minutes != null ? `${p.age_minutes}m` : "?";
         const oor = !p.in_range ? " ⚠️OOR" : "";
-        return `${i + 1}. ${p.pair} | ${cur}${p.total_value_usd} | PnL: ${pnl} | fees: ${cur}${p.unclaimed_fees_usd} | ${age}${oor}`;
+        return `${i + 1}. ${p.pair} | ${cur}${p.total_value_usd} | Net PnL: ${pnl} (${p.pnl_pct ?? "?"}%; ${p.net_pnl_status ?? "UNKNOWN"}) | fees: ${cur}${p.unclaimed_fees_usd} | ${age}${oor}`;
       });
       await sendMessage(`📊 Open Positions (${total_positions}):\n\n${lines.join("\n")}\n\n/close <n> to close | /claimall to review fees | /set <n> <note> to set instruction`);
     } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
@@ -1628,7 +1632,8 @@ async function telegramHandler(msg) {
         `Pool: ${pos.pool}`,
         `Position: ${pos.position}`,
         `Range: ${pos.lower_bin} → ${pos.upper_bin} | active ${pos.active_bin}`,
-        `PnL: ${pos.pnl_pct ?? "?"}% | fees: ${config.management.solMode ? "◎" : "$"}${pos.unclaimed_fees_usd ?? "?"}`,
+        `Net PnL: ${pos.pnl_pct ?? "?"}% (${pos.net_pnl_status ?? "UNKNOWN"}) | fees: ${config.management.solMode ? "◎" : "$"}${pos.unclaimed_fees_usd ?? "?"}`,
+        `Capital PnL excl. fees: $${pos.capital_pnl_usd ?? "?"} | Fee contribution: $${pos.fee_contribution_usd ?? "?"}`,
         `Value: ${config.management.solMode ? "◎" : "$"}${pos.total_value_usd ?? "?"}`,
         `Age: ${pos.age_minutes ?? "?"}m | ${pos.in_range ? "IN RANGE" : `OOR ${pos.minutes_out_of_range ?? 0}m`}`,
         pos.instruction ? `Note: ${pos.instruction}` : null,

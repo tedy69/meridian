@@ -33,6 +33,7 @@ import { appendDecision } from "../decision-log.js";
 import { agentMeridianJson, getAgentIdForRequests, getAgentMeridianHeaders } from "./agent-meridian.js";
 import { getAndClearStagedSignals } from "../signal-tracker.js";
 import { computePositions, fetchDlmmPnlForPool } from "./pnl.js";
+import { calculateOpenPositionPerformance } from "../position-performance.js";
 import { assertLiveTradingEnabled, assertMainnetRpc, assertOnChainWriteAllowed, isDryRun } from "../execution-guard.js";
 import { evaluateCloseProof } from "../close-settlement.js";
 import { normalizeSlippageBps } from "../trailing-safety.js";
@@ -1132,6 +1133,12 @@ export async function getPositionPnl({ pool_address, position_address }) {
           current_value_usd: p.total_value_usd,
           unclaimed_fee_usd: p.unclaimed_fees_usd,
           all_time_fees_usd: p.collected_fees_usd,
+          net_pnl_usd: p.net_pnl_usd ?? p.pnl_true_usd ?? p.pnl_usd,
+          net_pnl_pct: p.net_pnl_pct ?? p.pnl_pct,
+          capital_pnl_usd: p.capital_pnl_usd ?? null,
+          fee_contribution_usd: p.fee_contribution_usd ?? null,
+          net_pnl_status: p.net_pnl_status ?? "UNKNOWN",
+          capital_pnl_status: p.capital_pnl_status ?? "UNKNOWN",
           fee_per_tvl_24h: p.fee_per_tvl_24h,
           in_range: p.in_range,
           lower_bin: p.lower_bin,
@@ -1159,13 +1166,22 @@ export async function getPositionPnl({ pool_address, position_address }) {
     const reportedPnlPct = solMode
       ? maybeNum(p.pnlSolPctChange)
       : maybeNum(p.pnlPctChange);
-    const derivedPnlPct = deriveOpenPnlPct(p, solMode);
+    const configuredPerformance = deriveOpenPnlPerformance(p, solMode);
+    const usdPerformance = deriveOpenPnlPerformance(p, false);
+    const derivedPnlPct = configuredPerformance.available ? configuredPerformance.netPnlPct : null;
     return {
-      pnl_usd:           roundNum(solMode ? p.pnlSol : p.pnlUsd, 4),
-      pnl_pct:           roundNum(reportedPnlPct ?? derivedPnlPct ?? 0, 2),
+      pnl_usd:           configuredPerformance.available ? roundNum(configuredPerformance.netPnlUsd, 4) : null,
+      pnl_pct:           derivedPnlPct != null ? roundNum(derivedPnlPct, 2) : null,
       current_value_usd: roundNum(currentValue, 4),
       unclaimed_fee_usd: roundNum(unclaimedValue, 4),
       all_time_fees_usd: roundNum(solMode ? p.allTimeFees?.total?.sol : p.allTimeFees?.total?.usd, 4),
+      net_pnl_usd:       usdPerformance.available ? roundNum(usdPerformance.netPnlUsd, 4) : null,
+      net_pnl_pct:       usdPerformance.available ? roundNum(usdPerformance.netPnlPct, 2) : null,
+      capital_pnl_usd:   usdPerformance.available ? roundNum(usdPerformance.capitalPnlUsd, 4) : null,
+      fee_contribution_usd: usdPerformance.available ? roundNum(usdPerformance.feeContributionUsd, 4) : null,
+      net_pnl_status:    usdPerformance.netPnlStatus,
+      capital_pnl_status: usdPerformance.capitalStatus,
+      pnl_pct_reported:  reportedPnlPct != null ? roundNum(reportedPnlPct, 2) : null,
       fee_per_tvl_24h:   Math.round(parseFloat(p.feePerTvl24h || 0) * 100) / 100,
       in_range:    !p.isOutOfRange,
       lower_bin:   p.lowerBinId      ?? null,
@@ -1248,14 +1264,12 @@ function getClosedPnlPct(posEntry, solMode = false) {
   return deposit && deposit > 0 ? (pnl / deposit) * 100 : 0;
 }
 
-function deriveOpenPnlPct(binData, solMode = false) {
-  if (!binData) return null;
+function deriveOpenPnlPerformance(binData, solMode = false) {
+  if (!binData) return calculateOpenPositionPerformance();
 
-  const deposit = solMode
+  const deposits = solMode
     ? safeNum(binData.allTimeDeposits?.total?.sol)
     : safeNum(binData.allTimeDeposits?.total?.usd);
-  if (deposit <= 0) return null;
-
   const balances = solMode
     ? safeNum(binData.unrealizedPnl?.balancesSol)
     : safeNum(binData.unrealizedPnl?.balances);
@@ -1265,23 +1279,27 @@ function deriveOpenPnlPct(binData, solMode = false) {
   const withdrawals = solMode
     ? safeNum(binData.allTimeWithdrawals?.total?.sol)
     : safeNum(binData.allTimeWithdrawals?.total?.usd);
-  const fees = solMode
+  const claimedFees = solMode
     ? safeNum(binData.allTimeFees?.total?.sol)
     : safeNum(binData.allTimeFees?.total?.usd);
 
-  const pnl = balances + unclaimedFees + withdrawals + fees - deposit;
-  return (pnl / deposit) * 100;
+  return calculateOpenPositionPerformance({
+    depositsUsd: deposits,
+    balancesUsd: balances,
+    withdrawalsUsd: withdrawals,
+    claimedFeesUsd: claimedFees,
+    unclaimedFeesUsd: unclaimedFees,
+  });
 }
 
-function deriveLpAgentPnlPct(lpData, solMode = false) {
-  if (!lpData) return null;
-  const deposit = solMode ? safeNum(lpData.inputNative) : safeNum(lpData.inputValue);
-  if (deposit <= 0) return null;
-
-  const currentValue = solMode ? safeNum(lpData.valueNative) : safeNum(lpData.value);
-  const unclaimedFees = solMode ? safeNum(lpData.unCollectedFeeNative) : safeNum(lpData.unCollectedFee);
-  const pnl = currentValue + unclaimedFees - deposit;
-  return (pnl / deposit) * 100;
+function deriveLpAgentPnlPerformance(lpData, solMode = false) {
+  if (!lpData) return calculateOpenPositionPerformance();
+  return calculateOpenPositionPerformance({
+    depositsUsd: solMode ? safeNum(lpData.inputNative) : safeNum(lpData.inputValue),
+    balancesUsd: solMode ? safeNum(lpData.valueNative) : safeNum(lpData.value),
+    claimedFeesUsd: solMode ? safeNum(lpData.collectedFeeNative) : safeNum(lpData.collectedFee),
+    unclaimedFeesUsd: solMode ? safeNum(lpData.unCollectedFeeNative) : safeNum(lpData.unCollectedFee),
+  });
 }
 
 async function fetchRawOpenPositionsFromMeridian({ walletAddress, agentId }) {
@@ -1386,6 +1404,12 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
         const upperBin  = binData?.upperBinId      ?? tracked?.bin_range?.max ?? null;
         const activeBin = binData?.poolActiveBinId ?? tracked?.bin_range?.active ?? null;
         const lpData = lpAgentByPosition[positionAddress] || null;
+        const configuredPerformance = lpData
+          ? deriveLpAgentPnlPerformance(lpData, config.management.solMode)
+          : deriveOpenPnlPerformance(binData, config.management.solMode);
+        const usdPerformance = lpData
+          ? deriveLpAgentPnlPerformance(lpData, false)
+          : deriveOpenPnlPerformance(binData, false);
 
         const ageFromState = tracked?.deployed_at
           ? Math.floor((Date.now() - new Date(tracked.deployed_at).getTime()) / 60000)
@@ -1395,11 +1419,9 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
           : binData
             ? parseFloat(config.management.solMode ? (binData.pnlSolPctChange || 0) : (binData.pnlPctChange || 0))
             : null;
-        const derivedPnlPct = lpData
-          ? deriveLpAgentPnlPct(lpData, config.management.solMode)
-          : binData
-            ? deriveOpenPnlPct(binData, config.management.solMode)
-            : null;
+        const derivedPnlPct = configuredPerformance.available
+          ? configuredPerformance.netPnlPct
+          : null;
         const pnlPctDiff = reportedPnlPct != null && derivedPnlPct != null
           ? Math.abs(reportedPnlPct - derivedPnlPct)
           : null;
@@ -1407,7 +1429,7 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
         // from either method — e.g. missing deposits / data outage). Reported-vs-derived
         // divergence is normal noise on volatile pools, so it is logged but NOT gated —
         // gating on it froze all exits (stop-loss/trailing/close) and stranded positions.
-        const pnlPctSuspicious = reportedPnlPct == null && derivedPnlPct == null;
+        const pnlPctSuspicious = !configuredPerformance.available;
         if (pnlPctSuspicious) {
           log("positions_warn", `Unpriceable pnl_pct for ${positionAddress.slice(0, 8)}: no valid reported/derived value this tick — PnL rules paused`);
         } else if (pnlPctDiff != null && pnlPctDiff > (config.management.pnlSanityMaxDiffPct ?? 5)) {
@@ -1470,26 +1492,31 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
             : binData
             ? Math.round(parseFloat(binData.allTimeFees?.total?.usd || 0) * 10000) / 10000
             : null,
-          pnl_usd:            lpData
-            ? Math.round((
-                config.management.solMode
-                  ? safeNum(lpData.pnl?.valueNative)
-                  : safeNum(lpData.pnl?.value)
-              ) * 10000) / 10000
-            : binData
-            ? Math.round(parseFloat(config.management.solMode ? (binData.pnlSol || 0) : (binData.pnlUsd || 0)) * 10000) / 10000
+          pnl_usd:            configuredPerformance.available
+            ? Math.round(configuredPerformance.netPnlUsd * 10000) / 10000
             : null,
-          pnl_true_usd:       lpData
-            ? Math.round(safeNum(lpData.pnl?.value) * 10000) / 10000
-            : binData
-            ? Math.round(parseFloat(binData.pnlUsd || 0) * 10000) / 10000
+          pnl_true_usd:       usdPerformance.available
+            ? Math.round(usdPerformance.netPnlUsd * 10000) / 10000
             : null,
-          pnl_pct:            (lpData || binData)
-            ? Math.round(reportedPnlPct * 100) / 100
-            : null,
+          pnl_pct:            derivedPnlPct != null ? Math.round(derivedPnlPct * 100) / 100 : null,
           pnl_pct_derived:    derivedPnlPct != null ? Math.round(derivedPnlPct * 100) / 100 : null,
+          pnl_pct_reported:   reportedPnlPct != null ? Math.round(reportedPnlPct * 100) / 100 : null,
           pnl_pct_diff:       pnlPctDiff != null ? Math.round(pnlPctDiff * 100) / 100 : null,
           pnl_pct_suspicious: !!pnlPctSuspicious,
+          net_pnl_usd:        usdPerformance.available
+            ? Math.round(usdPerformance.netPnlUsd * 10000) / 10000
+            : null,
+          net_pnl_pct:        usdPerformance.available
+            ? Math.round(usdPerformance.netPnlPct * 100) / 100
+            : null,
+          capital_pnl_usd:    usdPerformance.available
+            ? Math.round(usdPerformance.capitalPnlUsd * 10000) / 10000
+            : null,
+          fee_contribution_usd: usdPerformance.available
+            ? Math.round(usdPerformance.feeContributionUsd * 10000) / 10000
+            : null,
+          net_pnl_status:     pnlPctSuspicious ? "UNKNOWN" : usdPerformance.netPnlStatus,
+          capital_pnl_status: pnlPctSuspicious ? "UNKNOWN" : usdPerformance.capitalStatus,
           unclaimed_fees_true_usd: lpData
             ? Math.round(safeNum(lpData.unCollectedFee) * 10000) / 10000
             : binData
@@ -1576,7 +1603,9 @@ export async function getWalletPositions({ wallet_address }) {
           ? maybeNum(p.pnlSolPctChange)
           : maybeNum(p.pnlPctChange)
         : null;
-      const derivedPnlPct = p ? deriveOpenPnlPct(p, solMode) : null;
+      const configuredPerformance = deriveOpenPnlPerformance(p, solMode);
+      const usdPerformance = deriveOpenPnlPerformance(p, false);
+      const derivedPnlPct = configuredPerformance.available ? configuredPerformance.netPnlPct : null;
 
       return {
         position:           r.position,
@@ -1587,8 +1616,16 @@ export async function getWalletPositions({ wallet_address }) {
         in_range:           p ? !p.isOutOfRange : null,
         unclaimed_fees_usd: roundNum(unclaimedValue, 4),
         total_value_usd:    roundNum(currentValue, 4),
-        pnl_usd:            roundNum(p ? (solMode ? p.pnlSol : p.pnlUsd) : 0, 4),
-        pnl_pct:            roundNum(reportedPnlPct ?? derivedPnlPct ?? 0, 2),
+        pnl_usd:            configuredPerformance.available ? roundNum(configuredPerformance.netPnlUsd, 4) : null,
+        pnl_pct:            derivedPnlPct != null ? roundNum(derivedPnlPct, 2) : null,
+        pnl_pct_derived:    derivedPnlPct != null ? roundNum(derivedPnlPct, 2) : null,
+        pnl_pct_reported:   reportedPnlPct != null ? roundNum(reportedPnlPct, 2) : null,
+        net_pnl_usd:        usdPerformance.available ? roundNum(usdPerformance.netPnlUsd, 4) : null,
+        net_pnl_pct:        usdPerformance.available ? roundNum(usdPerformance.netPnlPct, 2) : null,
+        capital_pnl_usd:    usdPerformance.available ? roundNum(usdPerformance.capitalPnlUsd, 4) : null,
+        fee_contribution_usd: usdPerformance.available ? roundNum(usdPerformance.feeContributionUsd, 4) : null,
+        net_pnl_status:     usdPerformance.netPnlStatus,
+        capital_pnl_status: usdPerformance.capitalStatus,
         age_minutes:        p?.createdAt ? Math.floor((Date.now() - p.createdAt * 1000) / 60000) : null,
       };
     });

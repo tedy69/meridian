@@ -206,8 +206,9 @@ WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
     type: "function",
     function: {
       name: "get_position_pnl",
-      description: `Get detailed PnL and real-time Fee/TVL metrics for an open position.
+      description: `Get canonical net PnL and real-time Fee/TVL metrics for an open position.
 Use this during management to check if yield has dropped significantly.
+PnL is net of current LP balances, withdrawals, claimed fees, and unclaimed fees minus deposits. Use net_pnl_status as the only profit/loss label: positive fees alone never mean a position is profitable. capital_pnl_usd excludes fees and must be disclosed separately when it is negative.
 Returns current feePerTvl24h which indicates the current APY of the pool.`,
       parameters: {
         type: "object",
@@ -230,11 +231,12 @@ Returns positions grouped by pool, each with:
 - pool address and token pair
 - bin range (min/max bin IDs)
 - whether currently in range
-- unclaimed fees (in USD)
-- total deposited value vs current value
+- canonical net PnL (net_pnl_usd/net_pnl_status) and its percentage
+- capital PnL excluding fees (capital_pnl_usd), plus the separate fee contribution
+- unclaimed fees and current LP value
 - time since last rebalance
 
-Use this at the start of every management cycle.`,
+Use this at the start of every management cycle. Never call an open position a floating profit when net_pnl_status is FLOATING_NET_LOSS, even if its fee fields are positive.`,
       parameters: {
         type: "object",
         properties: {}
@@ -309,7 +311,7 @@ Use this when the user asks about another wallet's positions, wants to monitor a
 or wants to copy/compare positions.
 
 Returns the same structure as get_my_positions but for the given wallet:
-position address, pool, bin range, in-range status, unclaimed fees, PnL, age.`,
+position address, pool, bin range, in-range status, unclaimed fees, canonical net PnL, capital PnL excluding fees, and age.`,
       parameters: {
         type: "object",
         properties: {
