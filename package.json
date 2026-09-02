@@ -17,7 +17,7 @@
     "dev": "DRY_RUN=true node index.js",
     "test": "npm run test:syntax && npm run test:guard",
     "test:syntax": "find . -path ./node_modules -prune -o -name '*.js' -print0 | xargs -0 -n 1 node --check",
-    "test:guard": "node --test test/test-execution-guard.js test/test-execution-budget.js test/test-deploy-sizing.js test/test-claim-all.js test/test-close-settlement.js test/test-dependency-safety.js test/test-production-manifest.js test/test-settlement-gate.js test/test-trailing-profit-lock.js test/test-trailing-safety.js test/test-stop-loss-safety.js test/test-pnl-watchdog-safety.js test/test-pool-memory-cooldown.js test/test-briefing-html.js test/test-position-performance.js test/test-risk-intelligence.js test/test-spot-momentum.js test/test-spot-realtime.js",
+    "test:guard": "node --test test/test-execution-guard.js test/test-execution-budget.js test/test-deploy-sizing.js test/test-claim-all.js test/test-close-settlement.js test/test-dependency-safety.js test/test-production-manifest.js test/test-settlement-gate.js test/test-trailing-profit-lock.js test/test-trailing-safety.js test/test-stop-loss-safety.js test/test-pnl-watchdog-safety.js test/test-pool-memory-cooldown.js test/test-briefing-html.js test/test-position-performance.js test/test-risk-intelligence.js test/test-spot-momentum.js test/test-spot-realtime.js test/test-telegram-spot-confirmation.js",
     "test:screen": "node test/test-screening.js",
     "test:agent": "DRY_RUN=true node test/test-agent.js",
     "postinstall": "node scripts/postinstall.js"

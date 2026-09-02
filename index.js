@@ -52,6 +52,12 @@ import { formatNetPnlPercent } from "./position-performance.js";
 import { buildRiskIntelligenceBrief, evaluateLossCircuitBreaker, evaluateTokenAuditRisk } from "./risk-intelligence.js";
 import { getSpotMomentumCandidates, getSpotPositionSnapshot, getSpotStatus } from "./tools/spot.js";
 import { createSpotRealtimeMonitor } from "./spot-realtime.js";
+import {
+  createSpotConfirmationStore,
+  formatConfirmedSpotOpenResult,
+  formatSpotConfirmationResolution,
+  groundSpotAgentOutcome,
+} from "./telegram-spot-confirmation.js";
 
 import { REPO_ROOT, repoPath } from "./repo-root.js";
 
@@ -138,6 +144,7 @@ let _screeningLastTriggered = 0; // epoch ms — prevents management from spammi
 let _spotExitKey = null;
 let _spotExitCount = 0;
 let _spotRealtimeMonitor = null;
+const spotConfirmationStore = createSpotConfirmationStore();
 // Exit/peak confirmation is now done by consecutive-tick counting in state.js
 // (registerExitSignal / confirmPeak), driven by the 3s RPC poller — no setTimeout rechecks.
 
@@ -498,6 +505,8 @@ async function runSpotScreeningCycle({ silent = false } = {}) {
 
     let openAttempted = false;
     let openSucceeded = false;
+    let openUncertain = false;
+    let spotOpenResult = null;
     const { content } = await agentLoop(`
 FAST SPOT MOMENTUM DECISION
 
@@ -515,13 +524,24 @@ Choose at most one candidate. A high score alone is insufficient: reject a stret
       onToolFinish: async ({ name, result, success }) => {
         if (name === "open_spot_position") {
           openAttempted = true;
-          openSucceeded = Boolean(success && result?.success !== false && !result?.error && !result?.blocked);
+          if (spotOpenResult == null) spotOpenResult = result;
+          const groundedResult = formatConfirmedSpotOpenResult(result, config.spot.tradeAmountSol);
+          openSucceeded = groundedResult.kind === "open_confirmed" || groundedResult.kind === "open_dry_run";
+          openUncertain = groundedResult.kind === "open_uncertain";
+          success = openSucceeded;
         }
         await liveMessage?.toolFinish(name, result, success);
       },
     });
-    report = content || "Spot decision returned no report.";
-    if (!openSucceeded) {
+    const groundedReport = groundSpotAgentOutcome({
+      assistantText: content || "Spot decision returned no report.",
+      candidateResult: null,
+      openResult: spotOpenResult,
+      confirmationStore: null,
+      amountSol: config.spot.tradeAmountSol,
+    });
+    report = groundedReport.text;
+    if (!openSucceeded && !openUncertain) {
       appendDecision({
         type: "spot_no_trade",
         actor: "SCREENER",
@@ -1817,6 +1837,8 @@ function formatHelpText() {
     "/briefing — morning briefing",
     "/hive — HiveMind sync status",
     "/hive pull — manual HiveMind pull now",
+    "/confirm — confirm one pending spot entry",
+    "/cancel — cancel a pending spot entry",
     "/pause — stop cron cycles",
     "/resume — start cron cycles again",
     "/stop — shut down agent",
@@ -1942,6 +1964,59 @@ async function telegramHandler(msg) {
       sendMessage("Queue is full (5 messages). Wait for the agent to finish.").catch(() => {});
     }
     return;
+  }
+
+  if (config.trading.mode === "spot_momentum") {
+    const confirmationReply = spotConfirmationStore.resolveReply(text);
+    if (confirmationReply.handled) {
+      if (confirmationReply.status !== "confirmed") {
+        await sendMessage(formatSpotConfirmationResolution(confirmationReply)).catch(() => {});
+        return;
+      }
+
+      busy = true;
+      _screeningBusy = true;
+      let liveMessage = null;
+      let executionStarted = false;
+      const confirmation = confirmationReply.confirmation;
+      try {
+        log("spot_confirmation", `Accepted ${confirmation.id} for ${confirmation.pool.slice(0, 8)}...`);
+        liveMessage = await createLiveMessage(
+          "Spot Entry Confirmation",
+          `Fresh preflight untuk ${confirmation.name} sedang dijalankan.`,
+        );
+        await liveMessage?.toolStart("open_spot_position");
+        executionStarted = true;
+        const result = await executeTool("open_spot_position", {
+          pool_address: confirmation.pool,
+        });
+        const grounded = formatConfirmedSpotOpenResult(result, config.spot.tradeAmountSol);
+        await liveMessage?.toolFinish(
+          "open_spot_position",
+          result,
+          grounded.kind === "open_confirmed" || grounded.kind === "open_dry_run",
+        );
+        appendHistory(text, grounded.text);
+        if (liveMessage) await liveMessage.finalize(grounded.text);
+        else await sendMessage(grounded.text);
+      } catch (error) {
+        const detail = String(error?.message || error || "unknown error")
+          .replace(/[\r\n\t]+/g, " ")
+          .slice(0, 300);
+        const message = executionStarted
+          ? `STATUS TRANSAKSI BELUM PASTI\n\nExecution flow ended without an authoritative result: ${detail}\nJANGAN kirim ulang konfirmasi. Cek status posisi dan chain terlebih dahulu.`
+          : `Konfirmasi gagal sebelum tool eksekusi dimulai: ${detail}\nTidak ada transaksi yang dikirim.`;
+        log("spot_confirmation_error", detail);
+        if (liveMessage) await liveMessage.fail(message).catch(() => {});
+        else await sendMessage(message).catch(() => {});
+      } finally {
+        busy = false;
+        _screeningBusy = false;
+        refreshPrompt();
+        drainTelegramQueue().catch(() => {});
+      }
+      return;
+    }
   }
 
   if (text === "/briefing") {
@@ -2258,15 +2333,40 @@ async function telegramHandler(msg) {
     const isDeployRequest = !hasCloseIntent && /\bdeploy\b|\bopen position\b|\blp into\b|\badd liquidity\b/i.test(text);
     const agentRole = isDeployRequest ? "SCREENER" : "GENERAL";
     const agentModel = agentRole === "SCREENER" ? config.llm.screeningModel : config.llm.generalModel;
+    let spotCandidateResult = null;
+    let spotOpenResult = null;
     liveMessage = await createLiveMessage("🤖 Live Update", `Request: ${text.slice(0, 240)}`);
     const { content } = await agentLoop(text, config.llm.maxSteps, sessionHistory, agentRole, agentModel, null, {
       interactive: true,
       onToolStart: async ({ name }) => { await liveMessage?.toolStart(name); },
-      onToolFinish: async ({ name, result, success }) => { await liveMessage?.toolFinish(name, result, success); },
+      onToolFinish: async ({ name, result, success }) => {
+        if (name === "get_spot_momentum_candidates") spotCandidateResult = result;
+        if (name === "open_spot_position") {
+          if (spotOpenResult == null) spotOpenResult = result;
+          const groundedResult = formatConfirmedSpotOpenResult(result, config.spot.tradeAmountSol);
+          success = groundedResult.kind === "open_confirmed" || groundedResult.kind === "open_dry_run";
+        }
+        await liveMessage?.toolFinish(name, result, success);
+      },
     });
-    appendHistory(text, content);
-    if (liveMessage) await liveMessage.finalize(stripThink(content));
-    else await sendMessage(stripThink(content));
+    const strippedContent = stripThink(content);
+    const grounded = config.trading.mode === "spot_momentum"
+      ? groundSpotAgentOutcome({
+          assistantText: strippedContent,
+          candidateResult: spotCandidateResult,
+          openResult: spotOpenResult,
+          confirmationStore: spotConfirmationStore,
+          amountSol: config.spot.tradeAmountSol,
+        })
+      : { kind: "assistant_text", text: strippedContent };
+    if (grounded.kind === "confirmation_armed") {
+      log("spot_confirmation", `Armed ${grounded.confirmation.id} for ${grounded.confirmation.pool.slice(0, 8)}...`);
+    } else if (grounded.kind === "ungrounded_claim") {
+      log("spot_confirmation_warn", "Suppressed an ungrounded spot execution claim from the model");
+    }
+    appendHistory(text, grounded.text);
+    if (liveMessage) await liveMessage.finalize(grounded.text);
+    else await sendMessage(grounded.text);
   } catch (e) {
     if (liveMessage) await liveMessage.fail(e.message).catch(() => {});
     else await sendMessage(`Error: ${e.message}`).catch(() => {});

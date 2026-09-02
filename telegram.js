@@ -439,6 +439,8 @@ const BOT_COMMANDS = [
   { command: "deploy",     description: "Deploy candidate by cached index" },
   { command: "briefing",   description: "Morning briefing" },
   { command: "hive",       description: "HiveMind sync status" },
+  { command: "confirm",    description: "Confirm one pending spot entry" },
+  { command: "cancel",     description: "Cancel a pending spot entry" },
   { command: "pause",      description: "Stop cron cycles" },
   { command: "resume",     description: "Start cron cycles again" },
   { command: "stop",       description: "Shut down agent" },

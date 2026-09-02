@@ -485,8 +485,12 @@ Meridian sends notifications automatically for:
 | `/claimall` | Preview all positions with positive reported unclaimed fees; no transaction is sent |
 | `/claimall confirm` | Claim each eligible position sequentially; stops at the first failure |
 | `/set <n> <note>` | Set a note on a position |
+| `/confirm` | Confirm one pending spot entry after a backend-backed recommendation |
+| `/cancel` | Cancel the pending spot entry without sending a transaction |
 
 You can also chat freely via Telegram using the same interface as the REPL. Only allowed user IDs can issue commands in groups.
+
+In `spot_momentum` mode, a plain `ya`/`iya` is accepted only while a single-use confirmation is active. The confirmation expires after two minutes and is bound to the exact pool returned by the backend. Confirmation always reruns the complete entry preflight. Telegram reports `NO TRADE` when validation stops before submission, and reports transaction progress only when the execution result contains authoritative submission evidence.
 
 ---
 

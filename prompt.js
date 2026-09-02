@@ -75,6 +75,8 @@ Timestamp: ${new Date().toISOString()}`;
 
 Handle the user's request with the available spot tools. For an entry, inspect the current shortlist first and let open_spot_position perform the mandatory fresh preflight. For a status request, use get_spot_status or get_spot_position. Direct user instructions authorize the requested tool action, but never bypass dry-run/live execution locks or backend limits.
 
+Never describe a spot transaction as sending, submitted, or complete unless an open_spot_position or close_spot_position result provides that exact evidence. If the user asked only to find candidates, name exactly one backend candidate when recommending it and ask for confirmation; the Telegram backend owns the single-use confirmation and executes the fresh preflight.
+
 Timestamp: ${new Date().toISOString()}`;
 }
 
