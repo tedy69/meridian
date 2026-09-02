@@ -391,8 +391,34 @@ async function refreshDiscordOnlyPools(pools, timeframe) {
  */
 export async function discoverPools({
   page_size = 50,
+  profile = "dlmm_lp",
 } = {}) {
-  const s = config.screening;
+  const spotProfile = profile === "spot_momentum";
+  const s = spotProfile
+    ? {
+      ...config.screening,
+      timeframe: "5m",
+      category: "trending",
+      excludeHighSupplyConcentration: true,
+      minMcap: config.spot.minMarketCapUsd,
+      maxMcap: config.spot.maxMarketCapUsd,
+      minHolders: config.spot.minHolders,
+      minVolume: config.spot.minVolume5mUsd,
+      minVolumeActiveTvlRatio: config.spot.minVolumeLiquidityRatio,
+      minTvl: config.spot.minLiquidityUsd,
+      maxTvl: null,
+      minBinStep: null,
+      maxBinStep: null,
+      minFeeActiveTvlRatio: null,
+      minOrganic: config.spot.minOrganic,
+      minTokenAgeHours: config.spot.minTokenAgeMinutes / 60,
+      maxTokenAgeHours: config.spot.maxTokenAgeHours,
+      allowedLaunchpads: [],
+      blockedLaunchpads: [],
+      useDiscordSignals: false,
+      maxVolatility: null,
+    }
+    : config.screening;
   const filters = [
     "base_token_has_critical_warnings=false",
     "quote_token_has_critical_warnings=false",
@@ -405,9 +431,9 @@ export async function discoverPools({
     `volume>=${s.minVolume}`,
     `tvl>=${s.minTvl}`,
     s.maxTvl != null ? `tvl<=${s.maxTvl}` : null,
-    `dlmm_bin_step>=${s.minBinStep}`,
-    `dlmm_bin_step<=${s.maxBinStep}`,
-    `fee_active_tvl_ratio>=${s.minFeeActiveTvlRatio}`,
+    s.minBinStep != null ? `dlmm_bin_step>=${s.minBinStep}` : null,
+    s.maxBinStep != null ? `dlmm_bin_step<=${s.maxBinStep}` : null,
+    s.minFeeActiveTvlRatio != null ? `fee_active_tvl_ratio>=${s.minFeeActiveTvlRatio}` : null,
     `base_token_organic_score>=${s.minOrganic}`,
     `quote_token_organic_score>=${s.minQuoteOrganic}`,
     s.minTokenAgeHours != null ? `base_token_created_at<=${Date.now() - s.minTokenAgeHours * 3_600_000}` : null,
@@ -426,7 +452,7 @@ export async function discoverPools({
 
   let rawPools = Array.isArray(data.data) ? data.data : [];
 
-  if (config.screening.useDiscordSignals) {
+  if (s.useDiscordSignals) {
     const signalCandidates = await fetchDiscordSignalCandidates().catch((error) => {
       log("screening", `Discord signal fetch failed: ${error.message}`);
       return [];
@@ -489,7 +515,7 @@ export async function discoverPools({
     return false;
   });
 
-  const condensed = thresholdedRawPools.map(condensePool);
+  const condensed = thresholdedRawPools.map((pool) => condensePool(pool, s.timeframe));
 
   // Hard-filter blacklisted tokens and blocked deployers (what pool discovery already gave us)
   let pools = condensed.filter((p) => {
@@ -707,7 +733,7 @@ export async function getPoolDetail({ pool_address, timeframe = "5m" }) {
  * Condense a pool object for LLM consumption.
  * Raw API returns ~100+ fields per pool. The LLM only needs ~20.
  */
-function condensePool(p) {
+function condensePool(p, sourceTimeframe = config.screening.timeframe) {
   return {
     pool: p.pool_address,
     name: p.name,
@@ -732,13 +758,13 @@ function condensePool(p) {
     volume_window: round(p.volume),
     fee_active_tvl_ratio: p.fee_active_tvl_ratio != null ? fix(p.fee_active_tvl_ratio, 4) : null,
     volatility: fix(p.volatility, 4),
-    volatility_timeframe: p.volatility_timeframe || getVolatilityTimeframe(config.screening.timeframe),
+    volatility_timeframe: p.volatility_timeframe || getVolatilityTimeframe(sourceTimeframe),
 
     // Per-timeframe breakdown (populated when sourceTimeframe !== volatilityTimeframe)
-    ...(p.volatility_timeframe && p.volatility_timeframe !== config.screening.timeframe ? {
-      [`volume_${config.screening.timeframe}`]: round(p[`volume_${config.screening.timeframe}`] ?? null),
+    ...(p.volatility_timeframe && p.volatility_timeframe !== sourceTimeframe ? {
+      [`volume_${sourceTimeframe}`]: round(p[`volume_${sourceTimeframe}`] ?? null),
       [`volume_${p.volatility_timeframe}`]: round(p[`volume_${p.volatility_timeframe}`] ?? null),
-      [`volatility_${config.screening.timeframe}`]: fix(p[`volatility_${config.screening.timeframe}`] ?? null, 4),
+      [`volatility_${sourceTimeframe}`]: fix(p[`volatility_${sourceTimeframe}`] ?? null, 4),
       [`volatility_${p.volatility_timeframe}`]: fix(p[`volatility_${p.volatility_timeframe}`] ?? null, 4),
     } : {}),
 
@@ -747,7 +773,9 @@ function condensePool(p) {
     mcap: round(p.token_x?.market_cap),
     organic_score: Math.round(p.token_x?.organic_score || 0),
     token_age_hours: p.token_x?.created_at
-      ? Math.floor((Date.now() - p.token_x.created_at) / 3_600_000)
+      ? Number(((Date.now() - (p.token_x.created_at < 1_000_000_000_000
+        ? p.token_x.created_at * 1000
+        : p.token_x.created_at)) / 3_600_000).toFixed(2))
       : null,
     dev: p.token_x?.dev || null,
     launchpad: getPoolLaunchpad(p),

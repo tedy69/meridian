@@ -13,6 +13,7 @@ import {
   assertLiveTradingEnabled,
   assertMainnetRpc,
   assertOnChainWriteAllowed,
+  assertSpotSwapAllowed,
   isDryRun,
   SOL_MINT,
 } from "../execution-guard.js";
@@ -36,8 +37,18 @@ function getWallet() {
 
 const JUPITER_PRICE_API = "https://api.jup.ag/price/v3";
 const JUPITER_SWAP_V2_API = "https://api.jup.ag/swap/v2";
+export const LEGACY_TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+const ASSOCIATED_TOKEN_PROGRAM_ID = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 function getJupiterApiKey() {
   return config.jupiter.apiKey || process.env.JUPITER_API_KEY || "";
+}
+
+function requireJupiterApiKey() {
+  const apiKey = String(getJupiterApiKey()).trim();
+  if (!apiKey) {
+    throw new Error("JUPITER_API_KEY is required for Jupiter Price and Swap V2 APIs");
+  }
+  return apiKey;
 }
 
 function getJupiterReferralParams() {
@@ -59,10 +70,92 @@ function getJupiterReferralParams() {
   return { referralAccount, referralFee: Math.round(referralFee) };
 }
 
-async function simulateJupiterTransaction(connection, transaction) {
+function associatedTokenAddress(owner, mint) {
+  return PublicKey.findProgramAddressSync([
+    owner.toBuffer(),
+    new PublicKey(LEGACY_TOKEN_PROGRAM_ID).toBuffer(),
+    new PublicKey(mint).toBuffer(),
+  ], new PublicKey(ASSOCIATED_TOKEN_PROGRAM_ID))[0];
+}
+
+function tokenRawAmountFromAccount(account) {
+  if (!account) return 0n;
+  const data = Buffer.isBuffer(account.data)
+    ? account.data
+    : Array.isArray(account.data) && typeof account.data[0] === "string"
+    ? Buffer.from(account.data[0], "base64")
+    : null;
+  if (!data || data.length < 72) throw new Error("Simulated SPL token account data is invalid");
+  return data.readBigUInt64LE(64);
+}
+
+function nonNegativeInteger(value, label) {
+  const text = String(value ?? "");
+  if (!/^[0-9]+$/.test(text)) throw new Error(`${label} must be a non-negative integer`);
+  return BigInt(text);
+}
+
+export function validateSimulatedSwapEffects({
+  inputMint,
+  outputMint,
+  inAmount,
+  minimumOutAmount,
+  totalFeeLamports,
+  walletLamportsBefore,
+  walletLamportsAfter,
+  inputTokenRawBefore = null,
+  inputTokenRawAfter = null,
+  outputTokenRawBefore = null,
+  outputTokenRawAfter = null,
+} = {}) {
+  const input = nonNegativeInteger(inAmount, "inAmount");
+  const minimumOut = nonNegativeInteger(minimumOutAmount, "minimumOutAmount");
+  const fees = nonNegativeInteger(totalFeeLamports, "totalFeeLamports");
+  const walletBefore = nonNegativeInteger(walletLamportsBefore, "walletLamportsBefore");
+  const walletAfter = nonNegativeInteger(walletLamportsAfter, "walletLamportsAfter");
+
+  if (inputMint === SOL_MINT) {
+    const debit = walletBefore - walletAfter;
+    if (debit < input) throw new Error("Simulation does not debit the exact requested SOL input");
+    if (debit > input + fees) throw new Error("Simulation exceeds the requested SOL input plus bounded transaction fees");
+  } else {
+    const tokenBefore = nonNegativeInteger(inputTokenRawBefore, "inputTokenRawBefore");
+    const tokenAfter = nonNegativeInteger(inputTokenRawAfter, "inputTokenRawAfter");
+    if (tokenBefore - tokenAfter !== input) throw new Error("Simulation does not debit the exact requested token input");
+  }
+
+  if (outputMint === SOL_MINT) {
+    const netCredit = walletAfter - walletBefore;
+    if (netCredit + fees < minimumOut) throw new Error("Simulation returns less SOL than the bounded minimum output");
+  } else {
+    const tokenBefore = nonNegativeInteger(outputTokenRawBefore, "outputTokenRawBefore");
+    const tokenAfter = nonNegativeInteger(outputTokenRawAfter, "outputTokenRawAfter");
+    if (tokenAfter - tokenBefore < minimumOut) throw new Error("Simulation returns less token output than the bounded minimum");
+  }
+
+  return true;
+}
+
+async function simulateJupiterTransaction(connection, transaction, {
+  walletPublicKey,
+  inputMint,
+  outputMint,
+  inAmount,
+  minimumOutAmount,
+  totalFeeLamports,
+} = {}) {
+  const wallet = new PublicKey(walletPublicKey);
+  const inputTokenAccount = inputMint === SOL_MINT ? null : associatedTokenAddress(wallet, inputMint);
+  const outputTokenAccount = outputMint === SOL_MINT ? null : associatedTokenAddress(wallet, outputMint);
+  const addresses = [wallet, inputTokenAccount, outputTokenAccount].filter(Boolean);
+  const before = await connection.getMultipleAccountsInfo(addresses, "finalized");
   const simulation = await connection.simulateTransaction(transaction, {
     sigVerify: true,
     commitment: "confirmed",
+    accounts: {
+      encoding: "base64",
+      addresses: addresses.map((address) => address.toBase58()),
+    },
   });
   if (simulation.value.err) {
     const logs = Array.isArray(simulation.value.logs)
@@ -72,6 +165,28 @@ async function simulateJupiterTransaction(connection, transaction) {
       `Jupiter swap simulation failed: ${JSON.stringify(simulation.value.err)} (${logs})`,
     );
   }
+  const after = simulation.value.accounts;
+  if (!Array.isArray(after) || after.length !== addresses.length || !before[0] || !after[0]) {
+    throw new Error("Jupiter simulation did not return the required wallet account effects");
+  }
+  let cursor = 1;
+  const inputBefore = inputTokenAccount ? before[cursor] : null;
+  const inputAfter = inputTokenAccount ? after[cursor++] : null;
+  const outputBefore = outputTokenAccount ? before[cursor] : null;
+  const outputAfter = outputTokenAccount ? after[cursor] : null;
+  validateSimulatedSwapEffects({
+    inputMint,
+    outputMint,
+    inAmount,
+    minimumOutAmount,
+    totalFeeLamports,
+    walletLamportsBefore: before[0].lamports,
+    walletLamportsAfter: after[0].lamports,
+    inputTokenRawBefore: inputTokenAccount ? tokenRawAmountFromAccount(inputBefore) : null,
+    inputTokenRawAfter: inputTokenAccount ? tokenRawAmountFromAccount(inputAfter) : null,
+    outputTokenRawBefore: outputTokenAccount ? tokenRawAmountFromAccount(outputBefore) : null,
+    outputTokenRawAfter: outputTokenAccount ? tokenRawAmountFromAccount(outputAfter) : null,
+  });
 }
 
 /**
@@ -225,6 +340,364 @@ export function normalizeMint(mint) {
   return mint;
 }
 
+function atomicAmount(amount, decimals) {
+  const numeric = Number(amount);
+  if (!Number.isFinite(numeric) || numeric <= 0) throw new Error("Swap amount must be a positive finite number");
+  const scaled = Math.floor(numeric * Math.pow(10, decimals));
+  if (!Number.isSafeInteger(scaled) || scaled <= 0) throw new Error("Swap amount is outside the safe atomic-unit range");
+  return String(scaled);
+}
+
+async function mintDecimals(connection, mint) {
+  if (mint === SOL_MINT) return 9;
+  const mintInfo = await connection.getParsedAccountInfo(new PublicKey(mint), "finalized");
+  const decimals = Number(mintInfo.value?.data?.parsed?.info?.decimals);
+  if (!Number.isInteger(decimals) || decimals < 0 || decimals > 18) {
+    throw new Error(`Could not verify decimals for token ${mint}`);
+  }
+  return decimals;
+}
+
+function integerString(value) {
+  return typeof value === "string" && /^[0-9]+$/.test(value) && BigInt(value) > 0n;
+}
+
+export function validateJupiterOrder(order, {
+  inputMint,
+  outputMint,
+  inAmount,
+  expectedTaker = null,
+  allowedRouters = null,
+  requireTakerPaysFees = false,
+  maxSlippageBps = null,
+  maxPriceImpactPct = null,
+  maxFeeBps = null,
+  maxPriorityFeeLamports = null,
+  maxTotalFeeLamports = null,
+  requestedAt = Date.now(),
+  now = Date.now(),
+  quoteMaxAgeMs = null,
+} = {}) {
+  if (!order || typeof order !== "object") throw new Error("Jupiter order is missing");
+  if (order.errorCode || order.errorMessage || order.error) {
+    throw new Error(`Jupiter order error: ${order.errorMessage || order.error || order.errorCode}`);
+  }
+  if (!order.transaction || !order.requestId) throw new Error("Jupiter order is not executable");
+  if (order.swapMode !== "ExactIn") throw new Error("Jupiter order must use ExactIn mode");
+  if (expectedTaker != null && order.taker !== expectedTaker) {
+    throw new Error("Jupiter order taker does not match the signing wallet");
+  }
+  const router = String(order.router || "").trim().toLowerCase();
+  if (Array.isArray(allowedRouters) && !allowedRouters.map((value) => String(value).toLowerCase()).includes(router)) {
+    throw new Error(`Jupiter order router ${order.router || "unknown"} is not allowed`);
+  }
+  if (Array.isArray(allowedRouters) && (!integerString(String(order.lastValidBlockHeight || "")))) {
+    throw new Error("Jupiter aggregator order requires a valid lastValidBlockHeight");
+  }
+  if (order.inputMint !== inputMint || order.outputMint !== outputMint) {
+    throw new Error("Jupiter order mint pair does not match the requested swap");
+  }
+  if (String(order.inAmount) !== String(inAmount)) throw new Error("Jupiter order input amount does not match the requested swap");
+  if (!integerString(String(order.outAmount || ""))) throw new Error("Jupiter order output amount is invalid");
+  if (!integerString(String(order.otherAmountThreshold || ""))) throw new Error("Jupiter order minimum output is required");
+  if (BigInt(String(order.otherAmountThreshold)) > BigInt(String(order.outAmount))) {
+    throw new Error("Jupiter order minimum output exceeds its expected output");
+  }
+
+  const slippage = Number(order.slippageBps);
+  if (!Number.isFinite(slippage) || slippage < 0 || (maxSlippageBps != null && slippage > Number(maxSlippageBps))) {
+    throw new Error(`Jupiter order slippage ${order.slippageBps ?? "unknown"} bps exceeds ${maxSlippageBps} bps`);
+  }
+  const impact = Number(order.priceImpact);
+  if (maxPriceImpactPct != null && (!Number.isFinite(impact) || Math.abs(impact) > Number(maxPriceImpactPct))) {
+    throw new Error(`Jupiter order price impact ${order.priceImpact ?? "unknown"}% exceeds ${maxPriceImpactPct}%`);
+  }
+  const feeBps = Number(order.feeBps);
+  if (!Number.isFinite(feeBps) || feeBps < 0 || (maxFeeBps != null && feeBps > Number(maxFeeBps))) {
+    throw new Error(`Jupiter order fee ${order.feeBps ?? "unknown"} bps exceeds ${maxFeeBps} bps`);
+  }
+  if (feeBps > 0 && order.feeMint !== inputMint && order.feeMint !== outputMint) {
+    throw new Error("Jupiter order fee mint is not part of the requested pair");
+  }
+  const transactionFees = [order.signatureFeeLamports, order.prioritizationFeeLamports, order.rentFeeLamports]
+    .map(Number);
+  if (maxTotalFeeLamports != null && transactionFees.some((value) => !Number.isFinite(value) || value < 0)) {
+    throw new Error("Jupiter order transaction fee breakdown is missing or invalid");
+  }
+  const priorityFeeLamports = Number(order.prioritizationFeeLamports);
+  if (maxPriorityFeeLamports != null && (!Number.isFinite(priorityFeeLamports) || priorityFeeLamports < 0 || priorityFeeLamports > Number(maxPriorityFeeLamports))) {
+    throw new Error(`Jupiter order priority fee ${order.prioritizationFeeLamports ?? "unknown"} lamports exceeds ${maxPriorityFeeLamports}`);
+  }
+  const totalFeeLamports = transactionFees
+    .reduce((sum, value) => sum + (Number.isFinite(value) ? value : 0), 0);
+  if (maxTotalFeeLamports != null && totalFeeLamports > Number(maxTotalFeeLamports)) {
+    throw new Error(`Jupiter order transaction fees ${totalFeeLamports} lamports exceed ${maxTotalFeeLamports}`);
+  }
+  if (requireTakerPaysFees) {
+    if (!expectedTaker) throw new Error("Expected taker is required to validate Jupiter fee payers");
+    if (order.gasless === true) throw new Error("Jupiter gasless orders are not allowed for autonomous spot execution");
+    const payerChecks = [
+      [transactionFees[0], order.signatureFeePayer, "signature"],
+      [transactionFees[1], order.prioritizationFeePayer, "priority"],
+      [transactionFees[2], order.rentFeePayer, "rent"],
+    ];
+    for (const [fee, payer, label] of payerChecks) {
+      if (Number.isFinite(fee) && fee > 0 && payer !== expectedTaker) {
+        throw new Error(`Jupiter ${label} fee payer does not match the signing wallet`);
+      }
+    }
+  }
+  if (quoteMaxAgeMs != null && now - requestedAt > Number(quoteMaxAgeMs)) {
+    throw new Error(`Jupiter order is older than ${quoteMaxAgeMs}ms`);
+  }
+  if (order.expireAt) {
+    const expiresAt = Date.parse(order.expireAt);
+    if (!Number.isFinite(expiresAt) || now >= expiresAt) throw new Error("Jupiter RFQ order is expired");
+  }
+
+  return {
+    outAmount: String(order.outAmount),
+    minimumOutAmount: String(order.otherAmountThreshold),
+    priceImpactPct: impact,
+    feeBps,
+    totalFeeLamports,
+  };
+}
+
+export function validateJupiterExecutionResult(result, {
+  expectedSignature,
+  inAmount,
+  minimumOutAmount,
+} = {}) {
+  if (!result || typeof result !== "object") throw new Error("Jupiter execution result is missing");
+  if (result.status !== "Success" || Number(result.code) !== 0 || !result.signature) {
+    throw new Error(`Swap failed: status=${result.status ?? "unknown"} code=${result.code ?? "unknown"} ${result.error || ""}`.trim());
+  }
+  if (result.signature !== expectedSignature) {
+    throw new Error("Jupiter execution signature does not match the locally signed transaction");
+  }
+  const inputAmount = String(result.totalInputAmount ?? result.inputAmountResult ?? "");
+  const outputAmount = String(result.totalOutputAmount ?? result.outputAmountResult ?? "");
+  if (!integerString(inputAmount) || inputAmount !== String(inAmount)) {
+    throw new Error("Jupiter execution input amount does not match the exact requested input");
+  }
+  if (!integerString(outputAmount) || BigInt(outputAmount) < BigInt(String(minimumOutAmount))) {
+    throw new Error("Jupiter execution output amount is below the bounded minimum output");
+  }
+  return { inputAmount, outputAmount, signature: result.signature };
+}
+
+export function validateJupiterTransactionEnvelope(transaction, expectedFeePayer) {
+  const feePayer = transaction?.message?.staticAccountKeys?.[0]?.toBase58?.();
+  const requiredSignatures = Number(transaction?.message?.header?.numRequiredSignatures);
+  if (feePayer !== expectedFeePayer) {
+    throw new Error("Jupiter transaction fee payer does not match the signing wallet");
+  }
+  if (requiredSignatures !== 1) {
+    throw new Error(`Jupiter transaction requires ${Number.isFinite(requiredSignatures) ? requiredSignatures : "an unknown number of"} signers; exactly one is allowed`);
+  }
+  return true;
+}
+
+export async function inspectMintSafety(mint, {
+  requireLegacyTokenProgram = true,
+} = {}) {
+  const normalized = normalizeMint(mint);
+  if (!normalized || normalized === SOL_MINT) throw new Error("A non-SOL token mint is required");
+  const connection = getConnection();
+  const response = await connection.getParsedAccountInfo(new PublicKey(normalized), "finalized");
+  const account = response.value;
+  if (!account) throw new Error(`Token mint ${normalized} does not exist at finalized commitment`);
+  const programId = account.owner?.toBase58?.() || String(account.owner || "");
+  const info = account.data?.parsed?.info;
+  if (!info) throw new Error(`Token mint ${normalized} could not be parsed`);
+  const result = {
+    mint: normalized,
+    programId,
+    decimals: Number(info.decimals),
+    mintAuthorityDisabled: info.mintAuthority == null,
+    freezeAuthorityDisabled: info.freezeAuthority == null,
+    legacyTokenProgram: programId === LEGACY_TOKEN_PROGRAM_ID,
+  };
+  if (requireLegacyTokenProgram && !result.legacyTokenProgram) {
+    throw new Error(`Token ${normalized} is not owned by the legacy SPL Token program`);
+  }
+  if (!result.mintAuthorityDisabled) throw new Error(`Token ${normalized} still has a mint authority`);
+  if (!result.freezeAuthorityDisabled) throw new Error(`Token ${normalized} still has a freeze authority`);
+  return result;
+}
+
+export async function getJupiterPrices(mints) {
+  const normalized = [...new Set((mints || []).map(normalizeMint).filter(Boolean))];
+  if (normalized.length === 0) return {};
+  const apiKey = requireJupiterApiKey();
+  const response = await fetch(`${JUPITER_PRICE_API}?ids=${encodeURIComponent(normalized.join(","))}`, {
+    headers: { "x-api-key": apiKey },
+  });
+  if (!response.ok) throw new Error(`Jupiter Price API failed: ${response.status} ${await response.text()}`);
+  return response.json();
+}
+
+export async function getFinalizedSlot() {
+  return getConnection().getSlot("finalized");
+}
+
+async function executeJupiterSwap({
+  inputMint,
+  outputMint,
+  amount,
+  amountAtomic = null,
+  slippageBps = null,
+  operation,
+  orderPolicy = {},
+  excludeRouters = "jupiterz",
+  priorityFeeLamports = null,
+}) {
+  const jupiterApiKey = requireJupiterApiKey();
+  const wallet = getWallet();
+  const connection = getConnection();
+  const amountStr = amountAtomic == null
+    ? atomicAmount(amount, await mintDecimals(connection, inputMint))
+    : String(amountAtomic);
+  if (!integerString(amountStr)) throw new Error("Swap atomic amount must be a positive integer string");
+  const search = new URLSearchParams({
+    inputMint,
+    outputMint,
+    amount: amountStr,
+    taker: wallet.publicKey.toString(),
+    swapMode: "ExactIn",
+  });
+  if (slippageBps != null) search.set("slippageBps", String(slippageBps));
+  if (excludeRouters) search.set("excludeRouters", excludeRouters);
+  if (priorityFeeLamports != null) {
+    search.set("priorityFeeLamports", String(priorityFeeLamports));
+    search.set("broadcastFeeType", "maxCap");
+  }
+  const referralParams = getJupiterReferralParams();
+  if (referralParams) {
+    search.set("referralAccount", referralParams.referralAccount);
+    search.set("referralFee", String(referralParams.referralFee));
+  }
+
+  const requestedAt = Date.now();
+  const orderRes = await fetch(`${JUPITER_SWAP_V2_API}/order?${search.toString()}`, {
+    headers: { "x-api-key": jupiterApiKey },
+  });
+  if (!orderRes.ok) throw new Error(`Swap V2 order failed: ${orderRes.status} ${await orderRes.text()}`);
+  const order = await orderRes.json();
+  const validatedOrder = validateJupiterOrder(order, {
+    inputMint,
+    outputMint,
+    inAmount: amountStr,
+    expectedTaker: wallet.publicKey.toString(),
+    allowedRouters: ["metis", "dflow", "okx"],
+    requireTakerPaysFees: true,
+    maxSlippageBps: slippageBps,
+    requestedAt,
+    ...orderPolicy,
+  });
+
+  assertOnChainWriteAllowed(operation);
+  await assertMainnetRpc(connection, operation);
+  if (order.lastValidBlockHeight != null) {
+    const lastValidBlockHeight = Number(order.lastValidBlockHeight);
+    const blockHeight = await connection.getBlockHeight("confirmed");
+    if (!Number.isFinite(lastValidBlockHeight) || blockHeight >= lastValidBlockHeight) {
+      throw new Error("Jupiter order block height is expired");
+    }
+  }
+  validateJupiterOrder(order, {
+    inputMint,
+    outputMint,
+    inAmount: amountStr,
+    expectedTaker: wallet.publicKey.toString(),
+    allowedRouters: ["metis", "dflow", "okx"],
+    requireTakerPaysFees: true,
+    maxSlippageBps: slippageBps,
+    requestedAt,
+    now: Date.now(),
+    ...orderPolicy,
+  });
+  const tx = VersionedTransaction.deserialize(Buffer.from(order.transaction, "base64"));
+  validateJupiterTransactionEnvelope(tx, wallet.publicKey.toString());
+  tx.sign([wallet]);
+  const expectedSignature = bs58.encode(tx.signatures[0]);
+  await simulateJupiterTransaction(connection, tx, {
+    walletPublicKey: wallet.publicKey.toString(),
+    inputMint,
+    outputMint,
+    inAmount: amountStr,
+    minimumOutAmount: validatedOrder.minimumOutAmount,
+    totalFeeLamports: validatedOrder.totalFeeLamports,
+  });
+  const signedTransaction = Buffer.from(tx.serialize()).toString("base64");
+
+  assertOnChainWriteAllowed(operation);
+  await assertMainnetRpc(connection, operation);
+  validateJupiterOrder(order, {
+    inputMint,
+    outputMint,
+    inAmount: amountStr,
+    expectedTaker: wallet.publicKey.toString(),
+    allowedRouters: ["metis", "dflow", "okx"],
+    requireTakerPaysFees: true,
+    maxSlippageBps: slippageBps,
+    requestedAt,
+    now: Date.now(),
+    ...orderPolicy,
+  });
+  const execRes = await fetch(`${JUPITER_SWAP_V2_API}/execute`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": jupiterApiKey,
+    },
+    body: JSON.stringify({ signedTransaction, requestId: order.requestId, lastValidBlockHeight: order.lastValidBlockHeight }),
+  });
+  if (!execRes.ok) {
+    const error = new Error(`Swap V2 execute failed: ${execRes.status} ${await execRes.text()}`);
+    error.submissionAttempted = true;
+    throw error;
+  }
+  const result = await execRes.json();
+  let executed;
+  try {
+    executed = validateJupiterExecutionResult(result, {
+      expectedSignature,
+      inAmount: amountStr,
+      minimumOutAmount: validatedOrder.minimumOutAmount,
+    });
+  } catch (cause) {
+    const error = new Error(cause.message);
+    error.submissionAttempted = true;
+    error.signature = result.signature || null;
+    throw error;
+  }
+  const confirmation = await connection.confirmTransaction(executed.signature, "finalized");
+  if (confirmation.value.err) {
+    const error = new Error(`Swap finalized with on-chain error: ${JSON.stringify(confirmation.value.err)}`);
+    error.submissionAttempted = true;
+    error.signature = executed.signature;
+    throw error;
+  }
+
+  return {
+    success: true,
+    tx: executed.signature,
+    input_mint: inputMint,
+    output_mint: outputMint,
+    input_amount_atomic: executed.inputAmount,
+    output_amount_atomic: executed.outputAmount,
+    minimum_output_amount: validatedOrder.minimumOutAmount,
+    expected_output_amount: validatedOrder.outAmount,
+    price_impact_pct: validatedOrder.priceImpactPct,
+    slippage_bps: Number(order.slippageBps),
+    fee_bps_applied: validatedOrder.feeBps,
+    total_transaction_fee_lamports: validatedOrder.totalFeeLamports,
+    finalized: true,
+  };
+}
+
 export async function swapToken({
   input_mint,
   output_mint,
@@ -257,115 +730,96 @@ export async function swapToken({
 
   try {
     log("swap", `${numericAmount} of ${input_mint} → ${output_mint}`);
-    const wallet = getWallet();
-    const connection = getConnection();
-
-    // ─── Convert to smallest unit ──────────────────────────────
-    let decimals = 9; // SOL default
-    if (input_mint !== config.tokens.SOL) {
-      const mintInfo = await connection.getParsedAccountInfo(new PublicKey(input_mint));
-      decimals = mintInfo.value?.data?.parsed?.info?.decimals ?? 9;
-    }
-    const amountAtomic = Math.floor(numericAmount * Math.pow(10, decimals));
-    if (!Number.isFinite(amountAtomic) || amountAtomic <= 0) {
-      throw new Error("Swap amount rounds to zero atomic units");
-    }
-    const amountStr = amountAtomic.toString();
-
-    // ─── Get Swap V2 order (unsigned tx + requestId) ───────────
-    const search = new URLSearchParams({
+    const result = await executeJupiterSwap({
       inputMint: input_mint,
       outputMint: output_mint,
-      amount: amountStr,
-      taker: wallet.publicKey.toString(),
+      amount: numericAmount,
+      slippageBps: normalizedSlippageBps,
+      operation: "swap_token",
     });
-    if (normalizedSlippageBps != null) {
-      search.set("slippageBps", String(normalizedSlippageBps));
-    }
-    const referralParams = getJupiterReferralParams();
-    if (referralParams) {
-      search.set("referralAccount", referralParams.referralAccount);
-      search.set("referralFee", String(referralParams.referralFee));
-    }
-    const orderUrl = `${JUPITER_SWAP_V2_API}/order?${search.toString()}`;
-    const jupiterApiKey = getJupiterApiKey();
-
-    const orderRes = await fetch(orderUrl, {
-      headers: jupiterApiKey ? { "x-api-key": jupiterApiKey } : {},
-    });
-    if (!orderRes.ok) {
-      const body = await orderRes.text();
-      throw new Error(`Swap V2 order failed: ${orderRes.status} ${body}`);
-    }
-
-    const order = await orderRes.json();
-    if (order.errorCode || order.errorMessage) {
-      throw new Error(`Swap V2 order error: ${order.errorMessage || order.errorCode}`);
-    }
-
-    const { transaction: unsignedTx, requestId } = order;
-
-    // ─── Deserialize and sign ─────────────────────────────────
-    assertOnChainWriteAllowed("swap_token");
-    await assertMainnetRpc(connection, "swap_token");
-    const tx = VersionedTransaction.deserialize(Buffer.from(unsignedTx, "base64"));
-    tx.sign([wallet]);
-    await simulateJupiterTransaction(connection, tx);
-    const signedTx = Buffer.from(tx.serialize()).toString("base64");
-
-    // ─── Execute ───────────────────────────────────────────────
-    assertOnChainWriteAllowed("swap_token");
-    await assertMainnetRpc(connection, "swap_token");
-    const execRes = await fetch(`${JUPITER_SWAP_V2_API}/execute`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...(jupiterApiKey ? { "x-api-key": jupiterApiKey } : {}),
-      },
-      body: JSON.stringify({ signedTransaction: signedTx, requestId }),
-    });
-    if (!execRes.ok) {
-      throw new Error(`Swap V2 execute failed: ${execRes.status} ${await execRes.text()}`);
-    }
-
-    const result = await execRes.json();
-    if (result.status === "Failed") {
-      throw new Error(`Swap failed on-chain: code=${result.code}`);
-    }
-    if (!result.signature) {
-      throw new Error("Swap execute response did not include a transaction signature");
-    }
-
-    const confirmation = await connection.confirmTransaction(result.signature, "finalized");
-    if (confirmation.value.err) {
-      throw new Error(`Swap finalized with on-chain error: ${JSON.stringify(confirmation.value.err)}`);
-    }
-
-    log("swap", `SUCCESS finalized tx: ${result.signature}`);
-    if (referralParams && order.feeBps !== referralParams.referralFee) {
-      log(
-        "swap_warn",
-        `Jupiter referral fee requested ${referralParams.referralFee} bps but order applied ${order.feeBps ?? "unknown"} bps`,
-      );
-    }
-
+    log("swap", `SUCCESS finalized tx: ${result.tx}`);
     return {
-      success: true,
-      tx: result.signature,
-      input_mint,
-      output_mint,
-      amount_in: result.inputAmountResult,
-      amount_out: result.outputAmountResult,
-      minimum_output_amount: order.otherAmountThreshold ?? null,
-      slippage_bps: normalizedSlippageBps,
-      referral_account: referralParams?.referralAccount || null,
-      referral_fee_bps_requested: referralParams?.referralFee || 0,
-      fee_bps_applied: order.feeBps ?? null,
-      fee_mint: order.feeMint ?? null,
-      finalized: true,
+      ...result,
+      amount_in: result.input_amount_atomic,
+      amount_out: result.output_amount_atomic,
     };
   } catch (error) {
     log("swap_error", error.message);
-    return { success: false, error: error.message };
+    return { success: false, error: error.message, submission_attempted: error.submissionAttempted === true, tx: error.signature || null };
+  }
+}
+
+export async function buySpotToken({ mint, amountSol }) {
+  const outputMint = normalizeMint(mint);
+  const amount = assertSpotSwapAllowed({
+    mode: config.trading.mode,
+    direction: "buy",
+    inputMint: SOL_MINT,
+    outputMint,
+    amount: amountSol,
+    configuredTradeAmountSol: config.spot.tradeAmountSol,
+    maxTradeAmountSol: config.spot.maxTradeAmountSol,
+  });
+  if (isDryRun()) {
+    return { dry_run: true, would_swap: { input_mint: SOL_MINT, output_mint: outputMint, amount }, message: "DRY RUN — no spot buy sent" };
+  }
+  assertLiveTradingEnabled("open_spot_position");
+  try {
+    return await executeJupiterSwap({
+      inputMint: SOL_MINT,
+      outputMint,
+      amount,
+      slippageBps: config.spot.entrySlippageBps,
+      operation: "open_spot_position",
+      excludeRouters: "jupiterz",
+      priorityFeeLamports: config.spot.maxPriorityFeeLamports,
+      orderPolicy: {
+        maxPriceImpactPct: config.spot.maxEntryPriceImpactPct,
+        maxFeeBps: config.spot.maxFeeBps,
+        maxPriorityFeeLamports: config.spot.maxPriorityFeeLamports,
+        maxTotalFeeLamports: config.spot.maxTotalFeeLamports,
+        quoteMaxAgeMs: config.spot.quoteMaxAgeMs,
+      },
+    });
+  } catch (error) {
+    return { success: false, error: error.message, submission_attempted: error.submissionAttempted === true, tx: error.signature || null };
+  }
+}
+
+export async function sellSpotToken({ mint, amount, rawAmount = null }) {
+  const inputMint = normalizeMint(mint);
+  const numericAmount = assertSpotSwapAllowed({
+    mode: config.trading.mode,
+    direction: "sell",
+    inputMint,
+    outputMint: SOL_MINT,
+    amount,
+    configuredTradeAmountSol: config.spot.tradeAmountSol,
+    maxTradeAmountSol: config.spot.maxTradeAmountSol,
+  });
+  if (isDryRun()) {
+    return { dry_run: true, would_swap: { input_mint: inputMint, output_mint: SOL_MINT, amount: numericAmount }, message: "DRY RUN — no spot sell sent" };
+  }
+  assertLiveTradingEnabled("close_spot_position");
+  try {
+    return await executeJupiterSwap({
+      inputMint,
+      outputMint: SOL_MINT,
+      amount: numericAmount,
+      amountAtomic: rawAmount,
+      slippageBps: config.spot.exitSlippageBps,
+      operation: "close_spot_position",
+      excludeRouters: "jupiterz",
+      priorityFeeLamports: config.spot.maxPriorityFeeLamports,
+      orderPolicy: {
+        maxPriceImpactPct: config.spot.maxExitPriceImpactPct,
+        maxFeeBps: config.spot.maxFeeBps,
+        maxPriorityFeeLamports: config.spot.maxPriorityFeeLamports,
+        maxTotalFeeLamports: config.spot.maxTotalFeeLamports,
+        quoteMaxAgeMs: config.spot.quoteMaxAgeMs,
+      },
+    });
+  } catch (error) {
+    return { success: false, error: error.message, submission_attempted: error.submissionAttempted === true, tx: error.signature || null };
   }
 }

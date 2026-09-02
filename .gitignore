@@ -25,6 +25,8 @@ token-blacklist.json
 strategy-library.json
 decision-log.json
 execution-budget.json
+spot-state.json
+spot-risk-budget.json
 hivemind-cache.json
 signal-weights.json
 

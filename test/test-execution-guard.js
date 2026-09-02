@@ -4,6 +4,7 @@ import {
   assertAutonomousSwapAllowed,
   assertMainnetRpc,
   assertNoPendingCloseSettlement,
+  assertSpotSwapAllowed,
   assertLiveTradingEnabled,
   SOLANA_MAINNET_GENESIS_HASH,
   SOL_MINT,
@@ -75,6 +76,50 @@ test("autonomous swaps can only sell a token back to SOL", () => {
     () => assertAutonomousSwapAllowed({ inputMint: "TokenMint", outputMint: SOL_MINT, amount: 0 }),
     /positive finite amount/i,
   );
+});
+
+test("spot buys are separately gated to the configured 0.5 SOL size", () => {
+  assert.equal(assertSpotSwapAllowed({
+    mode: "spot_momentum",
+    direction: "buy",
+    inputMint: SOL_MINT,
+    outputMint: "TokenMint111111111111111111111111111111111",
+    amount: 0.5,
+    configuredTradeAmountSol: 0.5,
+    maxTradeAmountSol: 0.5,
+  }), 0.5);
+
+  assert.throws(() => assertSpotSwapAllowed({
+    mode: "dlmm_lp",
+    direction: "buy",
+    inputMint: SOL_MINT,
+    outputMint: "TokenMint111111111111111111111111111111111",
+    amount: 0.5,
+    configuredTradeAmountSol: 0.5,
+    maxTradeAmountSol: 0.5,
+  }), /tradingMode=spot_momentum/);
+
+  assert.throws(() => assertSpotSwapAllowed({
+    mode: "spot_momentum",
+    direction: "buy",
+    inputMint: SOL_MINT,
+    outputMint: "TokenMint111111111111111111111111111111111",
+    amount: 0.6,
+    configuredTradeAmountSol: 0.5,
+    maxTradeAmountSol: 0.5,
+  }), /must equal.*0\.5 SOL/);
+});
+
+test("spot exits remain available after a strategy mode change", () => {
+  assert.equal(assertSpotSwapAllowed({
+    mode: "dlmm_lp",
+    direction: "sell",
+    inputMint: "TokenMint111111111111111111111111111111111",
+    outputMint: SOL_MINT,
+    amount: 123,
+    configuredTradeAmountSol: 0.5,
+    maxTradeAmountSol: 0.5,
+  }), 123);
 });
 
 test("a live deploy is blocked while confirmed-close settlement remains pending", () => {

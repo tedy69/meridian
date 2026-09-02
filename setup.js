@@ -213,7 +213,7 @@ const ev = (key, fallback) => existingEnv[key] ?? fallback;
 console.log(`
 ╔═══════════════════════════════════════════════╗
 ║        Meridian — Setup Wizard                ║
-║        Autonomous Meteora DLMM LP Agent       ║
+║        Spot Momentum + Meteora DLMM Agent     ║
 ╚═══════════════════════════════════════════════╝
 
 This wizard creates your .env and user-config.json.
@@ -245,6 +245,11 @@ const heliusKey = await ask(
   alreadySet(ev("HELIUS_API_KEY", ""))
 );
 
+const jupiterKey = await ask(
+  "Jupiter API key (required for spot order/execute)",
+  alreadySet(ev("JUPITER_API_KEY", ""))
+);
+
 // ─── Section 2: Telegram ──────────────────────────────────────────────────────
 console.log("\n── Telegram (optional — skip to disable) ─────────────────────");
 
@@ -268,6 +273,12 @@ const presetChoice = await askChoice("Select a risk preset:", [
 
 const preset = presetChoice.key === "custom" ? null : PRESETS[presetChoice.key];
 const p = (key, fallback) => preset?.[key] ?? e(key, fallback);
+
+const tradingModeChoice = await askChoice("Trading engine:", [
+  { label: "DLMM LP       — Original Meteora liquidity strategy", key: "dlmm_lp" },
+  { label: "Spot momentum — Fast SOL-quoted memecoin strategy", key: "spot_momentum" },
+], { defaultKey: e("tradingMode", "dlmm_lp") });
+const tradingMode = tradingModeChoice.key;
 
 console.log(preset
   ? `\n✓ ${preset.label} preset selected. Override individual values below (Enter to keep).\n`
@@ -649,6 +660,7 @@ const envMap = {
   ...(isKept(walletKey)     ? {} : { WALLET_PRIVATE_KEY: walletKey }),
   ...(rpcUrl                ? { RPC_URL: rpcUrl } : {}),
   ...(isKept(heliusKey)     ? {} : { HELIUS_API_KEY: heliusKey }),
+  ...(isKept(jupiterKey)    ? {} : { JUPITER_API_KEY: jupiterKey }),
   ...(isKept(telegramToken) ? {} : { TELEGRAM_BOT_TOKEN: telegramToken }),
   ...(telegramChatId        ? { TELEGRAM_CHAT_ID: telegramChatId } : {}),
   DRY_RUN: dryRun ? "true" : "false",
@@ -662,6 +674,7 @@ fs.writeFileSync(ENV_PATH, buildEnv(envMap));
 const userConfig = {
   ...existingConfig,
   preset: presetChoice.key,
+  tradingMode,
   rpcUrl,
   // Deployment
   deployAmountSol,

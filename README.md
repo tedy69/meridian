@@ -1,17 +1,18 @@
 # Meridian
 
-**Autonomous Meteora DLMM liquidity management agent for Solana, powered by LLMs.**
+**Autonomous Solana spot-momentum and Meteora DLMM agent, powered by LLMs.**
 
 **Links:** [Website](https://agentmeridian.xyz) | [Telegram](https://t.me/agentmeridian) | [X](https://x.com/meridian_agent)
 
-Meridian runs continuous screening and management cycles, deploying capital into high-quality Meteora DLMM pools and closing positions based on live PnL, yield, and range data. It learns from every position it closes.
+Meridian can run either the original Meteora DLMM strategy or a fast spot-momentum strategy. Spot mode uses deterministic token, liquidity, momentum, quote, and transaction gates around an AI candidate-ranking step.
 
 ---
 
 ## What it does
 
-- **Screens pools** — scans Meteora DLMM pools against configurable thresholds (fee/TVL ratio, organic score, holder count, mcap, bin step) and surfaces high-quality opportunities
-- **Manages positions** — monitors, claims fees, and closes LP positions autonomously; decides to STAY, CLOSE, or REDEPLOY based on live data
+- **Screens opportunities** — scans SOL-quoted pools and applies mode-specific liquidity, organic activity, holder, concentration, momentum, and market-cap gates
+- **Trades spot momentum** — optionally buys one freshly revalidated memecoin setup at a time, then applies mechanical stop, profit, trailing, and maximum-hold exits
+- **Manages DLMM positions** — retains the original LP deploy, fee claim, range, yield, and close workflow when `tradingMode` is `dlmm_lp`
 - **Learns from performance** — studies top LPers in target pools, saves structured lessons, and evolves screening thresholds based on closed position history
 - **Discord signals** — optional Discord listener watches LP Army channels for Solana token calls and queues them for screening
 - **Telegram chat** — full agent chat via Telegram, plus cycle reports and OOR alerts
@@ -21,12 +22,14 @@ Meridian runs continuous screening and management cycles, deploying capital into
 
 ## How it works
 
-Meridian runs a **ReAct agent loop** — each cycle the LLM reasons over live data, calls tools, and acts. Two specialized agents run on independent cron schedules:
+Meridian runs a **ReAct agent loop** for candidate judgment, while the backend owns all execution limits and exit rules. The active schedule depends on `tradingMode`:
 
 | Agent | Default interval | Role |
 |---|---|---|
-| **Screening Agent** | Every 30 min | Pool screening — finds and deploys into the best candidate |
-| **Management Agent** | Every 10 min | Position management — evaluates each open position and acts |
+| **Spot Screening Agent** | Every 30 sec | Ranks only candidates that passed deterministic gates; the backend repeats every check before a buy |
+| **Spot Manager** | Every 5 sec | Reads finalized balance and fresh price, then applies mechanical exits without waiting for the LLM |
+| **DLMM Screening Agent** | Every 30 min | Pool screening — finds and deploys into the best LP candidate |
+| **DLMM Management Agent** | Every 10 min | Position management — evaluates each open LP position and acts |
 
 ### Agent harness
 
@@ -38,7 +41,7 @@ The harness also keeps a structured decision log in `decision-log.json` for depl
 - `@meteora-ag/dlmm` SDK — on-chain position data, active bin, deploy/close transactions
 - Meteora DLMM PnL API — position yield, fee accrual, PnL
 - Pool screening API — fee/TVL ratios, volume, organic scores, holder counts
-- Jupiter API — token audit, mcap, launchpad, price stats
+- Jupiter APIs — token audit, price data, bounded minimum-output orders, and spot execution
 
 Agents are powered via **OpenRouter** and can be swapped for any compatible model.
 
@@ -50,6 +53,7 @@ Agents are powered via **OpenRouter** and can be swapped for any compatible mode
 - [OpenRouter](https://openrouter.ai) API key
 - Solana wallet (base58 private key)
 - Solana RPC endpoint ([Helius](https://helius.xyz) recommended)
+- Jupiter API key (required for spot price and order/execute requests)
 - Telegram bot token (optional)
 - [Claude Code](https://claude.ai/code) CLI (optional, for terminal slash commands)
 
@@ -80,7 +84,7 @@ The wizard writes **both** files at the repo root:
 
 | Goes in `.env` | Goes in `user-config.json` |
 |---|---|
-| `WALLET_PRIVATE_KEY`, `OPENROUTER_API_KEY`, `RPC_URL`, `HELIUS_API_KEY` | Risk preset, deploy size, max positions |
+| `WALLET_PRIVATE_KEY`, `OPENROUTER_API_KEY`, `RPC_URL`, `HELIUS_API_KEY`, `JUPITER_API_KEY` | Trading mode, risk preset, deploy size, max positions |
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `TELEGRAM_ALLOWED_USER_IDS` | Strategy, screening filters, exit rules, trailing TP |
 | `DRY_RUN`, `LIVE_TRADING_ENABLED` | Position sizing, cycle intervals, per-role LLM models, `solMode` |
 
@@ -95,6 +99,7 @@ WALLET_PRIVATE_KEY=your_base58_private_key
 RPC_URL=https://mainnet.helius-rpc.com/?api-key=YOUR_KEY
 OPENROUTER_API_KEY=sk-or-...
 HELIUS_API_KEY=your_helius_key          # for wallet balance lookups
+JUPITER_API_KEY=your_jupiter_key        # required for spot price + swap APIs
 TELEGRAM_BOT_TOKEN=123456:ABC...        # optional — for notifications + chat
 TELEGRAM_CHAT_ID=                       # auto-filled on first message
 DRY_RUN=true                            # leave true while reviewing behavior
@@ -135,7 +140,9 @@ DRY_RUN=false
 LIVE_TRADING_ENABLED=true
 ```
 
-The default limits are deliberately conservative: one position, 0.3 SOL maximum per position, and 0.5 SOL maximum deploy attempts per UTC day. Set `maxPositions`, `maxDeployAmount`, and `maxDailyDeploySol` yourself only after deciding the maximum loss you accept. Set either cap to `null` only to intentionally disable it. With `maxDeployAmount: null` and `positionSizePct: 1`, a deploy uses the wallet balance less `gasReserve`; settlement and position-count guards remain active. The agent cannot change those execution limits through an LLM tool.
+Existing installs remain in `dlmm_lp` mode until `tradingMode` is explicitly changed. Its default limits are one position, 0.3 SOL maximum per position, and 0.5 SOL maximum deploy attempts per UTC day.
+
+In `spot_momentum` mode, the default entry is exactly 0.5 SOL with one open position, a 0.2 SOL gas reserve, 2 SOL maximum buy turnover per UTC day, and a 0.05 SOL realized-loss circuit breaker. This requires at least 0.7 SOL in the execution wallet. The LLM cannot change these execution limits. Spot mode has no timed re-entry cooldown, but every new entry must pass a completely fresh backend preflight.
 
 On startup Meridian fetches your wallet balance, open positions, and top pool candidates, then begins autonomous cycles immediately.
 
@@ -487,6 +494,33 @@ You can also chat freely via Telegram using the same interface as the REPL. Only
 
 All fields are optional — defaults shown. Edit `user-config.json`.
 
+### Trading mode and spot momentum
+
+| Field | Default | Description |
+|---|---|---|
+| `tradingMode` | `dlmm_lp` | Set to `spot_momentum` to enable the fast spot engine; existing installs never switch implicitly |
+| `spotTradeAmountSol` | `0.5` | Exact SOL input for each accepted entry |
+| `spotMaxTradeAmountSol` | `0.5` | Hard backend ceiling; must not be lower than the configured entry |
+| `spotGasReserveSol` | `0.2` | SOL that must remain available beyond the entry capital |
+| `spotMaxDailyBuySol` | `2` | Maximum buy turnover per UTC day, including uncertain submissions |
+| `spotMaxDailyLossSol` | `0.05` | Stops new entries after this realized daily loss |
+| `spotMinLiquidityUsd` | `50000` | Minimum pool liquidity before deeper checks |
+| `spotMinVolume5mUsd` | `5000` | Minimum five-minute volume |
+| `spotMaxTop10Pct` | `30` | Maximum top-10 holder concentration |
+| `spotMaxBotHoldersPct` | `20` | Maximum bot-holder percentage |
+| `spotEntrySlippageBps` | `150` | Entry minimum-output tolerance; the order must also satisfy impact and fee caps |
+| `spotExitSlippageBps` | `300` | Exit minimum-output tolerance; the order must also satisfy impact and fee caps |
+| `spotStopLossTriggerPct` | `-4` | Early mechanical stop trigger |
+| `spotStopLossPct` | `-5` | Intended maximum-loss target; fast markets can still execute beyond it |
+| `spotTakeProfitPct` | `6` | Fixed take-profit trigger |
+| `spotTrailingTriggerPct` | `3` | Enables trailing protection after this PnL |
+| `spotTrailingDropPct` | `1.5` | Exit after this retracement from peak PnL |
+| `spotMaxHoldMinutes` | `30` | Maximum time in one momentum position |
+| `spotScanIntervalSec` | `30` | Candidate scan interval |
+| `spotManagementPollIntervalSec` | `5` | Finalized balance and price monitoring interval |
+
+Spot entries require a SOL quote, legacy SPL Token ownership, disabled mint and freeze authorities, a fresh token audit, 5-minute and 15-minute momentum confirmation, positive buyer pressure, and bounded concentration. Jupiter orders are checked for the exact mint pair and amount, explicit minimum output, quote age, price impact, fees, expiry, local simulation, mainnet identity, and finalized outcome. These controls reduce avoidable execution risk; they cannot guarantee profit or prevent all memecoin losses.
+
 ### Screening
 
 | Field | Default | Description |
@@ -665,6 +699,9 @@ config.js           Runtime config from user-config.json + .env (repo-root paths
 repo-root.js        Stable absolute repo path — used by PM2, state files, and .env loading
 prompt.js           System prompt builder (SCREENER / MANAGER / GENERAL roles)
 state.js            Position registry (state.json)
+spot-state.js       Atomic spot position state and trade history
+spot-risk-budget.js Atomic daily spot turnover and realized-loss budget
+spot-momentum.js    Pure candidate and mechanical exit policy
 decision-log.js     Structured decision log for deploy, close, skip, and no-deploy rationale
 lessons.js          Learning engine: records performance, derives lessons, evolves thresholds
 risk-intelligence.js Realized-loss circuit breaker, fresh pool/token gates, AI risk brief
@@ -680,6 +717,7 @@ tools/
   definitions.js    Tool schemas (OpenAI format)
   executor.js       Tool dispatch + safety checks
   dlmm.js           Meteora DLMM SDK wrapper
+  spot.js           Spot discovery, fresh preflight, open/close, and PnL snapshots
   screening.js      Pool discovery
   wallet.js         SOL/token balances + Jupiter swap
   token.js          Token info, holders, narrative

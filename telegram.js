@@ -224,6 +224,11 @@ function toolLabel(name) {
     get_token_narrative: "get token narrative",
     get_token_holders: "get token holders",
     get_top_candidates: "get top candidates",
+    get_spot_momentum_candidates: "get spot momentum candidates",
+    get_spot_position: "get spot position",
+    get_spot_status: "get spot status",
+    open_spot_position: "open spot position",
+    close_spot_position: "close spot position",
     get_pool_detail: "get pool detail",
     get_active_bin: "get active bin",
     deploy_position: "deploy position",
@@ -249,6 +254,14 @@ function summarizeToolResult(name, result) {
   switch (name) {
     case "deploy_position":
       return result.position ? `position ${String(result.position).slice(0, 8)}...` : "submitted";
+    case "open_spot_position":
+      return result.position?.symbol ? `${result.position.symbol} opened` : (result.dry_run ? "dry-run entry passed" : "submitted");
+    case "close_spot_position":
+      return result.pnl_pct != null ? `${Number(result.pnl_pct).toFixed(2)}%` : (result.dry_run ? "dry-run close" : "submitted");
+    case "get_spot_momentum_candidates":
+      return `${result.candidates?.length ?? 0} candidates`;
+    case "get_spot_position":
+      return result.position ? `${result.position.symbol || result.position.id} ${result.status || result.position.status}` : "no position";
     case "close_position":
       return result.success ? "closed" : (result.reason || "failed");
     case "claim_fees":
@@ -499,6 +512,26 @@ export async function notifySwap({ inputSymbol, outputSymbol, amountIn, amountOu
     `🔄 <b>Swapped</b> ${inputSymbol} → ${outputSymbol}\n` +
     `In: ${amountIn ?? "?"} | Out: ${amountOut ?? "?"}\n` +
     `Tx: <code>${tx?.slice(0, 16)}...</code>`
+  );
+}
+
+export async function notifySpotOpen({ symbol, amountSol, tx }) {
+  if (hasActiveLiveMessage()) return;
+  await sendHTML(
+    `⚡ <b>Spot opened</b> ${String(symbol || "token").replace(/[<>&]/g, "")}` +
+    `\nCapital: ${Number(amountSol).toFixed(3)} SOL` +
+    `\nTx: <code>${String(tx || "").slice(0, 16)}...</code>`,
+  );
+}
+
+export async function notifySpotClose({ symbol, pnlSol, pnlPct, reason, tx }) {
+  if (hasActiveLiveMessage()) return;
+  const sign = Number(pnlSol) >= 0 ? "+" : "";
+  await sendHTML(
+    `🏁 <b>Spot closed</b> ${String(symbol || "token").replace(/[<>&]/g, "")}` +
+    `\nPnL: ${sign}${Number(pnlSol).toFixed(4)} SOL (${sign}${Number(pnlPct).toFixed(2)}%)` +
+    `\nReason: ${String(reason || "rule exit").replace(/[<>&]/g, "").slice(0, 180)}` +
+    `\nTx: <code>${String(tx || "").slice(0, 16)}...</code>`,
   );
 }
 

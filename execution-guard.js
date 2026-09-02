@@ -110,3 +110,55 @@ export function assertAutonomousSwapAllowed({ inputMint, outputMint, amount }) {
 
   return numericAmount;
 }
+
+/**
+ * Spot swaps use a dedicated path. A buy is only allowed while spot_momentum
+ * mode is active and must use the exact backend-configured SOL size. A
+ * risk-reducing sell remains available after a mode change, but can only return
+ * the tracked token to SOL. This deliberately does not weaken the generic
+ * autonomous swap guard above.
+ */
+export function assertSpotSwapAllowed({
+  mode,
+  direction,
+  inputMint,
+  outputMint,
+  amount,
+  configuredTradeAmountSol,
+  maxTradeAmountSol,
+}) {
+  const numericAmount = Number(amount);
+  if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
+    throw new Error("Spot swap requires a positive finite amount.");
+  }
+
+  if (direction === "buy") {
+    if (mode !== "spot_momentum") {
+      throw new Error("Spot buy is blocked unless tradingMode=spot_momentum.");
+    }
+    if (inputMint !== SOL_MINT || !outputMint || outputMint === SOL_MINT) {
+      throw new Error("Spot buy must swap SOL into one validated non-SOL token.");
+    }
+    const configured = Number(configuredTradeAmountSol);
+    const maximum = Number(maxTradeAmountSol);
+    if (!Number.isFinite(configured) || configured <= 0 || !Number.isFinite(maximum) || maximum <= 0) {
+      throw new Error("Spot buy limits are invalid.");
+    }
+    if (Math.abs(numericAmount - configured) > 1e-9) {
+      throw new Error(`Spot buy amount must equal the backend-configured ${configured} SOL.`);
+    }
+    if (numericAmount > maximum + 1e-9) {
+      throw new Error(`Spot buy amount ${numericAmount} SOL exceeds the ${maximum} SOL hard cap.`);
+    }
+    return numericAmount;
+  }
+
+  if (direction === "sell") {
+    if (!inputMint || inputMint === SOL_MINT || outputMint !== SOL_MINT) {
+      throw new Error("Spot sell must return one non-SOL token to SOL.");
+    }
+    return numericAmount;
+  }
+
+  throw new Error("Spot swap direction must be buy or sell.");
+}

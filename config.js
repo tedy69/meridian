@@ -43,6 +43,15 @@ function positiveIntegerConfig(value, fallback) {
   return numeric != null && numeric >= 1 ? Math.max(1, Math.round(numeric)) : fallback;
 }
 
+function boundedPositiveIntegerConfig(value, fallback, maximum, label) {
+  if (value == null) return fallback;
+  const numeric = numericConfig(value);
+  if (numeric == null || !Number.isInteger(numeric) || numeric < 1 || numeric > maximum) {
+    throw new Error(`${label} must be an integer from 1 to ${maximum}`);
+  }
+  return numeric;
+}
+
 function positiveNumberConfig(value, fallback) {
   const numeric = numericConfig(value);
   return numeric != null && numeric > 0 ? numeric : fallback;
@@ -168,6 +177,80 @@ export function buildIndicatorConfig(userConfig = {}) {
   };
 }
 
+export function buildTradingConfig(userConfig = {}) {
+  // Preserve existing installations unless they explicitly opt into spot.
+  const requested = String(userConfig.tradingMode ?? "dlmm_lp").trim().toLowerCase();
+  if (!["dlmm_lp", "spot_momentum"].includes(requested)) {
+    throw new Error('tradingMode must be either "dlmm_lp" or "spot_momentum"');
+  }
+  return { mode: requested };
+}
+
+export function buildSpotConfig(userConfig = {}) {
+  const tradeAmountSol = positiveNumberConfig(userConfig.spotTradeAmountSol, 0.5);
+  const maxTradeAmountSol = positiveNumberConfig(userConfig.spotMaxTradeAmountSol, 0.5);
+  if (tradeAmountSol > maxTradeAmountSol || maxTradeAmountSol > 0.5) {
+    throw new Error("Spot trade amount and maximum must not exceed 0.5 SOL");
+  }
+  const gasReserveSol = positiveNumberConfig(userConfig.spotGasReserveSol, 0.2);
+  const stopLossPct = numericConfig(userConfig.spotStopLossPct) ?? -5;
+  const configuredStopTrigger = numericConfig(userConfig.spotStopLossTriggerPct) ?? -4;
+  const stopLossTriggerPct = stopLossPct < 0 && configuredStopTrigger < 0 && configuredStopTrigger > stopLossPct
+    ? configuredStopTrigger
+    : -4;
+
+  return {
+    tradeAmountSol,
+    maxTradeAmountSol,
+    gasReserveSol,
+    minWalletSol: Number((tradeAmountSol + gasReserveSol).toFixed(9)),
+    maxOpenPositions: 1,
+    maxDailyBuySol: positiveNumberConfig(userConfig.spotMaxDailyBuySol, 2),
+    maxDailyLossSol: positiveNumberConfig(userConfig.spotMaxDailyLossSol, 0.05),
+
+    minLiquidityUsd: positiveNumberConfig(userConfig.spotMinLiquidityUsd, 50_000),
+    minVolume5mUsd: positiveNumberConfig(userConfig.spotMinVolume5mUsd, 5_000),
+    minVolumeLiquidityRatio: positiveNumberConfig(userConfig.spotMinVolumeLiquidityRatio, 0.05),
+    minOrganic: positiveNumberConfig(userConfig.spotMinOrganic, 70),
+    minHolders: positiveIntegerConfig(userConfig.spotMinHolders, 500),
+    minMarketCapUsd: positiveNumberConfig(userConfig.spotMinMarketCapUsd, 150_000),
+    maxMarketCapUsd: positiveNumberConfig(userConfig.spotMaxMarketCapUsd, 10_000_000),
+    minTokenAgeMinutes: positiveNumberConfig(userConfig.spotMinTokenAgeMinutes, 30),
+    maxTokenAgeHours: positiveNumberConfig(userConfig.spotMaxTokenAgeHours, 72),
+    maxTop10Pct: positiveNumberConfig(userConfig.spotMaxTop10Pct, 30),
+    maxBotHoldersPct: positiveNumberConfig(userConfig.spotMaxBotHoldersPct, 20),
+    minPriceChange5mPct: numericConfig(userConfig.spotMinPriceChange5mPct) ?? 0.5,
+    maxPriceChange5mPct: positiveNumberConfig(userConfig.spotMaxPriceChange5mPct, 12),
+    minVolumeChangePct: numericConfig(userConfig.spotMinVolumeChangePct) ?? 0,
+    minBuySellVolumeRatio: positiveNumberConfig(userConfig.spotMinBuySellVolumeRatio, 1.1),
+    requirePositiveNetBuyers: userConfig.spotRequirePositiveNetBuyers ?? true,
+    requireMintAuthorityDisabled: userConfig.spotRequireMintAuthorityDisabled ?? true,
+    requireFreezeAuthorityDisabled: userConfig.spotRequireFreezeAuthorityDisabled ?? true,
+    requireLegacyTokenProgram: userConfig.spotRequireLegacyTokenProgram ?? true,
+    requireMomentumConfirmation: userConfig.spotRequireMomentumConfirmation ?? true,
+
+    entrySlippageBps: boundedPositiveIntegerConfig(userConfig.spotEntrySlippageBps, 150, 500, "spotEntrySlippageBps"),
+    exitSlippageBps: boundedPositiveIntegerConfig(userConfig.spotExitSlippageBps, 300, 1_000, "spotExitSlippageBps"),
+    maxEntryPriceImpactPct: positiveNumberConfig(userConfig.spotMaxEntryPriceImpactPct, 1),
+    maxExitPriceImpactPct: positiveNumberConfig(userConfig.spotMaxExitPriceImpactPct, 3),
+    maxFeeBps: positiveIntegerConfig(userConfig.spotMaxFeeBps, 60),
+    maxPriorityFeeLamports: positiveIntegerConfig(userConfig.spotMaxPriorityFeeLamports, 2_000_000),
+    maxTotalFeeLamports: positiveIntegerConfig(userConfig.spotMaxTotalFeeLamports, 5_000_000),
+    quoteMaxAgeMs: positiveIntegerConfig(userConfig.spotQuoteMaxAgeMs, 3_000),
+    maxPriceBlockLag: positiveIntegerConfig(userConfig.spotMaxPriceBlockLag, 150),
+
+    takeProfitPct: positiveNumberConfig(userConfig.spotTakeProfitPct, 6),
+    stopLossPct: stopLossPct < 0 ? stopLossPct : -5,
+    stopLossTriggerPct,
+    trailingTriggerPct: positiveNumberConfig(userConfig.spotTrailingTriggerPct, 3),
+    trailingDropPct: positiveNumberConfig(userConfig.spotTrailingDropPct, 1.5),
+    maxHoldMinutes: positiveNumberConfig(userConfig.spotMaxHoldMinutes, 30),
+    exitConfirmTicks: positiveIntegerConfig(userConfig.spotExitConfirmTicks, 2),
+    scanIntervalSec: positiveIntegerConfig(userConfig.spotScanIntervalSec, 30),
+    managementPollIntervalSec: positiveIntegerConfig(userConfig.spotManagementPollIntervalSec, 5),
+  };
+}
+
 // Apply wallet/RPC from user-config if not already in env
 if (u.rpcUrl)    process.env.RPC_URL            ||= u.rpcUrl;
 if (u.walletKey) process.env.WALLET_PRIVATE_KEY ||= u.walletKey;
@@ -198,8 +281,14 @@ function nonEmptyString(...values) {
 }
 
 export const config = {
+  // ─── Trading mode ─────────────────────────
+  trading: buildTradingConfig(u),
+
   // ─── Risk Limits ─────────────────────────
   risk: buildRiskConfig(u),
+
+  // ─── Fast spot-momentum strategy ──────────
+  spot: buildSpotConfig(u),
 
   // ─── Pool Screening Thresholds ───────────
   screening: buildScreeningConfig(u),

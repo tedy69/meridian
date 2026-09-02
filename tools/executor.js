@@ -26,6 +26,14 @@ import { addToBlacklist, removeFromBlacklist, listBlacklist } from "../token-bla
 import { blockDev, unblockDev, listBlockedDevs } from "../dev-blocklist.js";
 import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsOnPool } from "../smart-wallets.js";
 import { getTokenInfo, getTokenHolders, getTokenNarrative } from "./token.js";
+import {
+  closeSpotPosition,
+  getSpotMomentumCandidates,
+  getSpotPositionSnapshot,
+  getSpotStatus,
+  openSpotPosition,
+  validateSpotOpenRequest,
+} from "./spot.js";
 import { confirmIndicatorPreset } from "./chart-indicators.js";
 import {
   config,
@@ -64,7 +72,7 @@ const TIMEFRAME_MINUTES = {
   "24h": 1440,
 };
 import { log, logAction } from "../logger.js";
-import { notifyAutoSwapPending, notifyDeploy, notifyClose, notifySwap } from "../telegram.js";
+import { notifyAutoSwapPending, notifyDeploy, notifyClose, notifySwap, notifySpotOpen, notifySpotClose } from "../telegram.js";
 
 function getVolatilityTimeframe(sourceTimeframe) {
   const source = String(sourceTimeframe || "").trim();
@@ -348,6 +356,11 @@ const toolMap = {
   get_token_info: getTokenInfo,
   get_token_holders: getTokenHolders,
   get_token_narrative: getTokenNarrative,
+  get_spot_momentum_candidates: getSpotMomentumCandidates,
+  get_spot_position: getSpotPositionSnapshot,
+  get_spot_status: getSpotStatus,
+  open_spot_position: openSpotPosition,
+  close_spot_position: closeSpotPosition,
   add_smart_wallet: addSmartWallet,
   remove_smart_wallet: removeSmartWallet,
   list_smart_wallets: listSmartWallets,
@@ -714,6 +727,8 @@ const toolMap = {
 // Tools that modify on-chain state (need extra safety checks)
 const WRITE_TOOLS = new Set([
   "deploy_position",
+  "open_spot_position",
+  "close_spot_position",
   "claim_fees",
   "close_position",
   "swap_token",
@@ -725,6 +740,25 @@ const PROTECTED_TOOLS = new Set([
 ]);
 
 const MANUAL_ONLY_CONFIG_KEYS = new Set([
+  "tradingMode",
+  "spotTradeAmountSol",
+  "spotMaxTradeAmountSol",
+  "spotGasReserveSol",
+  "spotMaxDailyBuySol",
+  "spotMaxDailyLossSol",
+  "spotEntrySlippageBps",
+  "spotExitSlippageBps",
+  "spotMaxEntryPriceImpactPct",
+  "spotMaxExitPriceImpactPct",
+  "spotMaxFeeBps",
+  "spotMaxPriorityFeeLamports",
+  "spotMaxTotalFeeLamports",
+  "spotStopLossPct",
+  "spotStopLossTriggerPct",
+  "spotTakeProfitPct",
+  "spotTrailingTriggerPct",
+  "spotTrailingDropPct",
+  "spotMaxHoldMinutes",
   "maxPositions",
   "maxDeployAmount",
   "maxDailyDeploySol",
@@ -1088,6 +1122,20 @@ export async function executeTool(name, args) {
             error: settlementError.message,
           }).catch(() => {});
         }
+      } else if (name === "open_spot_position" && result.trade_status === "open") {
+        notifySpotOpen({
+          symbol: result.position?.symbol,
+          amountSol: result.amount_sol,
+          tx: result.tx,
+        }).catch(() => {});
+      } else if (name === "close_spot_position" && result.trade_status === "closed") {
+        notifySpotClose({
+          symbol: result.position?.symbol,
+          pnlSol: result.pnl_sol,
+          pnlPct: result.pnl_pct,
+          reason: args.reason,
+          tx: result.tx,
+        }).catch(() => {});
       } else if (name === "claim_fees" && config.management.autoSwapAfterClaim && result.base_mint) {
         await swapBaseToSolWithRetry(result.base_mint, "after claim");
       }
@@ -1137,6 +1185,12 @@ export async function executeTool(name, args) {
  */
 export async function runSafetyChecks(name, args) {
   switch (name) {
+    case "open_spot_position":
+      return validateSpotOpenRequest(args);
+
+    case "close_spot_position":
+      return { pass: true };
+
     case "deploy_position": {
       const pendingAutoSwaps = getPendingAutoSwaps();
       try {
@@ -1146,6 +1200,9 @@ export async function runSafetyChecks(name, args) {
           pass: false,
           reason: error.message,
         };
+      }
+      if (config.trading.mode !== "dlmm_lp") {
+        return { pass: false, reason: "deploy_position is blocked unless tradingMode=dlmm_lp" };
       }
       let lossCircuit;
       try {
@@ -1353,7 +1410,7 @@ export async function runSafetyChecks(name, args) {
         };
       }
       const requestedKeys = Object.keys(args?.changes || {});
-      const manualOnly = requestedKeys.filter((key) => MANUAL_ONLY_CONFIG_KEYS.has(key));
+      const manualOnly = requestedKeys.filter((key) => MANUAL_ONLY_CONFIG_KEYS.has(key) || key.startsWith("spot"));
       if (manualOnly.length > 0) {
         return {
           pass: false,
