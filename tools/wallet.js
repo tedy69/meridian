@@ -5,6 +5,12 @@ import {
   VersionedTransaction,
   Keypair,
 } from "@solana/web3.js";
+import {
+  ExtensionType,
+  TOKEN_2022_PROGRAM_ID,
+  getExtensionTypes,
+  unpackMint,
+} from "@solana/spl-token";
 import bs58 from "bs58";
 import { log } from "../logger.js";
 import { config } from "../config.js";
@@ -38,6 +44,7 @@ function getWallet() {
 const JUPITER_PRICE_API = "https://api.jup.ag/price/v3";
 const JUPITER_SWAP_V2_API = "https://api.jup.ag/swap/v2";
 export const LEGACY_TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+export const TOKEN_2022_PROGRAM_ID_STRING = TOKEN_2022_PROGRAM_ID.toBase58();
 const ASSOCIATED_TOKEN_PROGRAM_ID = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 function getJupiterApiKey() {
   return config.jupiter.apiKey || process.env.JUPITER_API_KEY || "";
@@ -70,12 +77,22 @@ function getJupiterReferralParams() {
   return { referralAccount, referralFee: Math.round(referralFee) };
 }
 
-function associatedTokenAddress(owner, mint) {
+export function deriveAssociatedTokenAddress(owner, mint, tokenProgramId = LEGACY_TOKEN_PROGRAM_ID) {
   return PublicKey.findProgramAddressSync([
     owner.toBuffer(),
-    new PublicKey(LEGACY_TOKEN_PROGRAM_ID).toBuffer(),
+    new PublicKey(tokenProgramId).toBuffer(),
     new PublicKey(mint).toBuffer(),
   ], new PublicKey(ASSOCIATED_TOKEN_PROGRAM_ID))[0];
+}
+
+async function mintTokenProgram(connection, mint) {
+  const account = await connection.getAccountInfo(new PublicKey(mint), "finalized");
+  if (!account) throw new Error(`Token mint ${mint} does not exist at finalized commitment`);
+  const programId = account.owner?.toBase58?.() || String(account.owner || "");
+  if (![LEGACY_TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID_STRING].includes(programId)) {
+    throw new Error(`Token mint ${mint} is owned by unsupported program ${programId || "unknown"}`);
+  }
+  return programId;
 }
 
 function tokenRawAmountFromAccount(account) {
@@ -145,8 +162,16 @@ async function simulateJupiterTransaction(connection, transaction, {
   totalFeeLamports,
 } = {}) {
   const wallet = new PublicKey(walletPublicKey);
-  const inputTokenAccount = inputMint === SOL_MINT ? null : associatedTokenAddress(wallet, inputMint);
-  const outputTokenAccount = outputMint === SOL_MINT ? null : associatedTokenAddress(wallet, outputMint);
+  const [inputTokenProgram, outputTokenProgram] = await Promise.all([
+    inputMint === SOL_MINT ? null : mintTokenProgram(connection, inputMint),
+    outputMint === SOL_MINT ? null : mintTokenProgram(connection, outputMint),
+  ]);
+  const inputTokenAccount = inputMint === SOL_MINT
+    ? null
+    : deriveAssociatedTokenAddress(wallet, inputMint, inputTokenProgram);
+  const outputTokenAccount = outputMint === SOL_MINT
+    ? null
+    : deriveAssociatedTokenAddress(wallet, outputMint, outputTokenProgram);
   const addresses = [wallet, inputTokenAccount, outputTokenAccount].filter(Boolean);
   const before = await connection.getMultipleAccountsInfo(addresses, "finalized");
   const simulation = await connection.simulateTransaction(transaction, {
@@ -499,32 +524,94 @@ export function validateJupiterTransactionEnvelope(transaction, expectedFeePayer
   return true;
 }
 
+const SAFE_TOKEN_2022_MINT_EXTENSIONS = new Set(["MetadataPointer", "TokenMetadata"]);
+
+function extensionTypeName(extensionType) {
+  if (typeof extensionType === "string") return extensionType;
+  const numericType = Number(extensionType);
+  const knownName = Number.isInteger(numericType) ? ExtensionType[numericType] : null;
+  return typeof knownName === "string" ? knownName : `Unknown(${String(extensionType)})`;
+}
+
+export function validateMintProgramSafety({
+  mint,
+  programId,
+  decimals,
+  isInitialized = true,
+  mintAuthority,
+  freezeAuthority,
+  extensionTypes = [],
+} = {}, {
+  requireLegacyTokenProgram = true,
+  allowMetadataOnlyToken2022 = false,
+} = {}) {
+  const normalizedExtensions = [...new Set((extensionTypes || []).map(extensionTypeName))];
+  const legacyTokenProgram = programId === LEGACY_TOKEN_PROGRAM_ID;
+  const token2022Program = programId === TOKEN_2022_PROGRAM_ID_STRING;
+
+  if (!legacyTokenProgram && !token2022Program) {
+    throw new Error(`Token ${mint} is owned by unsupported program ${programId || "unknown"}`);
+  }
+  if (!legacyTokenProgram && (requireLegacyTokenProgram || !allowMetadataOnlyToken2022)) {
+    throw new Error(`Token ${mint} is not owned by the legacy SPL Token program`);
+  }
+  if (legacyTokenProgram && normalizedExtensions.length > 0) {
+    throw new Error(`Legacy token ${mint} unexpectedly contains extensions: ${normalizedExtensions.join(", ")}`);
+  }
+  if (token2022Program) {
+    const unsupported = normalizedExtensions.filter((extension) => !SAFE_TOKEN_2022_MINT_EXTENSIONS.has(extension));
+    if (unsupported.length > 0) {
+      throw new Error(`Token ${mint} has unsupported Token-2022 extension(s): ${unsupported.join(", ")}`);
+    }
+  }
+  if (isInitialized !== true) throw new Error(`Token ${mint} mint is not initialized`);
+
+  const result = {
+    mint,
+    programId,
+    decimals: Number(decimals),
+    isInitialized: true,
+    mintAuthorityDisabled: mintAuthority == null,
+    freezeAuthorityDisabled: freezeAuthority == null,
+    legacyTokenProgram,
+    token2022Program,
+    metadataOnlyToken2022: token2022Program,
+    extensionTypes: normalizedExtensions,
+  };
+  if (!result.mintAuthorityDisabled) throw new Error(`Token ${mint} still has a mint authority`);
+  if (!result.freezeAuthorityDisabled) throw new Error(`Token ${mint} still has a freeze authority`);
+  return result;
+}
+
 export async function inspectMintSafety(mint, {
   requireLegacyTokenProgram = true,
+  allowMetadataOnlyToken2022 = false,
+  connection = getConnection(),
 } = {}) {
   const normalized = normalizeMint(mint);
   if (!normalized || normalized === SOL_MINT) throw new Error("A non-SOL token mint is required");
-  const connection = getConnection();
-  const response = await connection.getParsedAccountInfo(new PublicKey(normalized), "finalized");
-  const account = response.value;
+  const mintAddress = new PublicKey(normalized);
+  const account = await connection.getAccountInfo(mintAddress, "finalized");
   if (!account) throw new Error(`Token mint ${normalized} does not exist at finalized commitment`);
   const programId = account.owner?.toBase58?.() || String(account.owner || "");
-  const info = account.data?.parsed?.info;
-  if (!info) throw new Error(`Token mint ${normalized} could not be parsed`);
-  const result = {
+  let unpacked;
+  try {
+    unpacked = unpackMint(mintAddress, account, new PublicKey(programId));
+  } catch (error) {
+    throw new Error(`Token mint ${normalized} could not be parsed safely: ${error.message}`);
+  }
+  const extensionTypes = programId === TOKEN_2022_PROGRAM_ID_STRING
+    ? getExtensionTypes(unpacked.tlvData)
+    : [];
+  return validateMintProgramSafety({
     mint: normalized,
     programId,
-    decimals: Number(info.decimals),
-    mintAuthorityDisabled: info.mintAuthority == null,
-    freezeAuthorityDisabled: info.freezeAuthority == null,
-    legacyTokenProgram: programId === LEGACY_TOKEN_PROGRAM_ID,
-  };
-  if (requireLegacyTokenProgram && !result.legacyTokenProgram) {
-    throw new Error(`Token ${normalized} is not owned by the legacy SPL Token program`);
-  }
-  if (!result.mintAuthorityDisabled) throw new Error(`Token ${normalized} still has a mint authority`);
-  if (!result.freezeAuthorityDisabled) throw new Error(`Token ${normalized} still has a freeze authority`);
-  return result;
+    decimals: unpacked.decimals,
+    isInitialized: unpacked.isInitialized,
+    mintAuthority: unpacked.mintAuthority,
+    freezeAuthority: unpacked.freezeAuthority,
+    extensionTypes,
+  }, { requireLegacyTokenProgram, allowMetadataOnlyToken2022 });
 }
 
 export async function getJupiterPrices(mints) {

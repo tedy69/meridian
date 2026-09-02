@@ -3,7 +3,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { buildSpotConfig, buildTradingConfig } from "../config.js";
+import { PublicKey } from "@solana/web3.js";
+import { buildSpotConfig, buildSpotDiscoveryConfig, buildTradingConfig } from "../config.js";
 import { SOL_MINT } from "../execution-guard.js";
 import {
   calculateSpotPnlPct,
@@ -26,12 +27,21 @@ import {
   reserveSpotBuy,
 } from "../spot-risk-budget.js";
 import {
+  LEGACY_TOKEN_PROGRAM_ID,
+  TOKEN_2022_PROGRAM_ID_STRING,
+  deriveAssociatedTokenAddress,
+  validateMintProgramSafety,
   validateJupiterExecutionResult,
   validateJupiterOrder,
   validateJupiterTransactionEnvelope,
   validateSimulatedSwapEffects,
 } from "../tools/wallet.js";
-import { closeSpotPosition, getSpotPositionSnapshot, openSpotPosition } from "../tools/spot.js";
+import {
+  closeSpotPosition,
+  getSpotMomentumCandidates,
+  getSpotPositionSnapshot,
+  openSpotPosition,
+} from "../tools/spot.js";
 
 function withTempFiles(callback) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "meridian-spot-"));
@@ -107,6 +117,197 @@ test("spot momentum explicitly enables a backend-capped 0.5 SOL trade", () => {
   assert.throws(() => buildSpotConfig({ spotRealtimeEnabled: "false" }), /spotRealtimeEnabled/i);
   assert.throws(() => buildSpotConfig({ spotRealtimeCommitment: "fastest" }), /spotRealtimeCommitment/i);
   assert.throws(() => buildSpotConfig({ spotRealtimeEventDebounceMs: 10 }), /spotRealtimeEventDebounceMs/i);
+});
+
+test("spot discovery is broad while the fresh entry gate stays selective", () => {
+  const discovery = buildSpotDiscoveryConfig({});
+  const entry = buildSpotConfig({});
+
+  assert.deepEqual({
+    liquidity: discovery.minLiquidityUsd,
+    volume: discovery.minVolume5mUsd,
+    volumeRatio: discovery.minVolumeLiquidityRatio,
+    organic: discovery.minOrganic,
+    holders: discovery.minHolders,
+    minMcap: discovery.minMarketCapUsd,
+    maxMcap: discovery.maxMarketCapUsd,
+    minAgeMinutes: discovery.minTokenAgeMinutes,
+    maxAgeHours: discovery.maxTokenAgeHours,
+  }, {
+    liquidity: 20_000,
+    volume: 500,
+    volumeRatio: 0.025,
+    organic: 60,
+    holders: 200,
+    minMcap: 75_000,
+    maxMcap: 50_000_000,
+    minAgeMinutes: 20,
+    maxAgeHours: 2_160,
+  });
+  assert.deepEqual({
+    liquidity: entry.minLiquidityUsd,
+    volume: entry.minVolume5mUsd,
+    volumeRatio: entry.minVolumeLiquidityRatio,
+    organic: entry.minOrganic,
+    holders: entry.minHolders,
+    minMcap: entry.minMarketCapUsd,
+    maxMcap: entry.maxMarketCapUsd,
+    minAgeMinutes: entry.minTokenAgeMinutes,
+    maxAgeHours: entry.maxTokenAgeHours,
+    priceChange: entry.minPriceChange5mPct,
+    volumeChange: entry.minVolumeChangePct,
+    buySellRatio: entry.minBuySellVolumeRatio,
+  }, {
+    liquidity: 30_000,
+    volume: 2_000,
+    volumeRatio: 0.03,
+    organic: 65,
+    holders: 300,
+    minMcap: 100_000,
+    maxMcap: 30_000_000,
+    minAgeMinutes: 30,
+    maxAgeHours: 2_160,
+    priceChange: 0.2,
+    volumeChange: -10,
+    buySellRatio: 1.05,
+  });
+  assert.equal(entry.allowMetadataOnlyToken2022, true);
+  assert.equal(entry.requireLegacyTokenProgram, false);
+  assert.ok(discovery.minLiquidityUsd < entry.minLiquidityUsd);
+  assert.ok(discovery.minVolume5mUsd < entry.minVolume5mUsd);
+});
+
+test("Token-2022 mint safety only permits metadata extensions with disabled authorities", () => {
+  const legacy = validateMintProgramSafety({
+    mint: "legacy",
+    programId: LEGACY_TOKEN_PROGRAM_ID,
+    decimals: 6,
+    mintAuthority: null,
+    freezeAuthority: null,
+    extensionTypes: [],
+  });
+  assert.equal(legacy.legacyTokenProgram, true);
+
+  const metadataOnly = validateMintProgramSafety({
+    mint: "token-2022",
+    programId: TOKEN_2022_PROGRAM_ID_STRING,
+    decimals: 6,
+    mintAuthority: null,
+    freezeAuthority: null,
+    extensionTypes: [18, 19],
+  }, { requireLegacyTokenProgram: false, allowMetadataOnlyToken2022: true });
+  assert.equal(metadataOnly.metadataOnlyToken2022, true);
+  assert.deepEqual(metadataOnly.extensionTypes, ["MetadataPointer", "TokenMetadata"]);
+
+  for (const extension of [
+    "TransferFeeConfig",
+    "TransferHook",
+    "PermanentDelegate",
+    "PausableConfig",
+    "NonTransferable",
+    "MintCloseAuthority",
+    "Unknown(65535)",
+  ]) {
+    assert.throws(() => validateMintProgramSafety({
+      mint: "unsafe-token-2022",
+      programId: TOKEN_2022_PROGRAM_ID_STRING,
+      decimals: 6,
+      mintAuthority: null,
+      freezeAuthority: null,
+      extensionTypes: ["MetadataPointer", extension],
+    }, { requireLegacyTokenProgram: false, allowMetadataOnlyToken2022: true }), new RegExp(extension.replace(/[()]/g, "\\$&"), "i"));
+  }
+
+  assert.throws(() => validateMintProgramSafety({
+    mint: "metadata-disabled",
+    programId: TOKEN_2022_PROGRAM_ID_STRING,
+    decimals: 6,
+    mintAuthority: null,
+    freezeAuthority: null,
+    extensionTypes: ["TokenMetadata"],
+  }), /legacy SPL Token program/i);
+  assert.throws(() => validateMintProgramSafety({
+    mint: "authority-enabled",
+    programId: TOKEN_2022_PROGRAM_ID_STRING,
+    decimals: 6,
+    mintAuthority: "authority",
+    freezeAuthority: null,
+    extensionTypes: ["TokenMetadata"],
+  }, { requireLegacyTokenProgram: false, allowMetadataOnlyToken2022: true }), /mint authority/i);
+  assert.throws(() => validateMintProgramSafety({
+    mint: "uninitialized",
+    programId: LEGACY_TOKEN_PROGRAM_ID,
+    decimals: 6,
+    isInitialized: false,
+    mintAuthority: null,
+    freezeAuthority: null,
+  }), /not initialized/i);
+
+  const owner = new PublicKey("11111111111111111111111111111111");
+  const mint = new PublicKey("So11111111111111111111111111111111111111112");
+  assert.notEqual(
+    deriveAssociatedTokenAddress(owner, mint, LEGACY_TOKEN_PROGRAM_ID).toBase58(),
+    deriveAssociatedTokenAddress(owner, mint, TOKEN_2022_PROGRAM_ID_STRING).toBase58(),
+    "associated-token derivation must bind the mint's token program",
+  );
+});
+
+test("broadly discovered pools still must pass the stricter fresh entry policy", async () => {
+  const candidate = passingCandidate();
+  candidate.pool.tvl = 25_000;
+  candidate.pool.volume_window = 1_000;
+  candidate.pool.volume_active_tvl_ratio = 0.04;
+  candidate.pool.organic_score = 62;
+  candidate.pool.base.organic = 62;
+  candidate.pool.holders = 250;
+  candidate.tokenInfo.holders = 250;
+  candidate.pool.mcap = 90_000;
+  candidate.pool.token_age_hours = 1;
+  candidate.pool.price_change_pct = 1;
+  candidate.pool.volume_change_pct = 0;
+  let auditReads = 0;
+
+  const result = await getSpotMomentumCandidates({ limit: 10 }, {
+    tradingMode: "spot_momentum",
+    spotConfig: buildSpotConfig({}),
+    spotDiscoveryConfig: buildSpotDiscoveryConfig({}),
+    readSpotPosition: () => null,
+    discoverPools: async () => ({ pools: [candidate.pool] }),
+    getTokenInfo: async () => { auditReads += 1; return { results: [candidate.tokenInfo] }; },
+    confirmIndicatorPreset: async () => ({ confirmed: true, skipped: false, intervals: [] }),
+    inspectMintSafety: async () => ({ legacyTokenProgram: true, extensionTypes: [] }),
+    indicatorConfig: { entryPreset: "momentum_quality", intervals: ["5_MINUTE", "15_MINUTE"] },
+    sleep: async () => {},
+  });
+
+  assert.equal(auditReads, 1, "pool should survive broad discovery and reach the fresh audit");
+  assert.equal(result.shortlist_size, 1);
+  assert.equal(result.candidates.length, 0);
+  assert.match(result.filtered_examples[0].reason, /liquidity.*30000/i);
+});
+
+test("candidate screening rejects a behavioral Token-2022 extension before AI selection", async () => {
+  const candidate = passingCandidate();
+  let mintSafetyReads = 0;
+  const result = await getSpotMomentumCandidates({ limit: 10 }, {
+    tradingMode: "spot_momentum",
+    spotConfig: buildSpotConfig({}),
+    spotDiscoveryConfig: buildSpotDiscoveryConfig({}),
+    readSpotPosition: () => null,
+    discoverPools: async () => ({ pools: [candidate.pool] }),
+    getTokenInfo: async () => ({ results: [candidate.tokenInfo] }),
+    confirmIndicatorPreset: async () => ({ confirmed: true, skipped: false, intervals: [] }),
+    inspectMintSafety: async () => {
+      mintSafetyReads += 1;
+      throw new Error("unsupported Token-2022 extension(s): TransferFeeConfig");
+    },
+    indicatorConfig: { entryPreset: "momentum_quality", intervals: ["5_MINUTE", "15_MINUTE"] },
+    sleep: async () => {},
+  });
+
+  assert.equal(mintSafetyReads, 1);
+  assert.equal(result.candidates.length, 0);
+  assert.match(result.filtered_examples[0].reason, /TransferFeeConfig/);
 });
 
 test("candidate gate requires safe audit, SOL quote, and confirmed momentum", () => {

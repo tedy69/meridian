@@ -195,6 +195,20 @@ export function buildTradingConfig(userConfig = {}) {
   return { mode: requested };
 }
 
+export function buildSpotDiscoveryConfig(userConfig = {}) {
+  return {
+    minLiquidityUsd: positiveNumberConfig(userConfig.spotDiscoveryMinLiquidityUsd, 20_000),
+    minVolume5mUsd: positiveNumberConfig(userConfig.spotDiscoveryMinVolume5mUsd, 500),
+    minVolumeLiquidityRatio: positiveNumberConfig(userConfig.spotDiscoveryMinVolumeLiquidityRatio, 0.025),
+    minOrganic: positiveNumberConfig(userConfig.spotDiscoveryMinOrganic, 60),
+    minHolders: positiveIntegerConfig(userConfig.spotDiscoveryMinHolders, 200),
+    minMarketCapUsd: positiveNumberConfig(userConfig.spotDiscoveryMinMarketCapUsd, 75_000),
+    maxMarketCapUsd: positiveNumberConfig(userConfig.spotDiscoveryMaxMarketCapUsd, 50_000_000),
+    minTokenAgeMinutes: positiveNumberConfig(userConfig.spotDiscoveryMinTokenAgeMinutes, 20),
+    maxTokenAgeHours: positiveNumberConfig(userConfig.spotDiscoveryMaxTokenAgeHours, 2_160),
+  };
+}
+
 export function buildSpotConfig(userConfig = {}) {
   const tradeAmountSol = positiveNumberConfig(userConfig.spotTradeAmountSol, 0.5);
   const maxTradeAmountSol = positiveNumberConfig(userConfig.spotMaxTradeAmountSol, 0.5);
@@ -215,6 +229,12 @@ export function buildSpotConfig(userConfig = {}) {
   if (userConfig.spotRealtimeEnabled != null && typeof userConfig.spotRealtimeEnabled !== "boolean") {
     throw new Error("spotRealtimeEnabled must be true or false");
   }
+  if (userConfig.spotRequireLegacyTokenProgram != null && typeof userConfig.spotRequireLegacyTokenProgram !== "boolean") {
+    throw new Error("spotRequireLegacyTokenProgram must be true or false");
+  }
+  if (userConfig.spotAllowMetadataOnlyToken2022 != null && typeof userConfig.spotAllowMetadataOnlyToken2022 !== "boolean") {
+    throw new Error("spotAllowMetadataOnlyToken2022 must be true or false");
+  }
 
   return {
     tradeAmountSol,
@@ -225,25 +245,26 @@ export function buildSpotConfig(userConfig = {}) {
     maxDailyBuySol: positiveNumberConfig(userConfig.spotMaxDailyBuySol, 2),
     maxDailyLossSol: positiveNumberConfig(userConfig.spotMaxDailyLossSol, 0.05),
 
-    minLiquidityUsd: positiveNumberConfig(userConfig.spotMinLiquidityUsd, 50_000),
-    minVolume5mUsd: positiveNumberConfig(userConfig.spotMinVolume5mUsd, 5_000),
-    minVolumeLiquidityRatio: positiveNumberConfig(userConfig.spotMinVolumeLiquidityRatio, 0.05),
-    minOrganic: positiveNumberConfig(userConfig.spotMinOrganic, 70),
-    minHolders: positiveIntegerConfig(userConfig.spotMinHolders, 500),
-    minMarketCapUsd: positiveNumberConfig(userConfig.spotMinMarketCapUsd, 150_000),
-    maxMarketCapUsd: positiveNumberConfig(userConfig.spotMaxMarketCapUsd, 10_000_000),
+    minLiquidityUsd: positiveNumberConfig(userConfig.spotMinLiquidityUsd, 30_000),
+    minVolume5mUsd: positiveNumberConfig(userConfig.spotMinVolume5mUsd, 2_000),
+    minVolumeLiquidityRatio: positiveNumberConfig(userConfig.spotMinVolumeLiquidityRatio, 0.03),
+    minOrganic: positiveNumberConfig(userConfig.spotMinOrganic, 65),
+    minHolders: positiveIntegerConfig(userConfig.spotMinHolders, 300),
+    minMarketCapUsd: positiveNumberConfig(userConfig.spotMinMarketCapUsd, 100_000),
+    maxMarketCapUsd: positiveNumberConfig(userConfig.spotMaxMarketCapUsd, 30_000_000),
     minTokenAgeMinutes: positiveNumberConfig(userConfig.spotMinTokenAgeMinutes, 30),
-    maxTokenAgeHours: positiveNumberConfig(userConfig.spotMaxTokenAgeHours, 72),
+    maxTokenAgeHours: positiveNumberConfig(userConfig.spotMaxTokenAgeHours, 2_160),
     maxTop10Pct: positiveNumberConfig(userConfig.spotMaxTop10Pct, 30),
     maxBotHoldersPct: positiveNumberConfig(userConfig.spotMaxBotHoldersPct, 20),
-    minPriceChange5mPct: numericConfig(userConfig.spotMinPriceChange5mPct) ?? 0.5,
+    minPriceChange5mPct: numericConfig(userConfig.spotMinPriceChange5mPct) ?? 0.2,
     maxPriceChange5mPct: positiveNumberConfig(userConfig.spotMaxPriceChange5mPct, 12),
-    minVolumeChangePct: numericConfig(userConfig.spotMinVolumeChangePct) ?? 0,
-    minBuySellVolumeRatio: positiveNumberConfig(userConfig.spotMinBuySellVolumeRatio, 1.1),
+    minVolumeChangePct: numericConfig(userConfig.spotMinVolumeChangePct) ?? -10,
+    minBuySellVolumeRatio: positiveNumberConfig(userConfig.spotMinBuySellVolumeRatio, 1.05),
     requirePositiveNetBuyers: userConfig.spotRequirePositiveNetBuyers ?? true,
     requireMintAuthorityDisabled: userConfig.spotRequireMintAuthorityDisabled ?? true,
     requireFreezeAuthorityDisabled: userConfig.spotRequireFreezeAuthorityDisabled ?? true,
-    requireLegacyTokenProgram: userConfig.spotRequireLegacyTokenProgram ?? true,
+    requireLegacyTokenProgram: userConfig.spotRequireLegacyTokenProgram ?? false,
+    allowMetadataOnlyToken2022: userConfig.spotAllowMetadataOnlyToken2022 ?? true,
     requireMomentumConfirmation: userConfig.spotRequireMomentumConfirmation ?? true,
 
     entrySlippageBps: boundedPositiveIntegerConfig(userConfig.spotEntrySlippageBps, 150, 500, "spotEntrySlippageBps"),
@@ -310,6 +331,7 @@ export const config = {
 
   // ─── Fast spot-momentum strategy ──────────
   spot: buildSpotConfig(u),
+  spotDiscovery: buildSpotDiscoveryConfig(u),
 
   // ─── Pool Screening Thresholds ───────────
   screening: buildScreeningConfig(u),

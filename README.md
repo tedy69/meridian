@@ -508,10 +508,31 @@ All fields are optional — defaults shown. Edit `user-config.json`.
 | `spotGasReserveSol` | `0.1` | SOL that must remain available beyond the entry capital |
 | `spotMaxDailyBuySol` | `2` | Maximum buy turnover per UTC day, including uncertain submissions |
 | `spotMaxDailyLossSol` | `0.05` | Stops new entries after this realized daily loss |
-| `spotMinLiquidityUsd` | `50000` | Minimum pool liquidity before deeper checks |
-| `spotMinVolume5mUsd` | `5000` | Minimum five-minute volume |
+| `spotDiscoveryMinLiquidityUsd` | `20000` | Broad discovery liquidity floor before RPC/token-audit work |
+| `spotDiscoveryMinVolume5mUsd` | `500` | Broad discovery five-minute volume floor |
+| `spotDiscoveryMinVolumeLiquidityRatio` | `0.025` | Broad discovery volume/liquidity floor |
+| `spotDiscoveryMinOrganic` | `60` | Broad discovery organic-score floor |
+| `spotDiscoveryMinHolders` | `200` | Broad discovery holder floor |
+| `spotDiscoveryMinMarketCapUsd` | `75000` | Broad discovery minimum market cap |
+| `spotDiscoveryMaxMarketCapUsd` | `50000000` | Broad discovery maximum market cap |
+| `spotDiscoveryMinTokenAgeMinutes` | `20` | Broad discovery minimum token age |
+| `spotDiscoveryMaxTokenAgeHours` | `2160` | Broad discovery maximum token age (90 days) |
+| `spotMinLiquidityUsd` | `30000` | Fresh entry liquidity floor after discovery |
+| `spotMinVolume5mUsd` | `2000` | Fresh entry five-minute volume floor |
+| `spotMinVolumeLiquidityRatio` | `0.03` | Fresh entry volume/liquidity floor |
+| `spotMinOrganic` | `65` | Fresh entry organic-score floor |
+| `spotMinHolders` | `300` | Fresh entry holder floor |
+| `spotMinMarketCapUsd` | `100000` | Fresh entry minimum market cap |
+| `spotMaxMarketCapUsd` | `30000000` | Fresh entry maximum market cap |
+| `spotMinTokenAgeMinutes` | `30` | Fresh entry minimum token age |
+| `spotMaxTokenAgeHours` | `2160` | Fresh entry maximum token age (90 days) |
+| `spotMinPriceChange5mPct` | `0.2` | Minimum positive five-minute price momentum |
+| `spotMinVolumeChangePct` | `-10` | Minimum short-window volume acceleration; small cooling is permitted |
+| `spotMinBuySellVolumeRatio` | `1.05` | Minimum fresh buy/sell-volume pressure |
 | `spotMaxTop10Pct` | `30` | Maximum top-10 holder concentration |
 | `spotMaxBotHoldersPct` | `20` | Maximum bot-holder percentage |
+| `spotRequireLegacyTokenProgram` | `false` | Set true to reject every Token-2022 mint |
+| `spotAllowMetadataOnlyToken2022` | `true` | Permit Token-2022 only when every extension is metadata-only |
 | `spotEntrySlippageBps` | `150` | Entry minimum-output tolerance; the order must also satisfy impact and fee caps |
 | `spotExitSlippageBps` | `300` | Exit minimum-output tolerance; the order must also satisfy impact and fee caps |
 | `spotStopLossTriggerPct` | `-4` | Early mechanical stop trigger |
@@ -529,7 +550,7 @@ All fields are optional — defaults shown. Edit `user-config.json`.
 
 The realtime monitor is event-driven: Solana pool-account changes can arrive between fallback ticks, are coalesced to prevent overlapping work, and expose p50/p95/p99 trigger and refresh latency in `get_spot_status`. Failed price/RPC refreshes use bounded exponential backoff and recover automatically. The default full PnL valuation remains capped at once per second because it uses Jupiter Price API data. WebSocket delivery, RPC slots, price publication, and transaction landing are not guaranteed millisecond operations.
 
-Spot entries require a SOL quote, legacy SPL Token ownership, disabled mint and freeze authorities, a fresh token audit, 5-minute and 15-minute momentum confirmation, positive buyer pressure, and bounded concentration. Jupiter orders are checked for the exact mint pair and amount, explicit minimum output, quote age, price impact, fees, expiry, local simulation, mainnet identity, and finalized outcome. These controls reduce avoidable execution risk; they cannot guarantee profit or prevent all memecoin losses.
+Spot discovery is intentionally broader than the fresh entry gate, so more momentum pools reach the expensive token and indicator checks without weakening the final decision. Spot entries require a SOL quote, disabled mint and freeze authorities, a fresh token audit, 5-minute and 15-minute momentum confirmation, positive buyer pressure, and bounded concentration. Legacy SPL tokens are supported; Token-2022 mints are supported only with no extensions or the `MetadataPointer`/`TokenMetadata` extensions. Every behavioral or unknown extension—including transfer fees, hooks, permanent delegates, pausing, non-transferability, and mint-close authority—is rejected fail-closed. Jupiter orders are checked for the exact mint pair and amount, explicit minimum output, quote age, price impact, fees, expiry, local simulation, mainnet identity, and finalized outcome. These controls reduce avoidable execution risk; they cannot guarantee profit or prevent all memecoin losses.
 
 ### Screening
 

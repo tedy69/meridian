@@ -109,25 +109,24 @@ function freshPoolCandidate(raw, indicatorConfirmation = null) {
   };
 }
 
-function cheapPoolPass(pool, policy) {
+function cheapPoolEvaluation(pool, policy) {
   const liquidity = safeNumber(pool?.active_tvl ?? pool?.tvl, 0);
   const volume = safeNumber(pool?.volume_window, 0);
   const ratio = liquidity > 0 ? volume / liquidity : 0;
   const ageHours = safeNumber(pool?.token_age_hours);
-  return pool?.quote?.mint === SOL_MINT
-    && liquidity >= policy.minLiquidityUsd
-    && volume >= policy.minVolume5mUsd
-    && ratio >= policy.minVolumeLiquidityRatio
-    && safeNumber(pool?.organic_score, 0) >= policy.minOrganic
-    && safeNumber(pool?.holders, 0) >= policy.minHolders
-    && safeNumber(pool?.mcap, 0) >= policy.minMarketCapUsd
-    && safeNumber(pool?.mcap, Infinity) <= policy.maxMarketCapUsd
-    && ageHours != null
-    && ageHours * 60 >= policy.minTokenAgeMinutes
-    && ageHours <= policy.maxTokenAgeHours
-    && safeNumber(pool?.price_change_pct, -Infinity) >= policy.minPriceChange5mPct
-    && safeNumber(pool?.price_change_pct, Infinity) <= policy.maxPriceChange5mPct
-    && safeNumber(pool?.volume_change_pct, -Infinity) >= policy.minVolumeChangePct;
+  if (pool?.quote?.mint !== SOL_MINT) return { pass: false, reason: "Discovery pool is not SOL-quoted." };
+  if (liquidity < policy.minLiquidityUsd) return { pass: false, reason: `Discovery liquidity is below $${policy.minLiquidityUsd}.` };
+  if (volume < policy.minVolume5mUsd) return { pass: false, reason: `Discovery 5-minute volume is below $${policy.minVolume5mUsd}.` };
+  if (ratio < policy.minVolumeLiquidityRatio) return { pass: false, reason: `Discovery volume/liquidity is below ${policy.minVolumeLiquidityRatio}.` };
+  if (safeNumber(pool?.organic_score, 0) < policy.minOrganic) return { pass: false, reason: `Discovery organic score is below ${policy.minOrganic}.` };
+  if (safeNumber(pool?.holders, 0) < policy.minHolders) return { pass: false, reason: `Discovery holder count is below ${policy.minHolders}.` };
+  if (safeNumber(pool?.mcap, 0) < policy.minMarketCapUsd || safeNumber(pool?.mcap, Infinity) > policy.maxMarketCapUsd) {
+    return { pass: false, reason: `Discovery market cap is outside $${policy.minMarketCapUsd}-$${policy.maxMarketCapUsd}.` };
+  }
+  if (ageHours == null || ageHours * 60 < policy.minTokenAgeMinutes || ageHours > policy.maxTokenAgeHours) {
+    return { pass: false, reason: `Discovery token age is outside ${policy.minTokenAgeMinutes}m-${policy.maxTokenAgeHours}h.` };
+  }
+  return { pass: true, reason: "Pool passed broad discovery gates." };
 }
 
 function spotDeps(overrides = {}) {
@@ -162,6 +161,7 @@ function spotDeps(overrides = {}) {
     appendDecision,
     tradingMode: config.trading.mode,
     spotConfig: config.spot,
+    spotDiscoveryConfig: config.spotDiscovery,
     indicatorConfig: config.indicators,
     dryRun: isDryRun(),
     now: () => new Date(),
@@ -178,10 +178,16 @@ export async function getSpotMomentumCandidates({ limit = 10 } = {}, overrides =
   const active = deps.readSpotPosition();
   if (active) return { candidates: [], blocked: true, reason: `spot position ${active.id} is ${active.status}` };
 
-  const policy = spotScreeningPolicy(deps.spotConfig);
+  const discoveryPolicy = spotScreeningPolicy(deps.spotDiscoveryConfig);
+  const entryPolicy = spotScreeningPolicy(deps.spotConfig);
   const discovery = await deps.discoverPools({ page_size: 50, profile: "spot_momentum" });
+  const broadFiltered = [];
   const pools = (discovery?.pools || [])
-    .filter((pool) => cheapPoolPass(pool, policy))
+    .filter((pool) => {
+      const evaluation = cheapPoolEvaluation(pool, discoveryPolicy);
+      if (!evaluation.pass) broadFiltered.push({ name: pool?.name, reason: evaluation.reason });
+      return evaluation.pass;
+    })
     .sort((a, b) => safeNumber(b.volume_active_tvl_ratio, 0) - safeNumber(a.volume_active_tvl_ratio, 0))
     .slice(0, 15);
   const candidates = [];
@@ -190,7 +196,7 @@ export async function getSpotMomentumCandidates({ limit = 10 } = {}, overrides =
   for (const pool of pools) {
     try {
       const mint = pool.base?.mint;
-      const [tokenResult, momentum] = await Promise.all([
+      const [tokenResult, momentum, mintSafety] = await Promise.all([
         deps.getTokenInfo({ query: mint }),
         deps.confirmIndicatorPreset({
           mint,
@@ -199,10 +205,14 @@ export async function getSpotMomentumCandidates({ limit = 10 } = {}, overrides =
           intervals: deps.indicatorConfig.intervals,
           refresh: true,
         }),
+        deps.inspectMintSafety(mint, {
+          requireLegacyTokenProgram: deps.spotConfig.requireLegacyTokenProgram,
+          allowMetadataOnlyToken2022: deps.spotConfig.allowMetadataOnlyToken2022,
+        }),
       ]);
       const tokenInfo = tokenResult?.results?.[0] ?? null;
       const candidate = { ...pool, indicator_confirmation: momentum };
-      const evaluation = evaluateSpotMomentumCandidate({ pool: candidate, tokenInfo, policy });
+      const evaluation = evaluateSpotMomentumCandidate({ pool: candidate, tokenInfo, policy: entryPolicy });
       if (!evaluation.pass) {
         filtered.push({ name: pool.name, reason: evaluation.reason });
       } else {
@@ -210,6 +220,7 @@ export async function getSpotMomentumCandidates({ limit = 10 } = {}, overrides =
           ...candidate,
           spot_score: evaluation.score,
           spot_metrics: evaluation.metrics,
+          mint_safety: mintSafety,
           token_audit: tokenInfo?.audit ?? null,
           token_stats_1h: tokenInfo?.stats_1h ?? null,
         });
@@ -225,7 +236,9 @@ export async function getSpotMomentumCandidates({ limit = 10 } = {}, overrides =
     candidates: candidates.slice(0, Math.max(1, Math.min(10, Number(limit) || 10))),
     total_screened: discovery?.pools?.length ?? 0,
     shortlist_size: pools.length,
-    filtered_examples: filtered.slice(0, 5),
+    discovery_rejected: broadFiltered.length,
+    fresh_rejected: filtered.length,
+    filtered_examples: [...filtered, ...broadFiltered].slice(0, 5),
   };
 }
 
@@ -264,7 +277,10 @@ export async function validateSpotEntry(poolAddressValue, overrides = {}) {
         intervals: deps.indicatorConfig.intervals,
         refresh: true,
       }),
-      deps.inspectMintSafety(baseMint, { requireLegacyTokenProgram: deps.spotConfig.requireLegacyTokenProgram }),
+      deps.inspectMintSafety(baseMint, {
+        requireLegacyTokenProgram: deps.spotConfig.requireLegacyTokenProgram,
+        allowMetadataOnlyToken2022: deps.spotConfig.allowMetadataOnlyToken2022,
+      }),
     ]);
     const tokenInfo = tokenResult?.results?.[0] ?? null;
     const candidate = freshPoolCandidate(raw, momentum);
