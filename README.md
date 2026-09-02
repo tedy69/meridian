@@ -135,7 +135,7 @@ DRY_RUN=false
 LIVE_TRADING_ENABLED=true
 ```
 
-The default limits are deliberately conservative: one position, 0.5 SOL maximum per position, and 0.5 SOL maximum deploy attempts per UTC day. Set `maxPositions`, `maxDeployAmount`, and `maxDailyDeploySol` yourself only after deciding the maximum loss you accept. Set either cap to `null` only to intentionally disable it. With `maxDeployAmount: null` and `positionSizePct: 1`, a deploy uses the wallet balance less `gasReserve`; settlement and position-count guards remain active. The agent cannot change those execution limits through an LLM tool.
+The default limits are deliberately conservative: one position, 0.3 SOL maximum per position, and 0.5 SOL maximum deploy attempts per UTC day. Set `maxPositions`, `maxDeployAmount`, and `maxDailyDeploySol` yourself only after deciding the maximum loss you accept. Set either cap to `null` only to intentionally disable it. With `maxDeployAmount: null` and `positionSizePct: 1`, a deploy uses the wallet balance less `gasReserve`; settlement and position-count guards remain active. The agent cannot change those execution limits through an LLM tool.
 
 On startup Meridian fetches your wallet balance, open positions, and top pool candidates, then begins autonomous cycles immediately.
 
@@ -517,14 +517,17 @@ All fields are optional — defaults shown. Edit `user-config.json`.
 | `deployAmountSol` | `0.5` | Preferred base SOL per new position; if less is available, auto-deploy uses the remaining SOL after `gasReserve` |
 | `positionSizePct` | `0.35` | Fraction of deployable balance to use; set `1` to use all SOL after gas reserve |
 | `maxPositions` | `1` | Maximum simultaneously open positions |
-| `maxDeployAmount` | `0.5` | Maximum SOL cap per position; set `null` to disable this ceiling |
+| `maxDeployAmount` | `0.3` | Maximum SOL cap per position; set `null` to disable this ceiling |
 | `maxDailyDeploySol` | `0.5` | Maximum deploy attempts per UTC day; set `null` to disable this aggregate cap. Uncertain attempts remain counted when enabled. |
 | `lossCircuitBreakerEnabled` | `true` | Pause new positions after realized loss limits trigger |
 | `lossCircuitWindowPositions` | `5` | Closed positions included in the rolling-loss window |
 | `maxConsecutiveLosses` | `3` | Consecutive realized losses allowed before pausing |
 | `maxRollingLossPct` | `12` | Maximum summed loss percentage in the rolling window |
 | `maxSingleLossPct` | `12` | Single-position realized loss magnitude that triggers a pause |
-| `lossCircuitCooldownHours` | `12` | Pause duration after the latest loss trigger |
+| `lossCircuitStreakCooldownHours` | `1` | Pause after three consecutive smaller realized losses |
+| `lossCircuitRollingCooldownHours` | `2` | Pause after the rolling loss limit is reached |
+| `lossCircuitSingleCooldownHours` | `4` | Pause after one severe realized loss |
+| `lossCircuitRecoverySizePct` | `0.5` | Fraction of normal size allowed after cooldown until a profitable close |
 | `gasReserve` | `0.2` | Minimum SOL to keep for gas |
 | `minSolToOpen` | `0.55` | Minimum wallet SOL before opening |
 | `outOfRangeWaitMinutes` | `30` | Minutes OOR before acting |
@@ -540,7 +543,7 @@ All fields are optional — defaults shown. Edit `user-config.json`.
 
 `stopLossTriggerPct` must stay above `stopLossPct` (for example, `-8` and `-15`). This reduces execution overshoot, but a direct on-chain close cannot mathematically guarantee the final PnL during a sudden market move. The fast PnL watchdog keeps sampling while other workflows are busy and defers only transaction submission until the transaction lane is free. A negative settled stop-loss starts the pool/token cooldown so the bot does not immediately re-enter the same collapsing asset. When the LP relay is enabled and returns a valid zap-out order, Meridian uses the relay's configured minimum-output slippage bound before any local fallback.
 
-Before every deploy, Meridian also re-fetches pool fundamentals and token audit data. The realized-loss circuit breaker runs before those remote checks and cannot be overridden by the screener model. Its percentages are positive loss magnitudes (for example, `12` means a `-12%` limit).
+Before every deploy, Meridian also re-fetches pool fundamentals and token audit data. The realized-loss circuit breaker runs before those remote checks and cannot be overridden by the screener model. Its percentages are positive loss magnitudes (for example, `12` means a `-12%` limit). Cooldowns are adaptive: a small-loss streak pauses for 1 hour, rolling losses for 2 hours, and a severe single loss for 4 hours. Once the pause expires, backend sizing remains at 50% until a profitable position closes; the LLM cannot bypass that recovery cap.
 
 ### Schedule
 

@@ -9,7 +9,14 @@ import { log } from "./logger.js";
 import { getMyPositions, getActiveBin } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates, degenScore } from "./tools/screening.js";
-import { config, reloadScreeningThresholds, computeDeployAmount, formatSolAmount, getAutoDeploySizing } from "./config.js";
+import {
+  config,
+  reloadScreeningThresholds,
+  computeDeployAmount,
+  formatSolAmount,
+  getAutoDeploySizing,
+  getCircuitAdjustedDeploySizing,
+} from "./config.js";
 import { evolveThresholds, getAllPerformanceRecords, getPerformanceSummary } from "./lessons.js";
 import { drainPendingAutoSwaps, executeTool, registerCronRestarter } from "./tools/executor.js";
 import {
@@ -512,7 +519,13 @@ export async function runScreeningCycle({ silent = false } = {}) {
       _screeningBusy = false;
       return screenReport;
     }
-    preDeploySizing = getAutoDeploySizing(preBalance.sol);
+    preDeploySizing = getCircuitAdjustedDeploySizing(preBalance.sol, lossCircuit);
+    if (preDeploySizing.recoveryMode) {
+      log(
+        "risk",
+        `Recovery sizing active — deploy capped at ${formatSolAmount(preDeploySizing.amount)} SOL (${(preDeploySizing.recoverySizePct * 100).toFixed(0)}% of normal ${formatSolAmount(preDeploySizing.normalAmount)} SOL).`,
+      );
+    }
     const isDryRun = process.env.DRY_RUN === "true";
     if (!isDryRun && !preDeploySizing.funded) {
       log("cron", `Screening skipped — insufficient SOL (${preBalance.sol.toFixed(3)} leaves less than 0.01 SOL after ${preDeploySizing.reserve} gas reserve)`);
@@ -1186,7 +1199,7 @@ function formatConfigSnapshot() {
     "Config snapshot",
     "",
     `Strategy: ${config.strategy.strategy} | binsBelow: ${config.strategy.minBinsBelow}-${config.strategy.maxBinsBelow} | default ${config.strategy.defaultBinsBelow}`,
-    `Deploy: ${config.management.deployAmountSol} SOL | gasReserve: ${config.management.gasReserve} | maxPositions: ${config.risk.maxPositions}`,
+    `Deploy target: ${config.management.deployAmountSol} SOL | max: ${config.risk.maxDeployAmount ?? "uncapped"} SOL | gasReserve: ${config.management.gasReserve} | maxPositions: ${config.risk.maxPositions}`,
     `Stop loss: trigger ${config.management.stopLossTriggerPct}% → target max ${config.management.stopLossPct}% | confirmation ${config.management.stopLossConfirmTicks} tick | re-entry cooldown ${config.management.stopLossCooldownHours}h`,
     `Take profit: ${config.management.takeProfitPct}%`,
     `Trailing: ${config.management.trailingTakeProfit ? "on" : "off"} | trigger ${config.management.trailingTriggerPct}% | drop ${config.management.trailingDropPct}%`,
@@ -1195,7 +1208,7 @@ function formatConfigSnapshot() {
     `Yield floor: ${config.management.minFeePerTvl24h}% | min age ${config.management.minAgeBeforeYieldCheck}m`,
     `Screening: ${config.screening.category} / ${config.screening.timeframe} | TVL ${config.screening.minTvl}-${config.screening.maxTvl} | max volatility ${config.screening.maxVolatility}`,
     `Token audit: ${config.screening.requireTokenAudit ? "required" : "optional"} | fees ≥ ${config.screening.minTokenFeesSol} SOL | top10 ≤ ${config.screening.maxTop10Pct}% | bots ≤ ${config.screening.maxBotHoldersPct}%`,
-    `Loss circuit: ${config.risk.lossCircuitBreakerEnabled ? "on" : "off"} | ${config.risk.maxConsecutiveLosses} losses / rolling ${config.risk.maxRollingLossPct}% / single ${config.risk.maxSingleLossPct}% | cooldown ${config.risk.lossCircuitCooldownHours}h`,
+    `Loss circuit: ${config.risk.lossCircuitBreakerEnabled ? "on" : "off"} | ${config.risk.maxConsecutiveLosses} losses / rolling ${config.risk.maxRollingLossPct}% / single ${config.risk.maxSingleLossPct}% | adaptive cooldown ${config.risk.lossCircuitStreakCooldownHours}/${config.risk.lossCircuitRollingCooldownHours}/${config.risk.lossCircuitSingleCooldownHours}h | recovery ${(config.risk.lossCircuitRecoverySizePct * 100).toFixed(0)}%`,
     `Intervals: manage ${config.schedule.managementIntervalMin}m | screen ${config.schedule.screeningIntervalMin}m`,
     `HiveMind: ${isHiveMindEnabled() ? "enabled" : "disabled"}${config.hiveMind.agentId ? ` | ${config.hiveMind.agentId}` : ""}`,
   ].join("\n");
@@ -1229,6 +1242,10 @@ function settingValue(key) {
     gasReserve: config.management.gasReserve,
     maxPositions: config.risk.maxPositions,
     maxDeployAmount: config.risk.maxDeployAmount,
+    lossCircuitStreakCooldownHours: config.risk.lossCircuitStreakCooldownHours,
+    lossCircuitRollingCooldownHours: config.risk.lossCircuitRollingCooldownHours,
+    lossCircuitSingleCooldownHours: config.risk.lossCircuitSingleCooldownHours,
+    lossCircuitRecoverySizePct: config.risk.lossCircuitRecoverySizePct,
     takeProfitPct: config.management.takeProfitPct,
     stopLossPct: config.management.stopLossPct,
     stopLossTriggerPct: config.management.stopLossTriggerPct,
@@ -1308,7 +1325,7 @@ function renderSettingsMenu(page = "main") {
       stepButtons("deployAmountSol", "Deploy", 0.1),
       stepButtons("gasReserve", "Gas", 0.05),
       stepButtons("maxPositions", "Max pos", 1, { digits: 0 }),
-      stepButtons("maxDeployAmount", "Max SOL", 1, { digits: 0 }),
+      stepButtons("maxDeployAmount", "Max SOL", 0.05, { digits: 2 }),
       stepButtons("takeProfitPct", "TP %", 1, { digits: 0 }),
       stepButtons("stopLossTriggerPct", "SL trigger", 1, { digits: 0 }),
       stepButtons("stopLossPct", "SL max", 1, { digits: 0 }),

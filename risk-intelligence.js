@@ -32,6 +32,11 @@ function positiveNumber(value, fallback) {
   return numeric != null && numeric > 0 ? numeric : fallback;
 }
 
+function fraction(value, fallback) {
+  const numeric = numberOrNull(value);
+  return numeric != null && numeric > 0 && numeric <= 1 ? numeric : fallback;
+}
+
 function recordTimestamp(record) {
   const value = record?.recorded_at ?? record?.closed_at ?? record?.timestamp;
   const timestamp = Date.parse(value);
@@ -52,13 +57,31 @@ function normalizedPerformance(performance) {
 }
 
 function normalizedCircuitPolicy(policy = {}) {
+  const legacyCooldownHours = positiveNumber(
+    policy.cooldownHours ?? policy.lossCircuitCooldownHours,
+    null,
+  );
   return {
     enabled: policy.enabled ?? policy.lossCircuitBreakerEnabled ?? true,
     windowPositions: positiveInteger(policy.windowPositions ?? policy.lossCircuitWindowPositions, 5),
     maxConsecutiveLosses: positiveInteger(policy.maxConsecutiveLosses, 3),
     maxRollingLossPct: positiveNumber(policy.maxRollingLossPct, 12),
     maxSingleLossPct: positiveNumber(policy.maxSingleLossPct, 12),
-    cooldownHours: positiveNumber(policy.cooldownHours ?? policy.lossCircuitCooldownHours, 12),
+    cooldownByTrigger: {
+      loss_streak: positiveNumber(
+        policy.lossCircuitStreakCooldownHours ?? policy.streakCooldownHours,
+        legacyCooldownHours ?? 1,
+      ),
+      rolling_loss: positiveNumber(
+        policy.lossCircuitRollingCooldownHours ?? policy.rollingCooldownHours,
+        legacyCooldownHours ?? 2,
+      ),
+      single_loss: positiveNumber(
+        policy.lossCircuitSingleCooldownHours ?? policy.singleCooldownHours,
+        legacyCooldownHours ?? 4,
+      ),
+    },
+    recoverySizePct: fraction(policy.lossCircuitRecoverySizePct ?? policy.recoverySizePct, 0.5),
   };
 }
 
@@ -88,13 +111,43 @@ export function evaluateLossCircuitBreaker({ performance = [], policy = {}, now 
   const metrics = tailMetrics(records, normalizedPolicy.windowPositions);
 
   if (!normalizedPolicy.enabled) {
-    return { pass: true, trigger: null, reason: "Loss circuit breaker is disabled.", blockedUntil: null, metrics };
+    return {
+      pass: true,
+      trigger: null,
+      lastTrigger: null,
+      reason: "Loss circuit breaker is disabled.",
+      blockedUntil: null,
+      cooldownHours: null,
+      recoveryMode: false,
+      recoverySizePct: 1,
+      metrics,
+    };
   }
   if (records.length === 0) {
-    return { pass: true, trigger: null, reason: "No realized performance history yet.", blockedUntil: null, metrics };
+    return {
+      pass: true,
+      trigger: null,
+      lastTrigger: null,
+      reason: "No realized performance history yet.",
+      blockedUntil: null,
+      cooldownHours: null,
+      recoveryMode: false,
+      recoverySizePct: 1,
+      metrics,
+    };
   }
   if (!Number.isFinite(nowMs)) {
-    return { pass: false, trigger: "invalid_clock", reason: "Cannot verify loss cooldown because the current time is invalid.", blockedUntil: null, metrics };
+    return {
+      pass: false,
+      trigger: "invalid_clock",
+      lastTrigger: "invalid_clock",
+      reason: "Cannot verify loss cooldown because the current time is invalid.",
+      blockedUntil: null,
+      cooldownHours: null,
+      recoveryMode: false,
+      recoverySizePct: 1,
+      metrics,
+    };
   }
 
   let latestTrigger = null;
@@ -109,6 +162,7 @@ export function evaluateLossCircuitBreaker({ performance = [], policy = {}, now 
       trigger = "single_loss";
       reason = `Realized loss ${current.pnl_pct.toFixed(2)}% exceeded the ${normalizedPolicy.maxSingleLossPct.toFixed(2)}% single-position limit.`;
     } else if (
+      current.pnl_pct < 0 &&
       currentMetrics.sampleSize >= 2 &&
       currentMetrics.rollingPnlPct <= -normalizedPolicy.maxRollingLossPct
     ) {
@@ -130,20 +184,51 @@ export function evaluateLossCircuitBreaker({ performance = [], policy = {}, now 
   }
 
   if (!latestTrigger) {
-    return { pass: true, trigger: null, reason: "Realized loss limits are clear.", blockedUntil: null, metrics };
+    return {
+      pass: true,
+      trigger: null,
+      lastTrigger: null,
+      reason: "Realized loss limits are clear.",
+      blockedUntil: null,
+      cooldownHours: null,
+      recoveryMode: false,
+      recoverySizePct: 1,
+      metrics,
+    };
   }
 
-  const blockedUntilMs = latestTrigger.atMs + normalizedPolicy.cooldownHours * 3_600_000;
+  const cooldownHours = normalizedPolicy.cooldownByTrigger[latestTrigger.trigger];
+  const blockedUntilMs = latestTrigger.atMs + cooldownHours * 3_600_000;
   if (nowMs >= blockedUntilMs) {
-    return { pass: true, trigger: null, reason: "The latest realized-loss cooldown has expired.", blockedUntil: null, metrics };
+    const recovered = records.some((record) => (
+      record._closedAtMs > blockedUntilMs && record.pnl_pct > 0
+    ));
+    const recoveryMode = !recovered;
+    return {
+      pass: true,
+      trigger: null,
+      lastTrigger: latestTrigger.trigger,
+      reason: recoveryMode
+        ? `The ${cooldownHours}-hour realized-loss cooldown has expired; deploy sizing remains reduced until a profitable close.`
+        : "The latest realized-loss cooldown completed and a profitable close restored normal sizing.",
+      blockedUntil: null,
+      cooldownHours,
+      recoveryMode,
+      recoverySizePct: recoveryMode ? normalizedPolicy.recoverySizePct : 1,
+      metrics,
+    };
   }
 
   const blockedUntil = new Date(blockedUntilMs).toISOString();
   return {
     pass: false,
     trigger: latestTrigger.trigger,
+    lastTrigger: latestTrigger.trigger,
     reason: `${latestTrigger.reason} New deployments are paused until ${blockedUntil}.`,
     blockedUntil,
+    cooldownHours,
+    recoveryMode: false,
+    recoverySizePct: 1,
     metrics: latestTrigger.metrics,
   };
 }
@@ -406,9 +491,11 @@ export function buildRiskIntelligenceBrief({ performance = [], policy = {}, maxV
   if (stopLossStats.count > 0) {
     lines.push(`- Stop-loss outcomes: ${stopLossStats.count} closes, net ${formatSigned(stopLossStats.net)}, avg loss ${formatSigned(stopLossStats.averageLoss)}.`);
   }
-  lines.push(circuit.pass
-    ? `- CIRCUIT CLOSED: ${circuit.reason}`
-    : `- CIRCUIT OPEN: ${circuit.reason}`);
+  lines.push(!circuit.pass
+    ? `- CIRCUIT OPEN: ${circuit.reason}`
+    : circuit.recoveryMode
+      ? `- RECOVERY MODE: ${circuit.reason} Next deploy is capped at ${(circuit.recoverySizePct * 100).toFixed(0)}% of normal size.`
+      : `- CIRCUIT CLOSED: ${circuit.reason}`);
   lines.push("- Treat this history as risk context, not proof of future returns; backend gates remain authoritative.");
   return lines.join("\n");
 }

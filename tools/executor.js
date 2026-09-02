@@ -26,7 +26,12 @@ import { addToBlacklist, removeFromBlacklist, listBlacklist } from "../token-bla
 import { blockDev, unblockDev, listBlockedDevs } from "../dev-blocklist.js";
 import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsOnPool } from "../smart-wallets.js";
 import { getTokenInfo, getTokenHolders, getTokenNarrative } from "./token.js";
-import { config, getAutoDeploySizing, reloadScreeningThresholds, MIN_SAFE_BINS_BELOW } from "../config.js";
+import {
+  config,
+  getCircuitAdjustedDeploySizing,
+  reloadScreeningThresholds,
+  MIN_SAFE_BINS_BELOW,
+} from "../config.js";
 import { getRecentDecisions } from "../decision-log.js";
 import fs from "fs";
 import { execSync, spawn } from "child_process";
@@ -405,6 +410,10 @@ const toolMap = {
       // risk
       maxPositions: ["risk", "maxPositions"],
       maxDeployAmount: ["risk", "maxDeployAmount"],
+      lossCircuitStreakCooldownHours: ["risk", "lossCircuitStreakCooldownHours"],
+      lossCircuitRollingCooldownHours: ["risk", "lossCircuitRollingCooldownHours"],
+      lossCircuitSingleCooldownHours: ["risk", "lossCircuitSingleCooldownHours"],
+      lossCircuitRecoverySizePct: ["risk", "lossCircuitRecoverySizePct"],
       // schedule
       managementIntervalMin: ["schedule", "managementIntervalMin"],
       screeningIntervalMin: ["schedule", "screeningIntervalMin"],
@@ -1158,16 +1167,17 @@ export async function runSafetyChecks(name, args) {
 
       let minDeploy = Math.max(0.01, config.management.deployAmountSol);
       let balance = null;
+      let allowedSizing = null;
       if (!isDryRun()) {
         balance = await getWalletBalances();
-        const sizing = getAutoDeploySizing(balance.sol);
-        if (!sizing.funded) {
+        allowedSizing = getCircuitAdjustedDeploySizing(balance.sol, lossCircuit);
+        if (!allowedSizing.funded) {
           return {
             pass: false,
-            reason: `Insufficient SOL: have ${balance.sol} SOL; less than 0.01 SOL remains after ${sizing.reserve} SOL gas reserve.`,
+            reason: `Insufficient SOL: have ${balance.sol} SOL; less than 0.01 SOL remains after ${allowedSizing.reserve} SOL gas reserve.`,
           };
         }
-        minDeploy = sizing.minimumAmount;
+        minDeploy = allowedSizing.minimumAmount;
       }
       if (amountY < minDeploy) {
         return {
@@ -1179,6 +1189,14 @@ export async function runSafetyChecks(name, args) {
         return {
           pass: false,
           reason: `SOL amount ${amountY} exceeds maximum allowed per position (${config.risk.maxDeployAmount}).`,
+        };
+      }
+      if (allowedSizing && amountY > allowedSizing.maximumAmount + Number.EPSILON) {
+        return {
+          pass: false,
+          reason: allowedSizing.recoveryMode
+            ? `Recovery mode caps this deploy at ${allowedSizing.maximumAmount} SOL (${(allowedSizing.recoverySizePct * 100).toFixed(0)}% of the normal ${allowedSizing.normalAmount} SOL size).`
+            : `SOL amount ${amountY} exceeds the trusted backend sizing limit (${allowedSizing.maximumAmount}).`,
         };
       }
 

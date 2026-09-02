@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import test from "node:test";
-import { config } from "../config.js";
+import { buildRiskConfig, config, getCircuitAdjustedDeploySizing } from "../config.js";
 import {
   buildRiskIntelligenceBrief,
   evaluateFreshPoolRisk,
@@ -20,6 +20,18 @@ const circuitPolicy = {
   maxRollingLossPct: 12,
   maxSingleLossPct: 12,
   cooldownHours: 12,
+};
+
+const adaptiveCircuitPolicy = {
+  enabled: true,
+  windowPositions: 5,
+  maxConsecutiveLosses: 3,
+  maxRollingLossPct: 12,
+  maxSingleLossPct: 12,
+  lossCircuitStreakCooldownHours: 1,
+  lossCircuitRollingCooldownHours: 2,
+  lossCircuitSingleCooldownHours: 4,
+  lossCircuitRecoverySizePct: 0.5,
 };
 
 function performance(pnlPct, minutesAgo, extra = {}) {
@@ -87,6 +99,92 @@ test("loss circuit breaker automatically releases after its cooldown", () => {
 
   assert.equal(status.pass, true);
   assert.equal(status.trigger, null);
+});
+
+test("loss circuit breaker uses a four-hour pause for a severe single loss", () => {
+  const status = evaluateLossCircuitBreaker({
+    performance: [performance(1, 90), performance(-14, 30)],
+    policy: adaptiveCircuitPolicy,
+    now: NOW,
+  });
+
+  assert.equal(status.pass, false);
+  assert.equal(status.trigger, "single_loss");
+  assert.equal(status.cooldownHours, 4);
+  assert.equal(status.blockedUntil, "2026-09-02T09:30:00.000Z");
+});
+
+test("loss circuit breaker uses a two-hour pause for rolling losses", () => {
+  const status = evaluateLossCircuitBreaker({
+    performance: [
+      performance(2, 50),
+      performance(-5, 40),
+      performance(-4, 30),
+      performance(-6, 20),
+    ],
+    policy: adaptiveCircuitPolicy,
+    now: NOW,
+  });
+
+  assert.equal(status.pass, false);
+  assert.equal(status.trigger, "rolling_loss");
+  assert.equal(status.cooldownHours, 2);
+  assert.equal(status.blockedUntil, "2026-09-02T07:40:00.000Z");
+});
+
+test("loss circuit breaker uses a one-hour pause for a small-loss streak", () => {
+  const status = evaluateLossCircuitBreaker({
+    performance: [
+      performance(2, 50),
+      performance(-2, 40),
+      performance(-2, 30),
+      performance(-2, 20),
+    ],
+    policy: adaptiveCircuitPolicy,
+    now: NOW,
+  });
+
+  assert.equal(status.pass, false);
+  assert.equal(status.trigger, "loss_streak");
+  assert.equal(status.cooldownHours, 1);
+  assert.equal(status.blockedUntil, "2026-09-02T06:40:00.000Z");
+});
+
+test("an expired circuit stays in half-size recovery until a profitable close", () => {
+  const status = evaluateLossCircuitBreaker({
+    performance: [performance(-14, 5 * 60)],
+    policy: adaptiveCircuitPolicy,
+    now: NOW,
+  });
+
+  assert.equal(status.pass, true);
+  assert.equal(status.recoveryMode, true);
+  assert.equal(status.recoverySizePct, 0.5);
+  assert.equal(status.lastTrigger, "single_loss");
+});
+
+test("a profitable close after cooldown restores normal deploy sizing", () => {
+  const status = evaluateLossCircuitBreaker({
+    performance: [performance(-14, 7 * 60), performance(1, 60)],
+    policy: adaptiveCircuitPolicy,
+    now: NOW,
+  });
+
+  assert.equal(status.pass, true);
+  assert.equal(status.recoveryMode, false);
+  assert.equal(status.recoverySizePct, 1);
+});
+
+test("circuit-adjusted sizing halves the trusted backend amount during recovery", () => {
+  const sizing = getCircuitAdjustedDeploySizing(1, {
+    recoveryMode: true,
+    recoverySizePct: 0.5,
+  }, { maxDeployAmount: 0.3 });
+
+  assert.equal(sizing.normalAmount, 0.3);
+  assert.equal(sizing.amount, 0.15);
+  assert.equal(sizing.maximumAmount, 0.15);
+  assert.equal(sizing.recoveryMode, true);
 });
 
 const screening = {
@@ -300,14 +398,20 @@ test("deploy preflight returns fresh entry metrics only after every gate passes"
 });
 
 test("risk intelligence has conservative defaults", () => {
+  const riskDefaults = buildRiskConfig();
+
   assert.equal(config.screening.maxVolatility, 12);
   assert.equal(config.screening.requireTokenAudit, true);
-  assert.equal(config.risk.lossCircuitBreakerEnabled, true);
-  assert.equal(config.risk.lossCircuitWindowPositions, 5);
-  assert.equal(config.risk.maxConsecutiveLosses, 3);
-  assert.equal(config.risk.maxRollingLossPct, 12);
-  assert.equal(config.risk.maxSingleLossPct, 12);
-  assert.equal(config.risk.lossCircuitCooldownHours, 12);
+  assert.equal(riskDefaults.lossCircuitBreakerEnabled, true);
+  assert.equal(riskDefaults.lossCircuitWindowPositions, 5);
+  assert.equal(riskDefaults.maxConsecutiveLosses, 3);
+  assert.equal(riskDefaults.maxRollingLossPct, 12);
+  assert.equal(riskDefaults.maxSingleLossPct, 12);
+  assert.equal(riskDefaults.maxDeployAmount, 0.3);
+  assert.equal(riskDefaults.lossCircuitStreakCooldownHours, 1);
+  assert.equal(riskDefaults.lossCircuitRollingCooldownHours, 2);
+  assert.equal(riskDefaults.lossCircuitSingleCooldownHours, 4);
+  assert.equal(riskDefaults.lossCircuitRecoverySizePct, 0.5);
 });
 
 test("deploy safety checks the realized-loss circuit before remote pool preflight", () => {
@@ -319,6 +423,8 @@ test("deploy safety checks the realized-loss circuit before remote pool prefligh
   assert.ok(circuitIndex >= 0, "deploy safety must evaluate realized losses");
   assert.ok(freshPoolIndex >= 0, "deploy safety must retain fresh pool preflight");
   assert.ok(circuitIndex < freshPoolIndex, "circuit breaker should stop before remote deploy preflight");
+  assert.match(deploySafety, /getCircuitAdjustedDeploySizing/);
+  assert.match(deploySafety, /allowedSizing\.maximumAmount/);
 });
 
 test("automatic screening receives realized risk context and deterministic token audit", () => {
@@ -328,6 +434,16 @@ test("automatic screening receives realized risk context and deterministic token
   assert.match(screeningCycle, /evaluateLossCircuitBreaker/);
   assert.match(screeningCycle, /evaluateTokenAuditRisk/);
   assert.match(screeningCycle, /buildRiskIntelligenceBrief/);
+  assert.match(screeningCycle, /getCircuitAdjustedDeploySizing/);
+});
+
+test("the Telegram risk menu preserves a fractional SOL deployment cap", () => {
+  const source = fs.readFileSync(new URL("../index.js", import.meta.url), "utf8");
+
+  assert.match(
+    source,
+    /stepButtons\("maxDeployAmount", "Max SOL", 0\.05, \{ digits: 2 \}\)/,
+  );
 });
 
 test("a corrupt performance ledger fails closed instead of erasing loss history", () => {

@@ -43,6 +43,16 @@ function positiveIntegerConfig(value, fallback) {
   return numeric != null && numeric >= 1 ? Math.max(1, Math.round(numeric)) : fallback;
 }
 
+function positiveNumberConfig(value, fallback) {
+  const numeric = numericConfig(value);
+  return numeric != null && numeric > 0 ? numeric : fallback;
+}
+
+function fractionConfig(value, fallback) {
+  const numeric = numericConfig(value);
+  return numeric != null && numeric > 0 && numeric <= 1 ? numeric : fallback;
+}
+
 const legacyBinsBelow = numericConfig(u.binsBelow);
 const stopLossPolicy = configuredStopLossPolicy(u);
 const configuredMinBinsBelow = numericConfig(u.minBinsBelow) ?? MIN_SAFE_BINS_BELOW;
@@ -55,6 +65,46 @@ const strategyDefaultBinsBelow = Math.max(
   strategyMinBinsBelow,
   Math.min(strategyMaxBinsBelow, Math.round(configuredDefaultBinsBelow)),
 );
+
+export function buildRiskConfig(userConfig = {}) {
+  const legacyLossCircuitCooldownHours = positiveNumberConfig(
+    userConfig.lossCircuitCooldownHours,
+    null,
+  );
+  return {
+    maxPositions: userConfig.maxPositions ?? 1,
+    // `null` deliberately disables the per-position SOL ceiling. An absent
+    // value retains the conservative default.
+    maxDeployAmount: userConfig.maxDeployAmount === null ? null : (userConfig.maxDeployAmount ?? 0.3),
+    // `null` deliberately disables the aggregate daily deploy cap. An absent
+    // value retains the conservative default.
+    maxDailyDeploySol: userConfig.maxDailyDeploySol === null ? null : (userConfig.maxDailyDeploySol ?? 0.5),
+    // Realized-loss circuit breaker. Values are positive loss magnitudes.
+    // This gate is deterministic and cannot be overridden by an LLM decision.
+    lossCircuitBreakerEnabled: userConfig.lossCircuitBreakerEnabled ?? true,
+    lossCircuitWindowPositions: positiveIntegerConfig(userConfig.lossCircuitWindowPositions, 5),
+    maxConsecutiveLosses: positiveIntegerConfig(userConfig.maxConsecutiveLosses, 3),
+    maxRollingLossPct: numericConfig(userConfig.maxRollingLossPct) ?? 12,
+    maxSingleLossPct: numericConfig(userConfig.maxSingleLossPct) ?? 12,
+    // Adaptive cooldowns reopen faster after smaller drawdowns while reserving
+    // the longest pause for one severe loss. The legacy flat value remains a
+    // compatibility fallback when an existing configuration explicitly sets it.
+    lossCircuitCooldownHours: legacyLossCircuitCooldownHours ?? 2,
+    lossCircuitStreakCooldownHours: positiveNumberConfig(
+      userConfig.lossCircuitStreakCooldownHours,
+      legacyLossCircuitCooldownHours ?? 1,
+    ),
+    lossCircuitRollingCooldownHours: positiveNumberConfig(
+      userConfig.lossCircuitRollingCooldownHours,
+      legacyLossCircuitCooldownHours ?? 2,
+    ),
+    lossCircuitSingleCooldownHours: positiveNumberConfig(
+      userConfig.lossCircuitSingleCooldownHours,
+      legacyLossCircuitCooldownHours ?? 4,
+    ),
+    lossCircuitRecoverySizePct: fractionConfig(userConfig.lossCircuitRecoverySizePct, 0.5),
+  };
+}
 
 // Apply wallet/RPC from user-config if not already in env
 if (u.rpcUrl)    process.env.RPC_URL            ||= u.rpcUrl;
@@ -89,23 +139,7 @@ function nonEmptyString(...values) {
 
 export const config = {
   // ─── Risk Limits ─────────────────────────
-  risk: {
-    maxPositions:    u.maxPositions    ?? 1,
-    // `null` deliberately disables the per-position SOL ceiling. An absent
-    // value retains the conservative default.
-    maxDeployAmount: u.maxDeployAmount === null ? null : (u.maxDeployAmount ?? u.deployAmountSol ?? 0.5),
-    // `null` deliberately disables the aggregate daily deploy cap. An absent
-    // value retains the conservative default.
-    maxDailyDeploySol: u.maxDailyDeploySol === null ? null : (u.maxDailyDeploySol ?? 0.5),
-    // Realized-loss circuit breaker. Values are positive loss magnitudes.
-    // This gate is deterministic and cannot be overridden by an LLM decision.
-    lossCircuitBreakerEnabled: u.lossCircuitBreakerEnabled ?? true,
-    lossCircuitWindowPositions: positiveIntegerConfig(u.lossCircuitWindowPositions, 5),
-    maxConsecutiveLosses: positiveIntegerConfig(u.maxConsecutiveLosses, 3),
-    maxRollingLossPct: numericConfig(u.maxRollingLossPct) ?? 12,
-    maxSingleLossPct: numericConfig(u.maxSingleLossPct) ?? 12,
-    lossCircuitCooldownHours: numericConfig(u.lossCircuitCooldownHours) ?? 12,
-  },
+  risk: buildRiskConfig(u),
 
   // ─── Pool Screening Thresholds ───────────
   screening: {
@@ -375,6 +409,48 @@ export function getAutoDeploySizing(walletSol, overrides = {}) {
     minimumAmount: funded ? Math.min(preferredMinimum, amount) : MIN_DEPLOY_AMOUNT_SOL,
     reserve,
     funded,
+  };
+}
+
+/**
+ * Apply the deterministic post-circuit recovery cap to the normal wallet
+ * sizing result. The backend uses the same calculation as the screening
+ * prompt, so an LLM cannot request the unreduced amount during recovery.
+ */
+export function getCircuitAdjustedDeploySizing(walletSol, circuitStatus = {}, overrides = {}) {
+  const normal = getAutoDeploySizing(walletSol, overrides);
+  const requestedRecoveryPct = Number(circuitStatus?.recoverySizePct);
+  const recoverySizePct = Number.isFinite(requestedRecoveryPct)
+    && requestedRecoveryPct > 0
+    && requestedRecoveryPct <= 1
+    ? requestedRecoveryPct
+    : 0.5;
+
+  if (circuitStatus?.recoveryMode !== true) {
+    return {
+      ...normal,
+      normalAmount: normal.amount,
+      maximumAmount: normal.amount,
+      recoveryMode: false,
+      recoverySizePct: 1,
+    };
+  }
+
+  const flooredRecoveryCap = Math.floor((normal.amount * recoverySizePct + Number.EPSILON) * 100) / 100;
+  const recoveryCap = normal.amount >= MIN_DEPLOY_AMOUNT_SOL
+    ? Math.max(MIN_DEPLOY_AMOUNT_SOL, flooredRecoveryCap)
+    : flooredRecoveryCap;
+  const adjusted = getAutoDeploySizing(walletSol, {
+    ...overrides,
+    maxDeployAmount: recoveryCap,
+  });
+
+  return {
+    ...adjusted,
+    normalAmount: normal.amount,
+    maximumAmount: recoveryCap,
+    recoveryMode: true,
+    recoverySizePct,
   };
 }
 
