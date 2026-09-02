@@ -512,7 +512,7 @@ All fields are optional — defaults shown. Edit `user-config.json`.
 
 | Field | Default | Description |
 |---|---|---|
-| `deployAmountSol` | `0.5` | Base SOL per new position |
+| `deployAmountSol` | `0.5` | Preferred base SOL per new position; if less is available, auto-deploy uses the remaining SOL after `gasReserve` |
 | `positionSizePct` | `0.35` | Fraction of deployable balance to use; set `1` to use all SOL after gas reserve |
 | `maxPositions` | `1` | Maximum simultaneously open positions |
 | `maxDeployAmount` | `0.5` | Maximum SOL cap per position; set `null` to disable this ceiling |

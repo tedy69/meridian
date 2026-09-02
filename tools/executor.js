@@ -26,7 +26,7 @@ import { addToBlacklist, removeFromBlacklist, listBlacklist } from "../token-bla
 import { blockDev, unblockDev, listBlockedDevs } from "../dev-blocklist.js";
 import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsOnPool } from "../smart-wallets.js";
 import { getTokenInfo, getTokenHolders, getTokenNarrative } from "./token.js";
-import { config, reloadScreeningThresholds, MIN_SAFE_BINS_BELOW } from "../config.js";
+import { config, getAutoDeploySizing, reloadScreeningThresholds, MIN_SAFE_BINS_BELOW } from "../config.js";
 import { getRecentDecisions } from "../decision-log.js";
 import fs from "fs";
 import { execSync, spawn } from "child_process";
@@ -1183,11 +1183,23 @@ export async function runSafetyChecks(name, args) {
         };
       }
 
-      const minDeploy = Math.max(0.1, config.management.deployAmountSol);
+      let minDeploy = Math.max(0.01, config.management.deployAmountSol);
+      let balance = null;
+      if (!isDryRun()) {
+        balance = await getWalletBalances();
+        const sizing = getAutoDeploySizing(balance.sol);
+        if (!sizing.funded) {
+          return {
+            pass: false,
+            reason: `Insufficient SOL: have ${balance.sol} SOL; less than 0.01 SOL remains after ${sizing.reserve} SOL gas reserve.`,
+          };
+        }
+        minDeploy = sizing.minimumAmount;
+      }
       if (amountY < minDeploy) {
         return {
           pass: false,
-          reason: `Amount ${amountY} SOL is below the minimum deploy amount (${minDeploy} SOL). Use at least ${minDeploy} SOL.`,
+          reason: `Amount ${amountY} SOL is below the minimum deploy amount for the current wallet (${minDeploy} SOL).`,
         };
       }
       if (config.risk.maxDeployAmount !== null && amountY > config.risk.maxDeployAmount) {
@@ -1198,8 +1210,7 @@ export async function runSafetyChecks(name, args) {
       }
 
       // Check SOL balance
-      if (process.env.DRY_RUN !== "true") {
-        const balance = await getWalletBalances();
+      if (!isDryRun()) {
         const gasReserve = config.management.gasReserve;
         const minRequired = amountY + gasReserve;
         if (balance.sol < minRequired) {

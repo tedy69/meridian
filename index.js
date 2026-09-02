@@ -9,7 +9,7 @@ import { log } from "./logger.js";
 import { getMyPositions, getActiveBin } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates, degenScore } from "./tools/screening.js";
-import { config, reloadScreeningThresholds, computeDeployAmount, formatSolAmount } from "./config.js";
+import { config, reloadScreeningThresholds, computeDeployAmount, formatSolAmount, getAutoDeploySizing } from "./config.js";
 import { evolveThresholds, getPerformanceSummary } from "./lessons.js";
 import { drainPendingAutoSwaps, executeTool, registerCronRestarter } from "./tools/executor.js";
 import {
@@ -457,7 +457,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
   _screeningLastTriggered = Date.now();
 
   // Hard guards — don't even run the agent if preconditions aren't met
-  let prePositions, preBalance;
+  let prePositions, preBalance, preDeploySizing;
   let liveMessage = null;
   let screenReport = null;
   try {
@@ -474,16 +474,16 @@ export async function runScreeningCycle({ silent = false } = {}) {
       _screeningBusy = false;
       return screenReport;
     }
-    const minRequired = config.management.deployAmountSol + config.management.gasReserve;
+    preDeploySizing = getAutoDeploySizing(preBalance.sol);
     const isDryRun = process.env.DRY_RUN === "true";
-    if (!isDryRun && preBalance.sol < minRequired) {
-      log("cron", `Screening skipped — insufficient SOL (${preBalance.sol.toFixed(3)} < ${minRequired} needed for deploy + gas)`);
-      screenReport = `Screening skipped — insufficient SOL (${preBalance.sol.toFixed(3)} < ${minRequired} needed for deploy + gas).`;
+    if (!isDryRun && !preDeploySizing.funded) {
+      log("cron", `Screening skipped — insufficient SOL (${preBalance.sol.toFixed(3)} leaves less than 0.01 SOL after ${preDeploySizing.reserve} gas reserve)`);
+      screenReport = `Screening skipped — insufficient SOL (${preBalance.sol.toFixed(3)} leaves less than 0.01 SOL after ${preDeploySizing.reserve} gas reserve).`;
       appendDecision({
         type: "skip",
         actor: "SCREENER",
         summary: "Screening skipped",
-        reason: `Insufficient SOL (${preBalance.sol.toFixed(3)} < ${minRequired})`,
+        reason: `Insufficient SOL after ${preDeploySizing.reserve} gas reserve`,
       });
       _screeningBusy = false;
       return screenReport;
@@ -502,7 +502,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
   try {
     // Reuse pre-fetched balance — no extra RPC call needed
     const currentBalance = preBalance;
-    const deployAmount = computeDeployAmount(currentBalance.sol);
+    const deployAmount = preDeploySizing.amount;
     log("cron", `Computed deploy amount: ${formatSolAmount(deployAmount)} SOL (wallet: ${currentBalance.sol} SOL)`);
 
     // Load active strategy
@@ -931,8 +931,8 @@ Summarize the current portfolio health, total fees earned, and performance of al
           getWalletBalances().catch(() => null),
         ]);
         if (!positions || (positions.total_positions ?? 0) >= config.risk.maxPositions) return;
-        const minRequired = config.management.deployAmountSol + config.management.gasReserve;
-        if (process.env.DRY_RUN !== "true" && (!balance || balance.sol < minRequired)) return;
+        const sizing = balance ? getAutoDeploySizing(balance.sol) : null;
+        if (process.env.DRY_RUN !== "true" && (!sizing || !sizing.funded)) return;
 
         const top = await getTopCandidates({ limit: config.opportunity.limit }).catch(() => null);
         const candidates = (top?.candidates || []).slice().sort((a, b) => degenScore(b, config.opportunity) - degenScore(a, config.opportunity));

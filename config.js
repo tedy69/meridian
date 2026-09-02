@@ -15,6 +15,9 @@ const u = fs.existsSync(USER_CONFIG_PATH)
   ? JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8"))
   : {};
 export const MIN_SAFE_BINS_BELOW = 35;
+// Deploy amounts are rendered and submitted at two-decimal SOL precision.
+// Keep a cent as the smallest useful LP amount after preserving gas.
+export const MIN_DEPLOY_AMOUNT_SOL = 0.01;
 
 function numericConfig(value) {
   const n = Number(value);
@@ -311,7 +314,8 @@ export const config = {
  *
  * Formula: clamp(deployable × positionSizePct, floor=deployAmountSol,
  * ceil=maxDeployAmount when configured). The result never spends the gas
- * reserve even when the per-position ceiling is disabled.
+ * reserve even when the per-position ceiling is disabled. When the wallet is
+ * below the preferred floor, the remaining deployable balance is intentional.
  *
  * Examples (defaults: gasReserve=0.2, positionSizePct=0.35, floor=0.5):
  *   0.8 SOL wallet → 0.6 SOL deploy  (floor)
@@ -333,6 +337,33 @@ export function computeDeployAmount(walletSol, overrides = {}) {
   // Floor, rather than round, so full-wallet sizing never consumes part of
   // the configured gas reserve through a half-cent-style rounding increase.
   return Math.floor((result + Number.EPSILON) * 100) / 100;
+}
+
+/**
+ * Resolve whether the wallet can fund an automatic deploy without treating
+ * deployAmountSol as a hard block when the wallet is below that preferred size. The
+ * returned minimumAmount preserves the configured floor whenever it is
+ * affordable, but lets a smaller wallet use all of its deployable SOL.
+ */
+export function getAutoDeploySizing(walletSol, overrides = {}) {
+  const reserve = overrides.gasReserve ?? config.management.gasReserve ?? 0.2;
+  const configuredFloor = Number(overrides.deployAmountSol ?? config.management.deployAmountSol);
+  const preferredMinimum = Number.isFinite(configuredFloor)
+    ? Math.max(MIN_DEPLOY_AMOUNT_SOL, configuredFloor)
+    : MIN_DEPLOY_AMOUNT_SOL;
+  const amount = computeDeployAmount(walletSol, overrides);
+  const wallet = Number(walletSol);
+  const funded = Number.isFinite(wallet)
+    && Number.isFinite(amount)
+    && amount >= MIN_DEPLOY_AMOUNT_SOL
+    && wallet + Number.EPSILON >= amount + reserve;
+
+  return {
+    amount,
+    minimumAmount: funded ? Math.min(preferredMinimum, amount) : MIN_DEPLOY_AMOUNT_SOL,
+    reserve,
+    funded,
+  };
 }
 
 export function formatSolAmount(amount) {
