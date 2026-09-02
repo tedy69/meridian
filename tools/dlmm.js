@@ -640,8 +640,19 @@ export async function deployPosition({
   entry_tvl,
   entry_volume,
   entry_holders,
+  entry_signal_snapshot,
 }) {
   pool_address = normalizeMint(pool_address);
+  const resolveEntrySignalSnapshot = (baseMint) => {
+    const stagedSignalSnapshot = config.darwin?.enabled
+      ? getAndClearStagedSignals(pool_address, baseMint)
+      : null;
+    const combined = {
+      ...(stagedSignalSnapshot || {}),
+      ...(entry_signal_snapshot || {}),
+    };
+    return Object.keys(combined).length > 0 ? combined : null;
+  };
   const activeStrategy = strategy || config.strategy.strategy;
   let activeBinsBelow = bins_below ?? config.strategy.defaultBinsBelow ?? config.strategy.minBinsBelow;
   let activeBinsAbove = bins_above ?? 0;
@@ -864,9 +875,7 @@ export async function deployPosition({
 
       const positionAddress = matching?.position || null;
       if (positionAddress) {
-        const signalSnapshot = config.darwin?.enabled
-          ? getAndClearStagedSignals(pool_address, baseMint)
-          : null;
+        const signalSnapshot = resolveEntrySignalSnapshot(baseMint);
         trackPosition({
           position: positionAddress,
           pool: pool_address,
@@ -1006,9 +1015,7 @@ export async function deployPosition({
     log("deploy", `SUCCESS — ${txHashes.length} tx(s): ${txHashes[0]}`);
 
     _positionsCacheAt = 0;
-    const signalSnapshot = config.darwin?.enabled
-      ? getAndClearStagedSignals(pool_address, baseMint)
-      : null;
+    const signalSnapshot = resolveEntrySignalSnapshot(baseMint);
     trackPosition({
       position: newPosition.publicKey.toString(),
       pool: pool_address,

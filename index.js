@@ -662,6 +662,20 @@ export async function runScreeningCycle({ silent = false } = {}) {
       const priceChange = ti?.stats_1h?.price_change;
       const netBuyers = ti?.stats_1h?.net_buyers;
       const activeBin = activeBinResults[i]?.status === "fulfilled" ? activeBinResults[i].value?.binId : null;
+      const momentum = pool.indicator_confirmation;
+      const momentumIntervals = Array.isArray(momentum?.intervals)
+        ? momentum.intervals
+          .filter((entry) => entry?.ok)
+          .map((entry) => {
+            const signal = entry.signal || {};
+            const direction = signal.supertrendDirection || "unknown";
+            const candleMove = Number.isFinite(signal.close) && Number.isFinite(signal.previousClose)
+              ? (signal.close > signal.previousClose ? "rising" : "not-rising")
+              : "unknown";
+            return `${entry.interval}:${direction},RSI=${signal.rsi ?? "?"},${candleMove}`;
+          })
+          .join(" | ")
+        : "";
 
       const pvpLine = pool.is_pvp
         ? `  pvp: HIGH — rival ${pool.pvp_rival_name || pool.pvp_symbol} (${pool.pvp_rival_mint?.slice(0, 8)}...) has pool ${pool.pvp_rival_pool?.slice(0, 8)}..., tvl=$${pool.pvp_rival_tvl}, holders=${pool.pvp_rival_holders}, fees=${pool.pvp_rival_fees}SOL`
@@ -673,6 +687,9 @@ export async function runScreeningCycle({ silent = false } = {}) {
         `  audit: top10=${top10Pct}%, bots=${botPct}%, fees=${feesSol}SOL${launchpad ? `, launchpad=${launchpad}` : ""}`,
         pvpLine,
         `  smart_wallets: ${sw?.in_pool?.length ?? 0} present${sw?.in_pool?.length ? ` → CONFIDENCE BOOST (${sw.in_pool.map(w => w.name).join(", ")})` : ""}`,
+        momentum?.confirmed
+          ? `  momentum: CONFIRMED${momentumIntervals ? ` — ${momentumIntervals}` : ""}`
+          : null,
         activeBin != null ? `  active_bin: ${activeBin}` : null,
         priceChange != null ? `  1h: price${priceChange >= 0 ? "+" : ""}${priceChange}%, net_buyers=${netBuyers ?? "?"}` : null,
         n?.narrative ? `  narrative_untrusted: ${sanitizeUntrustedPromptText(n.narrative, 500)}` : `  narrative_untrusted: none`,
@@ -714,7 +731,7 @@ ${candidateBlocks.join("\n\n")}
 
 STEPS:
 1. Decide if any candidate is actually worth deploying. One surviving candidate is not automatically good enough.
-2. Pick the best candidate based on realized risk context, narrative quality, smart wallets, and pool metrics. Prefer positive expectancy over headline win rate and avoid profiles resembling the high-volatility loss tail.
+2. Pick the best candidate based on realized risk context, confirmed 5m+15m momentum, narrative quality, smart wallets, and pool metrics. Prefer positive expectancy over headline win rate and avoid profiles resembling the high-volatility loss tail. Do not chase an overbought or non-rising candle; the backend will re-fetch and reject stale or incomplete momentum.
 3. Call deploy_position (active_bin is pre-fetched above — no need to call get_active_bin).
    bins_below = round(${config.strategy.minBinsBelow} + (candidate volatility/5)*(${config.strategy.maxBinsBelow - config.strategy.minBinsBelow})) clamped to [${config.strategy.minBinsBelow},${config.strategy.maxBinsBelow}].
    pass deploy_position.volatility = the candidate volatility value.
@@ -963,11 +980,14 @@ Summarize the current portfolio health, total fees earned, and performance of al
   let opportunityPollInterval = null;
   if (config.opportunity.enabled) {
     const oppMs = Math.max(15, Number(config.opportunity.pollIntervalSec ?? 45)) * 1000;
-    const oppCooldownMs = 5 * 60 * 1000; // don't re-trigger the deploy LLM more than every 5m
+    const decisionMinIntervalMs = Math.max(
+      15,
+      Number(config.opportunity.decisionMinIntervalSec ?? 90),
+    ) * 1000;
     let _opportunityPollBusy = false;
     opportunityPollInterval = setInterval(async () => {
       if (_screeningBusy || _managementBusy || _claimAllBusy || _opportunityPollBusy) return;
-      if (Date.now() - _screeningLastTriggered < oppCooldownMs) return;
+      if (Date.now() - _screeningLastTriggered < decisionMinIntervalMs) return;
       _opportunityPollBusy = true;
       try {
         const [positions, balance] = await Promise.all([
@@ -1195,6 +1215,16 @@ function formatWalletStatus(wallet, positions) {
 }
 
 function formatConfigSnapshot() {
+  const lossCooldowns = [
+    config.risk.lossCircuitStreakCooldownHours,
+    config.risk.lossCircuitRollingCooldownHours,
+    config.risk.lossCircuitSingleCooldownHours,
+  ];
+  const lossResponse = !config.risk.lossCircuitBreakerEnabled
+    ? "off"
+    : lossCooldowns.every((hours) => Number(hours) === 0)
+      ? "immediate quality-gated re-entry, no timed pause"
+      : `timed pause ${lossCooldowns.join("/")}h`;
   return [
     "Config snapshot",
     "",
@@ -1207,9 +1237,11 @@ function formatConfigSnapshot() {
     `Repeat deploy cooldown: ${config.management.repeatDeployCooldownEnabled ? "on" : "off"} | ${config.management.repeatDeployCooldownTriggerCount}x / ${config.management.repeatDeployCooldownHours}h | min fee earned ${config.management.repeatDeployCooldownMinFeeEarnedPct}% | ${config.management.repeatDeployCooldownScope}`,
     `Yield floor: ${config.management.minFeePerTvl24h}% | min age ${config.management.minAgeBeforeYieldCheck}m`,
     `Screening: ${config.screening.category} / ${config.screening.timeframe} | TVL ${config.screening.minTvl}-${config.screening.maxTvl} | max volatility ${config.screening.maxVolatility}`,
+    `Entry quality: organic ≥ ${config.screening.minOrganic} | fee/active-TVL ≥ ${config.screening.minFeeActiveTvlRatio}% | volume/active-TVL ≥ ${config.screening.minVolumeActiveTvlRatio}`,
     `Token audit: ${config.screening.requireTokenAudit ? "required" : "optional"} | fees ≥ ${config.screening.minTokenFeesSol} SOL | top10 ≤ ${config.screening.maxTop10Pct}% | bots ≤ ${config.screening.maxBotHoldersPct}%`,
-    `Loss circuit: ${config.risk.lossCircuitBreakerEnabled ? "on" : "off"} | ${config.risk.maxConsecutiveLosses} losses / rolling ${config.risk.maxRollingLossPct}% / single ${config.risk.maxSingleLossPct}% | adaptive cooldown ${config.risk.lossCircuitStreakCooldownHours}/${config.risk.lossCircuitRollingCooldownHours}/${config.risk.lossCircuitSingleCooldownHours}h | recovery ${(config.risk.lossCircuitRecoverySizePct * 100).toFixed(0)}%`,
-    `Intervals: manage ${config.schedule.managementIntervalMin}m | screen ${config.schedule.screeningIntervalMin}m`,
+    `Loss response: ${lossResponse} | ${config.risk.maxConsecutiveLosses} losses / rolling ${config.risk.maxRollingLossPct}% / single ${config.risk.maxSingleLossPct}% | recovery size ${(config.risk.lossCircuitRecoverySizePct * 100).toFixed(0)}%`,
+    `Momentum: ${config.indicators.enabled ? "required" : "off"} | ${config.indicators.entryPreset} | ${config.indicators.intervals.join("+")} | RSI ${config.indicators.entryRsiMin}-${config.indicators.entryRsiMax} | fail closed ${config.indicators.entryFailClosed ? "on" : "off"}`,
+    `Intervals: manage ${config.schedule.managementIntervalMin}m | screen ${config.schedule.screeningIntervalMin}m | opportunity ${config.opportunity.pollIntervalSec}s / decision ${config.opportunity.decisionMinIntervalSec}s`,
     `HiveMind: ${isHiveMindEnabled() ? "enabled" : "disabled"}${config.hiveMind.agentId ? ` | ${config.hiveMind.agentId}` : ""}`,
   ].join("\n");
 }
@@ -1264,6 +1296,9 @@ function settingValue(key) {
     rsiLength: config.indicators.rsiLength,
     indicatorIntervals: config.indicators.intervals,
     requireAllIntervals: config.indicators.requireAllIntervals,
+    entryFailClosed: config.indicators.entryFailClosed,
+    entryRsiMin: config.indicators.entryRsiMin,
+    entryRsiMax: config.indicators.entryRsiMax,
   };
   return values[key];
 }
@@ -1354,15 +1389,16 @@ function renderSettingsMenu(page = "main") {
   } else if (page === "indicators") {
     rows = [
       [toggleButton("chartIndicatorsEnabled", "Chart indicators"), toggleButton("requireAllIntervals", "Require all TF")],
+      [toggleButton("entryFailClosed", "Entry fail closed")],
       [
         settingButton("TF: 5m", "cfg:set:indicatorIntervals:5_MINUTE"),
         settingButton("TF: 15m", "cfg:set:indicatorIntervals:15_MINUTE"),
         settingButton("TF: both", "cfg:set:indicatorIntervals:both"),
       ],
       [
+        settingButton("Entry: Momentum", "cfg:set:indicatorEntryPreset:momentum_quality"),
         settingButton("Entry: ST", "cfg:set:indicatorEntryPreset:supertrend_break"),
         settingButton("Entry: RSI", "cfg:set:indicatorEntryPreset:rsi_reversal"),
-        settingButton("Entry: ST/RSI", "cfg:set:indicatorEntryPreset:supertrend_or_rsi"),
       ],
       [
         settingButton("Exit: ST", "cfg:set:indicatorExitPreset:supertrend_break"),
@@ -1370,6 +1406,8 @@ function renderSettingsMenu(page = "main") {
         settingButton("Exit: BB+RSI", "cfg:set:indicatorExitPreset:bb_plus_rsi"),
       ],
       stepButtons("rsiLength", "RSI len", 1, { digits: 0 }),
+      stepButtons("entryRsiMin", "Entry RSI min", 1, { digits: 0 }),
+      stepButtons("entryRsiMax", "Entry RSI max", 1, { digits: 0 }),
     ];
   } else {
     rows = [
@@ -1468,7 +1506,7 @@ async function applySettingsMenuCallback(msg) {
     await answerCallbackQuery(msg.callbackQueryId, "Config update failed");
     return;
   }
-  page = key.startsWith("indicator") || key === "chartIndicatorsEnabled" || key === "rsiLength" || key === "requireAllIntervals"
+  page = key.startsWith("indicator") || key === "chartIndicatorsEnabled" || key === "rsiLength" || key === "requireAllIntervals" || key === "entryFailClosed" || key.startsWith("entryRsi")
     ? "indicators"
     : ["useDiscordSignals", "blockPvpSymbols", "strategy", "minBinsBelow", "maxBinsBelow", "defaultBinsBelow", "managementIntervalMin", "screeningIntervalMin"].includes(key)
       ? "screen"

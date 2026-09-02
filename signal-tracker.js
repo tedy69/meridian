@@ -1,8 +1,8 @@
 /**
  * signal-tracker.js — Stages screening signals for later attribution.
  *
- * Deploy-time persistence is not currently wired, so staged signals are
- * short-lived context rather than durable performance data.
+ * Darwin-enabled screening signals are merged with the executor's fresh,
+ * compact entry snapshot and persisted with the opened position.
  */
 
 import { log } from "./logger.js";

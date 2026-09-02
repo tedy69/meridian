@@ -26,6 +26,7 @@ import { addToBlacklist, removeFromBlacklist, listBlacklist } from "../token-bla
 import { blockDev, unblockDev, listBlockedDevs } from "../dev-blocklist.js";
 import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsOnPool } from "../smart-wallets.js";
 import { getTokenInfo, getTokenHolders, getTokenNarrative } from "./token.js";
+import { confirmIndicatorPreset } from "./chart-indicators.js";
 import {
   config,
   getCircuitAdjustedDeploySizing,
@@ -82,10 +83,67 @@ async function fetchFreshPoolDetail(poolAddress, timeframe = config.screening.ti
   return (data?.data || [])[0] ?? null;
 }
 
+function compactMomentumIntervals(momentum) {
+  if (!Array.isArray(momentum?.intervals)) return [];
+
+  const optionalNumber = (value) => {
+    if (value == null || value === "") return null;
+    const numeric = Number(value);
+    return Number.isFinite(numeric) ? numeric : null;
+  };
+
+  return momentum.intervals
+    .filter((entry) => entry?.ok === true)
+    .map((entry) => {
+      const signal = entry.signal || {};
+      const close = optionalNumber(signal.close);
+      const previousClose = optionalNumber(signal.previousClose);
+      const supertrendValue = optionalNumber(signal.supertrendValue);
+      return {
+        interval: entry.interval,
+        confirmed: entry.confirmed === true,
+        rsi: optionalNumber(signal.rsi),
+        supertrend_direction: String(signal.supertrendDirection || "unknown"),
+        close_above_trend: Number.isFinite(close) && Number.isFinite(supertrendValue)
+          ? close >= supertrendValue
+          : null,
+        rising_candle: Number.isFinite(close) && Number.isFinite(previousClose)
+          ? close > previousClose
+          : null,
+        supertrend_break_up: signal.supertrendBreakUp === true,
+      };
+    });
+}
+
+function buildEntrySignalSnapshot({ poolRisk, tokenAudit, momentum, momentumPreset }) {
+  const snapshot = {
+    base_mint: poolRisk.baseMint,
+    organic_score: poolRisk.metrics.baseOrganic,
+    quote_organic_score: poolRisk.metrics.quoteOrganic,
+    fee_tvl_ratio: poolRisk.metrics.feeActiveTvlRatio,
+    volume_active_tvl_ratio: poolRisk.metrics.volumeActiveTvlRatio,
+    volatility: poolRisk.metrics.volatility,
+    ...poolRisk.entryMarketData,
+    token_global_fees_sol: tokenAudit.metrics?.globalFeesSol ?? null,
+    token_top10_pct: tokenAudit.metrics?.top10Pct ?? null,
+    token_bot_holders_pct: tokenAudit.metrics?.botHoldersPct ?? null,
+  };
+
+  if (momentum) {
+    snapshot.momentum_preset = momentum.preset ?? momentumPreset;
+    snapshot.momentum_confirmed = momentum.confirmed === true;
+    snapshot.momentum_intervals = compactMomentumIntervals(momentum);
+  }
+
+  return snapshot;
+}
+
 export async function validateDeployPoolThresholds(args, {
   screening = config.screening,
+  indicators = config.indicators,
   fetchPoolDetail = fetchFreshPoolDetail,
   fetchTokenInfo = getTokenInfo,
+  fetchIndicatorConfirmation = confirmIndicatorPreset,
 } = {}) {
   const sourceTimeframe = screening.timeframe || "5m";
   let detail;
@@ -140,12 +198,55 @@ export async function validateDeployPoolThresholds(args, {
   const tokenAudit = evaluateTokenAuditRisk(tokenInfo, screening, { expectedMint: poolRisk.baseMint });
   if (!tokenAudit.pass) return tokenAudit;
 
+  let momentum = null;
+  if (indicators.enabled) {
+    if (!poolRisk.baseMint) {
+      return { pass: false, reason: "Could not identify the base mint for fresh entry-momentum confirmation." };
+    }
+    try {
+      momentum = await fetchIndicatorConfirmation({
+        mint: poolRisk.baseMint,
+        side: "entry",
+        preset: indicators.entryPreset,
+        intervals: indicators.intervals,
+        refresh: true,
+      });
+    } catch (error) {
+      return {
+        pass: false,
+        reason: `Could not refresh entry momentum before deploy: ${error.message}`,
+      };
+    }
+    const failClosed = indicators.entryFailClosed ?? true;
+    if (momentum?.confirmed !== true || (failClosed && momentum?.skipped === true)) {
+      return {
+        pass: false,
+        reason: `Entry momentum is not confirmed: ${momentum?.reason || "fresh indicator evidence is unavailable"}.`,
+        momentum,
+      };
+    }
+  }
+
   return {
     pass: true,
+    trustedPoolArgs: {
+      base_mint: poolRisk.baseMint,
+      bin_step: poolRisk.metrics.binStep,
+      volatility: poolRisk.metrics.volatility,
+      fee_tvl_ratio: poolRisk.metrics.feeActiveTvlRatio,
+      organic_score: poolRisk.metrics.baseOrganic,
+    },
     entryMarketData: poolRisk.entryMarketData,
+    entrySignalSnapshot: buildEntrySignalSnapshot({
+      poolRisk,
+      tokenAudit,
+      momentum,
+      momentumPreset: indicators.entryPreset,
+    }),
     riskMetrics: {
       pool: poolRisk.metrics,
       tokenAudit: tokenAudit.metrics,
+      momentum,
     },
   };
 }
@@ -180,19 +281,25 @@ function coerceStringArray(value, key) {
   return value.map((entry) => coerceString(entry, key)).filter(Boolean);
 }
 
-function normalizeConfigValue(key, value) {
+export function normalizeConfigValue(key, value) {
   const booleanKeys = new Set([
     "excludeHighSupplyConcentration",
     "useDiscordSignals",
     "avoidPvpSymbols",
     "blockPvpSymbols",
+    "requireTokenAudit",
     "autoSwapAfterClaim",
+    "repeatDeployCooldownEnabled",
     "trailingTakeProfit",
     "solMode",
     "darwinEnabled",
     "lpAgentRelayEnabled",
+    "opportunityPollEnabled",
+    "chartIndicatorsEnabled",
+    "requireAllIntervals",
+    "entryFailClosed",
   ]);
-  const arrayKeys = new Set(["allowedLaunchpads", "blockedLaunchpads"]);
+  const arrayKeys = new Set(["allowedLaunchpads", "blockedLaunchpads", "indicatorIntervals"]);
   const stringKeys = new Set([
     "timeframe",
     "category",
@@ -211,6 +318,9 @@ function normalizeConfigValue(key, value) {
     "pnlRpcUrl",
     "gmgnFeeSource",
     "gmgnApiKey",
+    "repeatDeployCooldownScope",
+    "indicatorEntryPreset",
+    "indicatorExitPreset",
   ]);
   if (value === null) return null;
   if (booleanKeys.has(key)) return coerceBoolean(value, key);
@@ -338,6 +448,7 @@ const toolMap = {
       minTvl: ["screening", "minTvl"],
       maxTvl: ["screening", "maxTvl"],
       minVolume: ["screening", "minVolume"],
+      minVolumeActiveTvlRatio: ["screening", "minVolumeActiveTvlRatio"],
       minOrganic: ["screening", "minOrganic"],
       minQuoteOrganic: ["screening", "minQuoteOrganic"],
       minHolders: ["screening", "minHolders"],
@@ -394,6 +505,7 @@ const toolMap = {
       // opportunity poller (interval/enabled changes apply on next restart)
       opportunityPollEnabled: ["opportunity", "enabled"],
       opportunityPollIntervalSec: ["opportunity", "pollIntervalSec"],
+      opportunityDecisionMinIntervalSec: ["opportunity", "decisionMinIntervalSec"],
       opportunityPollLimit: ["opportunity", "limit"],
       opportunityMinScore: ["opportunity", "minScore"],
       opportunitySmartWalletBonus: ["opportunity", "smartWalletScoreBonus"],
@@ -457,7 +569,10 @@ const toolMap = {
       indicatorCandles: ["indicators", "candles", ["chartIndicators", "candles"]],
       rsiOversold: ["indicators", "rsiOversold", ["chartIndicators", "rsiOversold"]],
       rsiOverbought: ["indicators", "rsiOverbought", ["chartIndicators", "rsiOverbought"]],
+      entryRsiMin: ["indicators", "entryRsiMin", ["chartIndicators", "entryRsiMin"]],
+      entryRsiMax: ["indicators", "entryRsiMax", ["chartIndicators", "entryRsiMax"]],
       requireAllIntervals: ["indicators", "requireAllIntervals", ["chartIndicators", "requireAllIntervals"]],
+      entryFailClosed: ["indicators", "entryFailClosed", ["chartIndicators", "entryFailClosed"]],
     };
 
     const applied = {};
@@ -1054,7 +1169,9 @@ export async function runSafetyChecks(name, args) {
       }
       const poolThresholds = await validateDeployPoolThresholds(args);
       if (!poolThresholds.pass) return poolThresholds;
+      if (poolThresholds.trustedPoolArgs) Object.assign(args, poolThresholds.trustedPoolArgs);
       if (poolThresholds.entryMarketData) Object.assign(args, poolThresholds.entryMarketData);
+      if (poolThresholds.entrySignalSnapshot) args.entry_signal_snapshot = poolThresholds.entrySignalSnapshot;
 
       // Reject pools with bin_step out of configured range
       const minStep = config.screening.minBinStep;

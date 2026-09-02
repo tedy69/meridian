@@ -491,11 +491,12 @@ All fields are optional — defaults shown. Edit `user-config.json`.
 
 | Field | Default | Description |
 |---|---|---|
-| `minFeeActiveTvlRatio` | `0.05` | Minimum fee/active-TVL ratio |
+| `minFeeActiveTvlRatio` | `0.15` | Minimum fee/active-TVL ratio |
 | `minTvl` | `10000` | Minimum pool TVL (USD) |
 | `maxTvl` | `150000` | Maximum pool TVL (USD) |
 | `minVolume` | `500` | Minimum pool volume |
-| `minOrganic` | `60` | Minimum organic score (0–100) |
+| `minVolumeActiveTvlRatio` | `0.02` | Minimum fresh volume divided by active TVL |
+| `minOrganic` | `70` | Minimum organic score (0–100) |
 | `minHolders` | `500` | Minimum token holder count |
 | `minMcap` | `150000` | Minimum market cap (USD) |
 | `maxMcap` | `10000000` | Maximum market cap (USD) |
@@ -519,15 +520,15 @@ All fields are optional — defaults shown. Edit `user-config.json`.
 | `maxPositions` | `1` | Maximum simultaneously open positions |
 | `maxDeployAmount` | `0.3` | Maximum SOL cap per position; set `null` to disable this ceiling |
 | `maxDailyDeploySol` | `0.5` | Maximum deploy attempts per UTC day; set `null` to disable this aggregate cap. Uncertain attempts remain counted when enabled. |
-| `lossCircuitBreakerEnabled` | `true` | Pause new positions after realized loss limits trigger |
+| `lossCircuitBreakerEnabled` | `true` | Keep realized-loss context and reduced recovery sizing active |
 | `lossCircuitWindowPositions` | `5` | Closed positions included in the rolling-loss window |
-| `maxConsecutiveLosses` | `3` | Consecutive realized losses allowed before pausing |
-| `maxRollingLossPct` | `12` | Maximum summed loss percentage in the rolling window |
-| `maxSingleLossPct` | `12` | Single-position realized loss magnitude that triggers a pause |
-| `lossCircuitStreakCooldownHours` | `1` | Pause after three consecutive smaller realized losses |
-| `lossCircuitRollingCooldownHours` | `2` | Pause after the rolling loss limit is reached |
-| `lossCircuitSingleCooldownHours` | `4` | Pause after one severe realized loss |
-| `lossCircuitRecoverySizePct` | `0.5` | Fraction of normal size allowed after cooldown until a profitable close |
+| `maxConsecutiveLosses` | `3` | Consecutive realized losses that activate loss-aware recovery |
+| `maxRollingLossPct` | `12` | Rolling loss magnitude that activates recovery sizing |
+| `maxSingleLossPct` | `12` | Single-position loss magnitude that activates recovery sizing |
+| `lossCircuitStreakCooldownHours` | `0` | Timed pause after a smaller-loss streak; `0` allows immediate quality-gated re-entry |
+| `lossCircuitRollingCooldownHours` | `0` | Timed pause after rolling losses; `0` allows immediate quality-gated re-entry |
+| `lossCircuitSingleCooldownHours` | `0` | Timed pause after one severe loss; `0` allows immediate quality-gated re-entry |
+| `lossCircuitRecoverySizePct` | `0.5` | Fraction of normal size allowed after a loss trigger until a profitable close |
 | `gasReserve` | `0.2` | Minimum SOL to keep for gas |
 | `minSolToOpen` | `0.55` | Minimum wallet SOL before opening |
 | `outOfRangeWaitMinutes` | `30` | Minutes OOR before acting |
@@ -535,7 +536,7 @@ All fields are optional — defaults shown. Edit `user-config.json`.
 | `stopLossTriggerPct` | `-8` | Early stop-loss trigger, deliberately above `stopLossPct` to leave execution room |
 | `stopLossConfirmTicks` | `1` | Authoritative PnL ticks required for stop loss; a fresh RPC recheck still occurs before submission |
 | `stopLossCooldownHours` | `12` | Blocks re-entry to the same pool and token after a stop-loss that settles negative; set `0` only to disable it explicitly |
-| `takeProfitPct` | `5` | Close when fees earned reach this % of capital |
+| `takeProfitPct` | `3` | Close when fees earned reach this % of capital |
 | `trailingTakeProfit` | `true` | Enable trailing take-profit |
 | `trailingTriggerPct` | `3` | Activate trailing TP at this PnL % |
 | `trailingDropPct` | `1.5` | Close when PnL drops this % from peak |
@@ -543,7 +544,9 @@ All fields are optional — defaults shown. Edit `user-config.json`.
 
 `stopLossTriggerPct` must stay above `stopLossPct` (for example, `-8` and `-15`). This reduces execution overshoot, but a direct on-chain close cannot mathematically guarantee the final PnL during a sudden market move. The fast PnL watchdog keeps sampling while other workflows are busy and defers only transaction submission until the transaction lane is free. A negative settled stop-loss starts the pool/token cooldown so the bot does not immediately re-enter the same collapsing asset. When the LP relay is enabled and returns a valid zap-out order, Meridian uses the relay's configured minimum-output slippage bound before any local fallback.
 
-Before every deploy, Meridian also re-fetches pool fundamentals and token audit data. The realized-loss circuit breaker runs before those remote checks and cannot be overridden by the screener model. Its percentages are positive loss magnitudes (for example, `12` means a `-12%` limit). Cooldowns are adaptive: a small-loss streak pauses for 1 hour, rolling losses for 2 hours, and a severe single loss for 4 hours. Once the pause expires, backend sizing remains at 50% until a profitable position closes; the LLM cannot bypass that recovery cap.
+Before every deploy, Meridian re-fetches pool fundamentals, token audit data, and 5-minute plus 15-minute momentum. Entry fails closed unless both timeframes show a rising price above bullish Supertrend with RSI in the configured `45–72` band. The default loss response has no timed global pause: qualifying setups can be considered immediately, but backend sizing remains at 50% after a loss trigger until a profitable position closes. Neither the model nor a direct `deploy_position` call can bypass these checks.
+
+The opportunity poll runs every 45 seconds and may launch a full decision again after 90 seconds. This 90-second limit only prevents duplicate model/API work; it is not a loss cooldown.
 
 ### Schedule
 

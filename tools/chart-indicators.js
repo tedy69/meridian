@@ -42,10 +42,12 @@ function buildSignalSummary(payload) {
   };
 }
 
-function evaluatePreset(side, preset, payload) {
+export function evaluateIndicatorPreset(side, preset, payload, indicatorConfig = config.indicators) {
   const summary = buildSignalSummary(payload);
-  const oversold = Number(config.indicators.rsiOversold ?? 30);
-  const overbought = Number(config.indicators.rsiOverbought ?? 80);
+  const oversold = Number(indicatorConfig.rsiOversold ?? 30);
+  const overbought = Number(indicatorConfig.rsiOverbought ?? 80);
+  const entryRsiMin = Number(indicatorConfig.entryRsiMin ?? 45);
+  const entryRsiMax = Number(indicatorConfig.entryRsiMax ?? 72);
   const close = summary.close;
   const previousClose = summary.previousClose;
   const lowerBand = summary.lowerBand;
@@ -67,6 +69,28 @@ function evaluatePreset(side, preset, payload) {
     close <= level;
 
   switch (preset) {
+    case "momentum_quality": {
+      if (side !== "entry") {
+        return {
+          confirmed: false,
+          reason: "momentum_quality is an entry-only preset",
+          signal: summary,
+        };
+      }
+      const aboveBullishTrend = isBullish &&
+        close != null &&
+        summary.supertrendValue != null &&
+        close >= summary.supertrendValue;
+      const rising = close != null && previousClose != null && close > previousClose;
+      const balancedRsi = rsi != null && rsi >= entryRsiMin && rsi <= entryRsiMax;
+      return {
+        confirmed: aboveBullishTrend &&
+          balancedRsi &&
+          rising,
+        reason: `Momentum quality requires bullish Supertrend, rising price, and RSI ${rsi ?? "n/a"} within ${entryRsiMin}-${entryRsiMax}`,
+        signal: summary,
+      };
+    }
     case "supertrend_break":
       return side === "entry"
         ? {
@@ -202,6 +226,57 @@ function evaluatePreset(side, preset, payload) {
   }
 }
 
+export function resolveIndicatorConfirmation({
+  side,
+  preset,
+  targets = [],
+  results = [],
+  requireAllIntervals = false,
+  failClosed = false,
+} = {}) {
+  const successful = results.filter((entry) => entry.ok);
+  if (successful.length === 0) {
+    const refuseEntry = side === "entry" && failClosed;
+    return {
+      enabled: true,
+      confirmed: !refuseEntry,
+      skipped: true,
+      preset,
+      side,
+      requireAllIntervals,
+      reason: refuseEntry
+        ? "Indicator API unavailable; refusing entry."
+        : "Indicator API unavailable; falling back to existing logic.",
+      intervals: results,
+    };
+  }
+
+  const successfulIntervals = new Set(successful.map((entry) => entry.interval));
+  const missingRequired = requireAllIntervals
+    ? targets.filter((interval) => !successfulIntervals.has(interval))
+    : [];
+  const confirmed = missingRequired.length > 0
+    ? false
+    : requireAllIntervals
+      ? successful.every((entry) => entry.confirmed)
+      : successful.some((entry) => entry.confirmed);
+
+  return {
+    enabled: true,
+    confirmed,
+    skipped: false,
+    preset,
+    side,
+    requireAllIntervals,
+    reason: missingRequired.length > 0
+      ? `Indicator confirmation is missing required interval(s): ${missingRequired.join(", ")}; refusing entry.`
+      : confirmed
+        ? `${preset} confirmed on ${successful.filter((entry) => entry.confirmed).map((entry) => entry.interval).join(", ")}`
+        : `${preset} not confirmed on ${successful.map((entry) => entry.interval).join(", ")}`,
+    intervals: results,
+  };
+}
+
 async function fetchChartIndicatorsForMint(
   mint,
   {
@@ -237,14 +312,23 @@ export async function confirmIndicatorPreset({
 
   const targets = normalizeIntervals(intervals);
   if (targets.length === 0) {
-    return { enabled: false, confirmed: true, reason: "No indicator intervals configured", intervals: [] };
+    const failClosed = side === "entry" && (config.indicators.entryFailClosed ?? true);
+    return {
+      enabled: true,
+      confirmed: !failClosed,
+      skipped: true,
+      reason: failClosed
+        ? "No indicator intervals configured; refusing entry."
+        : "No indicator intervals configured.",
+      intervals: [],
+    };
   }
 
   const results = [];
   for (const interval of targets) {
     try {
       const payload = await fetchChartIndicatorsForMint(mint, { interval, refresh });
-      const evaluation = evaluatePreset(side, preset, payload);
+      const evaluation = evaluateIndicatorPreset(side, preset, payload, config.indicators);
       results.push({
         interval,
         ok: true,
@@ -266,34 +350,13 @@ export async function confirmIndicatorPreset({
     }
   }
 
-  const successful = results.filter((entry) => entry.ok);
-  if (successful.length === 0) {
-    return {
-      enabled: true,
-      confirmed: true,
-      skipped: true,
-      preset,
-      side,
-      reason: "Indicator API unavailable; falling back to existing logic",
-      intervals: results,
-    };
-  }
-
   const requireAll = !!config.indicators.requireAllIntervals;
-  const confirmed = requireAll
-    ? successful.every((entry) => entry.confirmed)
-    : successful.some((entry) => entry.confirmed);
-
-  return {
-    enabled: true,
-    confirmed,
-    skipped: false,
-    preset,
+  return resolveIndicatorConfirmation({
     side,
+    preset,
+    targets,
+    results,
     requireAllIntervals: requireAll,
-    reason: confirmed
-      ? `${preset} confirmed on ${successful.filter((entry) => entry.confirmed).map((entry) => entry.interval).join(", ")}`
-      : `${preset} not confirmed on ${successful.map((entry) => entry.interval).join(", ")}`,
-    intervals: results,
-  };
+    failClosed: side === "entry" && (config.indicators.entryFailClosed ?? true),
+  });
 }

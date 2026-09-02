@@ -71,6 +71,32 @@ function buildSignalSnapshot(perf) {
   return Object.values(snapshot).some((value) => value != null) ? snapshot : null;
 }
 
+export function summarizeEntryMomentum(signalSnapshot) {
+  const intervals = Array.isArray(signalSnapshot?.momentum_intervals)
+    ? signalSnapshot.momentum_intervals
+    : [];
+  if (intervals.length === 0) return null;
+
+  const intervalSummary = intervals
+    .filter((entry) => entry?.interval)
+    .map((entry) => {
+      const rising = entry.rising_candle === true
+        ? "rising"
+        : entry.rising_candle === false
+          ? "not rising"
+          : "candle unknown";
+      const trendPosition = entry.close_above_trend === true
+        ? "above trend"
+        : entry.close_above_trend === false
+          ? "below trend"
+          : "trend position unknown";
+      return `${entry.interval}: RSI ${entry.rsi ?? "?"}, ${entry.supertrend_direction || "trend unknown"}, ${rising}, ${trendPosition}`;
+    });
+  if (intervalSummary.length === 0) return null;
+
+  return `${signalSnapshot.momentum_preset || "entry momentum"} [${intervalSummary.join("; ")}]`;
+}
+
 // ─── Record Position Performance ──────────────────────────────
 
 /**
@@ -243,6 +269,8 @@ function derivLesson(perf) {
     `organic=${perf.organic_score}`,
     `bin_range=${typeof perf.bin_range === 'object' ? JSON.stringify(perf.bin_range) : perf.bin_range}`,
   ];
+  const entryMomentum = summarizeEntryMomentum(perf.signal_snapshot);
+  if (entryMomentum) contextParts.push(`entry_momentum=${entryMomentum}`);
   if (perf.entry_mcap != null || perf.entry_tvl != null || perf.entry_volume != null) {
     contextParts.push(`entry(mcap=${fmtNum(perf.entry_mcap)}, tvl=${fmtNum(perf.entry_tvl)}, vol=${fmtNum(perf.entry_volume)})`);
   }
@@ -274,6 +302,9 @@ function derivLesson(perf) {
   }
 
   if (!rule) return null;
+  if (entryMomentum && !rule.includes(entryMomentum)) {
+    rule = `${rule} Entry momentum: ${entryMomentum}.`;
+  }
 
   const closeReasonText = String(perf.close_reason || "").toLowerCase();
   const positiveEvidence =
@@ -712,6 +743,7 @@ export function getPerformanceHistory({ hours = 24, limit = 50 } = {}) {
       minutes_held: r.minutes_held,
       close_reason: r.close_reason,
       closed_at: r.recorded_at,
+      entry_signals: r.signal_snapshot || null,
     }));
 
   const totalPnl = filtered.reduce((s, r) => s + (r.pnl_usd ?? 0), 0);

@@ -1,7 +1,17 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import test from "node:test";
-import { buildRiskConfig, config, getCircuitAdjustedDeploySizing } from "../config.js";
+import {
+  buildIndicatorConfig,
+  buildRiskConfig,
+  buildScreeningConfig,
+  config,
+  getCircuitAdjustedDeploySizing,
+} from "../config.js";
+import {
+  evaluateIndicatorPreset,
+  resolveIndicatorConfirmation,
+} from "../tools/chart-indicators.js";
 import {
   buildRiskIntelligenceBrief,
   evaluateFreshPoolRisk,
@@ -9,7 +19,8 @@ import {
   evaluateTokenAuditRisk,
   parsePerformanceLedger,
 } from "../risk-intelligence.js";
-import { validateDeployPoolThresholds } from "../tools/executor.js";
+import { summarizeEntryMomentum } from "../lessons.js";
+import { normalizeConfigValue, validateDeployPoolThresholds } from "../tools/executor.js";
 
 const NOW = new Date("2026-09-02T06:00:00.000Z");
 
@@ -32,6 +43,13 @@ const adaptiveCircuitPolicy = {
   lossCircuitRollingCooldownHours: 2,
   lossCircuitSingleCooldownHours: 4,
   lossCircuitRecoverySizePct: 0.5,
+};
+
+const noCooldownCircuitPolicy = {
+  ...adaptiveCircuitPolicy,
+  lossCircuitStreakCooldownHours: 0,
+  lossCircuitRollingCooldownHours: 0,
+  lossCircuitSingleCooldownHours: 0,
 };
 
 function performance(pnlPct, minutesAgo, extra = {}) {
@@ -187,6 +205,102 @@ test("circuit-adjusted sizing halves the trusted backend amount during recovery"
   assert.equal(sizing.recoveryMode, true);
 });
 
+test("loss-aware recovery starts immediately when timed cooldowns are zero", () => {
+  const status = evaluateLossCircuitBreaker({
+    performance: [performance(-14, 1)],
+    policy: noCooldownCircuitPolicy,
+    now: NOW,
+  });
+
+  assert.equal(status.pass, true);
+  assert.equal(status.trigger, null);
+  assert.equal(status.lastTrigger, "single_loss");
+  assert.equal(status.blockedUntil, null);
+  assert.equal(status.cooldownHours, 0);
+  assert.equal(status.recoveryMode, true);
+  assert.equal(status.recoverySizePct, 0.5);
+  assert.match(status.reason, /no timed cooldown/i);
+});
+
+test("momentum-quality entry requires a rising candle above bullish Supertrend with balanced RSI", () => {
+  const result = evaluateIndicatorPreset("entry", "momentum_quality", {
+    latest: {
+      candle: { close: 105 },
+      previousCandle: { close: 100 },
+      rsi: { value: 58 },
+      supertrend: { value: 98, direction: "bullish" },
+      states: { supertrendBreakUp: false },
+    },
+  }, { entryRsiMin: 45, entryRsiMax: 72 });
+
+  assert.equal(result.confirmed, true);
+});
+
+test("momentum-quality entry rejects an overbought chase even in a bullish trend", () => {
+  const result = evaluateIndicatorPreset("entry", "momentum_quality", {
+    latest: {
+      candle: { close: 105 },
+      previousCandle: { close: 100 },
+      rsi: { value: 79 },
+      supertrend: { value: 98, direction: "bullish" },
+      states: { supertrendBreakUp: false },
+    },
+  }, { entryRsiMin: 45, entryRsiMax: 72 });
+
+  assert.equal(result.confirmed, false);
+  assert.match(result.reason, /RSI 79.*45-72/i);
+});
+
+test("momentum-quality entry rejects a falling candle even on a fresh Supertrend flip", () => {
+  const result = evaluateIndicatorPreset("entry", "momentum_quality", {
+    latest: {
+      candle: { close: 101 },
+      previousCandle: { close: 103 },
+      rsi: { value: 55 },
+      supertrend: { value: 98, direction: "bullish" },
+      states: { supertrendBreakUp: true },
+    },
+  }, { entryRsiMin: 45, entryRsiMax: 72 });
+
+  assert.equal(result.confirmed, false);
+  assert.match(result.reason, /rising price/i);
+});
+
+test("entry indicators fail closed when every fresh interval is unavailable", () => {
+  const result = resolveIndicatorConfirmation({
+    side: "entry",
+    preset: "momentum_quality",
+    targets: ["5_MINUTE", "15_MINUTE"],
+    results: [
+      { interval: "5_MINUTE", ok: false, confirmed: null, reason: "timeout" },
+      { interval: "15_MINUTE", ok: false, confirmed: null, reason: "timeout" },
+    ],
+    requireAllIntervals: true,
+    failClosed: true,
+  });
+
+  assert.equal(result.confirmed, false);
+  assert.equal(result.skipped, true);
+  assert.match(result.reason, /unavailable.*refusing entry/i);
+});
+
+test("multi-timeframe entry confirmation rejects a missing required interval", () => {
+  const result = resolveIndicatorConfirmation({
+    side: "entry",
+    preset: "momentum_quality",
+    targets: ["5_MINUTE", "15_MINUTE"],
+    results: [
+      { interval: "5_MINUTE", ok: true, confirmed: true, reason: "confirmed" },
+      { interval: "15_MINUTE", ok: false, confirmed: null, reason: "timeout" },
+    ],
+    requireAllIntervals: true,
+    failClosed: true,
+  });
+
+  assert.equal(result.confirmed, false);
+  assert.match(result.reason, /missing required interval/i);
+});
+
 const screening = {
   minTvl: 10_000,
   maxTvl: 150_000,
@@ -202,6 +316,8 @@ const screening = {
   maxVolatility: 12,
   excludeHighSupplyConcentration: true,
 };
+
+const noIndicators = { enabled: false };
 
 function healthyPool(overrides = {}) {
   return {
@@ -249,6 +365,17 @@ test("fresh backend validation blocks stale low-volume data", () => {
 
   assert.equal(result.pass, false);
   assert.match(result.reason, /volume.*below.*500/i);
+});
+
+test("fresh backend validation blocks weak activity relative to liquidity", () => {
+  const result = evaluateFreshPoolRisk({
+    detail: healthyPool({ active_tvl: 100_000, volume: 1_000 }),
+    volatility: 8,
+    screening: { ...screening, minVolumeActiveTvlRatio: 0.02 },
+  });
+
+  assert.equal(result.pass, false);
+  assert.match(result.reason, /volume\/active-TVL.*0\.01.*minimum 0\.02/i);
 });
 
 test("fresh backend validation fails closed on critical token warnings", () => {
@@ -339,6 +466,7 @@ test("risk brief exposes recent expectancy and tail-risk to the screener AI", ()
 test("deploy preflight uses the longer volatility window and blocks its tail", async () => {
   const result = await validateDeployPoolThresholds({ pool_address: "Pool111" }, {
     screening: { ...screening, timeframe: "5m", requireTokenAudit: true, ...tokenAuditPolicy },
+    indicators: noIndicators,
     fetchPoolDetail: async (_poolAddress, timeframe) => timeframe === "30m"
       ? healthyPool({ volatility: 14 })
       : healthyPool({ volatility: 3 }),
@@ -359,6 +487,7 @@ test("deploy preflight uses the longer volatility window and blocks its tail", a
 test("deploy preflight re-fetches and enforces token audit", async () => {
   const result = await validateDeployPoolThresholds({ pool_address: "Pool111" }, {
     screening: { ...screening, timeframe: "30m", requireTokenAudit: true, ...tokenAuditPolicy },
+    indicators: noIndicators,
     fetchPoolDetail: async () => healthyPool(),
     fetchTokenInfo: async () => ({
       found: true,
@@ -377,6 +506,7 @@ test("deploy preflight re-fetches and enforces token audit", async () => {
 test("deploy preflight returns fresh entry metrics only after every gate passes", async () => {
   const result = await validateDeployPoolThresholds({ pool_address: "Pool111" }, {
     screening: { ...screening, timeframe: "30m", requireTokenAudit: true, ...tokenAuditPolicy },
+    indicators: noIndicators,
     fetchPoolDetail: async () => healthyPool(),
     fetchTokenInfo: async () => ({
       found: true,
@@ -395,10 +525,150 @@ test("deploy preflight returns fresh entry metrics only after every gate passes"
     entry_volume: 2_500,
     entry_holders: 1_000,
   });
+  assert.deepEqual(result.trustedPoolArgs, {
+    base_mint: "Mint111111111111111111111111111111111111",
+    bin_step: 100,
+    volatility: 8,
+    fee_tvl_ratio: 0.2,
+    organic_score: 80,
+  });
 });
 
-test("risk intelligence has conservative defaults", () => {
+test("deploy preflight fails closed when fresh entry momentum cannot be confirmed", async () => {
+  const result = await validateDeployPoolThresholds({ pool_address: "Pool111" }, {
+    screening: { ...screening, timeframe: "30m", requireTokenAudit: true, ...tokenAuditPolicy },
+    indicators: {
+      enabled: true,
+      entryPreset: "momentum_quality",
+      intervals: ["5_MINUTE", "15_MINUTE"],
+      requireAllIntervals: true,
+      entryFailClosed: true,
+    },
+    fetchPoolDetail: async () => healthyPool(),
+    fetchTokenInfo: async () => ({
+      found: true,
+      results: [{
+        mint: "Mint111111111111111111111111111111111111",
+        global_fees_sol: 100,
+        audit: { top_holders_pct: 25, bot_holders_pct: 5 },
+      }],
+    }),
+    fetchIndicatorConfirmation: async () => ({
+      enabled: true,
+      confirmed: false,
+      skipped: true,
+      reason: "Indicator API unavailable; refusing entry",
+      intervals: [],
+    }),
+  });
+
+  assert.equal(result.pass, false);
+  assert.match(result.reason, /momentum.*unavailable.*refusing entry/i);
+});
+
+test("deploy preflight records fresh multi-timeframe momentum after every gate passes", async () => {
+  const confirmation = {
+    enabled: true,
+    confirmed: true,
+    skipped: false,
+    reason: "momentum_quality confirmed on 5_MINUTE, 15_MINUTE",
+    intervals: [
+      {
+        interval: "5_MINUTE",
+        ok: true,
+        confirmed: true,
+        signal: {
+          close: 1.05,
+          previousClose: 1,
+          rsi: 58,
+          supertrendValue: 0.98,
+          supertrendDirection: "bullish",
+          supertrendBreakUp: true,
+        },
+        latest: { should_not_be_persisted: true },
+      },
+      {
+        interval: "15_MINUTE",
+        ok: true,
+        confirmed: true,
+        signal: {
+          close: 1.03,
+          previousClose: 1.01,
+          rsi: 54,
+          supertrendValue: 0.99,
+          supertrendDirection: "bullish",
+          supertrendBreakUp: false,
+        },
+      },
+    ],
+  };
+  const result = await validateDeployPoolThresholds({ pool_address: "Pool111" }, {
+    screening: { ...screening, timeframe: "30m", requireTokenAudit: true, ...tokenAuditPolicy },
+    indicators: {
+      enabled: true,
+      entryPreset: "momentum_quality",
+      intervals: ["5_MINUTE", "15_MINUTE"],
+      requireAllIntervals: true,
+      entryFailClosed: true,
+    },
+    fetchPoolDetail: async () => healthyPool(),
+    fetchTokenInfo: async () => ({
+      found: true,
+      results: [{
+        mint: "Mint111111111111111111111111111111111111",
+        global_fees_sol: 100,
+        audit: { top_holders_pct: 25, bot_holders_pct: 5 },
+      }],
+    }),
+    fetchIndicatorConfirmation: async () => confirmation,
+  });
+
+  assert.equal(result.pass, true);
+  assert.deepEqual(result.riskMetrics.momentum, confirmation);
+  assert.deepEqual(result.entrySignalSnapshot, {
+    base_mint: "Mint111111111111111111111111111111111111",
+    organic_score: 80,
+    quote_organic_score: 90,
+    fee_tvl_ratio: 0.2,
+    volume_active_tvl_ratio: 0.0625,
+    volatility: 8,
+    entry_mcap: 500_000,
+    entry_tvl: 50_000,
+    entry_volume: 2_500,
+    entry_holders: 1_000,
+    token_global_fees_sol: 100,
+    token_top10_pct: 25,
+    token_bot_holders_pct: 5,
+    momentum_preset: "momentum_quality",
+    momentum_confirmed: true,
+    momentum_intervals: [
+      {
+        interval: "5_MINUTE",
+        confirmed: true,
+        rsi: 58,
+        supertrend_direction: "bullish",
+        close_above_trend: true,
+        rising_candle: true,
+        supertrend_break_up: true,
+      },
+      {
+        interval: "15_MINUTE",
+        confirmed: true,
+        rsi: 54,
+        supertrend_direction: "bullish",
+        close_above_trend: true,
+        rising_candle: true,
+        supertrend_break_up: false,
+      },
+    ],
+  });
+  assert.equal(JSON.stringify(result.entrySignalSnapshot).includes("should_not_be_persisted"), false);
+});
+
+test("risk intelligence defaults to immediate loss-aware re-entry with stronger entry quality", () => {
   const riskDefaults = buildRiskConfig();
+  const screeningDefaults = buildScreeningConfig();
+  const indicatorDefaults = buildIndicatorConfig();
 
   assert.equal(config.screening.maxVolatility, 12);
   assert.equal(config.screening.requireTokenAudit, true);
@@ -408,10 +678,30 @@ test("risk intelligence has conservative defaults", () => {
   assert.equal(riskDefaults.maxRollingLossPct, 12);
   assert.equal(riskDefaults.maxSingleLossPct, 12);
   assert.equal(riskDefaults.maxDeployAmount, 0.3);
-  assert.equal(riskDefaults.lossCircuitStreakCooldownHours, 1);
-  assert.equal(riskDefaults.lossCircuitRollingCooldownHours, 2);
-  assert.equal(riskDefaults.lossCircuitSingleCooldownHours, 4);
+  assert.equal(screeningDefaults.minOrganic, 70);
+  assert.equal(screeningDefaults.minFeeActiveTvlRatio, 0.15);
+  assert.equal(screeningDefaults.minVolumeActiveTvlRatio, 0.02);
+  assert.equal(indicatorDefaults.enabled, true);
+  assert.equal(indicatorDefaults.entryPreset, "momentum_quality");
+  assert.deepEqual(indicatorDefaults.intervals, ["5_MINUTE", "15_MINUTE"]);
+  assert.equal(indicatorDefaults.requireAllIntervals, true);
+  assert.equal(indicatorDefaults.entryFailClosed, true);
+  assert.equal(riskDefaults.lossCircuitStreakCooldownHours, 0);
+  assert.equal(riskDefaults.lossCircuitRollingCooldownHours, 0);
+  assert.equal(riskDefaults.lossCircuitSingleCooldownHours, 0);
   assert.equal(riskDefaults.lossCircuitRecoverySizePct, 0.5);
+});
+
+test("entry-momentum settings retain their intended types when updated", () => {
+  assert.equal(normalizeConfigValue("chartIndicatorsEnabled", false), false);
+  assert.equal(normalizeConfigValue("entryFailClosed", true), true);
+  assert.equal(normalizeConfigValue("requireAllIntervals", true), true);
+  assert.equal(normalizeConfigValue("opportunityPollEnabled", false), false);
+  assert.equal(normalizeConfigValue("indicatorEntryPreset", "momentum_quality"), "momentum_quality");
+  assert.deepEqual(
+    normalizeConfigValue("indicatorIntervals", ["5_MINUTE", "15_MINUTE"]),
+    ["5_MINUTE", "15_MINUTE"],
+  );
 });
 
 test("deploy safety checks the realized-loss circuit before remote pool preflight", () => {
@@ -425,6 +715,50 @@ test("deploy safety checks the realized-loss circuit before remote pool prefligh
   assert.ok(circuitIndex < freshPoolIndex, "circuit breaker should stop before remote deploy preflight");
   assert.match(deploySafety, /getCircuitAdjustedDeploySizing/);
   assert.match(deploySafety, /allowedSizing\.maximumAmount/);
+  assert.match(deploySafety, /trustedPoolArgs/);
+  assert.match(deploySafety, /entry_signal_snapshot/);
+});
+
+test("deploy persistence combines fresh entry evidence even when Darwin learning is disabled", () => {
+  const source = fs.readFileSync(new URL("../tools/dlmm.js", import.meta.url), "utf8");
+  const deployPosition = source.slice(
+    source.indexOf("export async function deployPosition"),
+    source.indexOf("// ─── Close Position"),
+  );
+
+  assert.match(deployPosition, /entry_signal_snapshot/);
+  assert.ok(
+    deployPosition.match(/signal_snapshot:\s*signalSnapshot/g)?.length >= 2,
+    "both relay and standard deploy paths must persist the entry snapshot",
+  );
+  assert.match(deployPosition, /\.\.\.\(entry_signal_snapshot \|\| \{\}\)/);
+});
+
+test("learned lessons summarize the exact multi-timeframe entry conditions", () => {
+  const summary = summarizeEntryMomentum({
+    momentum_preset: "momentum_quality",
+    momentum_intervals: [
+      {
+        interval: "5_MINUTE",
+        rsi: 58,
+        supertrend_direction: "bullish",
+        close_above_trend: true,
+        rising_candle: true,
+      },
+      {
+        interval: "15_MINUTE",
+        rsi: 54,
+        supertrend_direction: "bullish",
+        close_above_trend: true,
+        rising_candle: true,
+      },
+    ],
+  });
+
+  assert.equal(
+    summary,
+    "momentum_quality [5_MINUTE: RSI 58, bullish, rising, above trend; 15_MINUTE: RSI 54, bullish, rising, above trend]",
+  );
 });
 
 test("automatic screening receives realized risk context and deterministic token audit", () => {

@@ -32,6 +32,11 @@ function positiveNumber(value, fallback) {
   return numeric != null && numeric > 0 ? numeric : fallback;
 }
 
+function nonNegativeNumber(value, fallback) {
+  const numeric = numberOrNull(value);
+  return numeric != null && numeric >= 0 ? numeric : fallback;
+}
+
 function fraction(value, fallback) {
   const numeric = numberOrNull(value);
   return numeric != null && numeric > 0 && numeric <= 1 ? numeric : fallback;
@@ -57,7 +62,7 @@ function normalizedPerformance(performance) {
 }
 
 function normalizedCircuitPolicy(policy = {}) {
-  const legacyCooldownHours = positiveNumber(
+  const legacyCooldownHours = nonNegativeNumber(
     policy.cooldownHours ?? policy.lossCircuitCooldownHours,
     null,
   );
@@ -68,17 +73,17 @@ function normalizedCircuitPolicy(policy = {}) {
     maxRollingLossPct: positiveNumber(policy.maxRollingLossPct, 12),
     maxSingleLossPct: positiveNumber(policy.maxSingleLossPct, 12),
     cooldownByTrigger: {
-      loss_streak: positiveNumber(
+      loss_streak: nonNegativeNumber(
         policy.lossCircuitStreakCooldownHours ?? policy.streakCooldownHours,
-        legacyCooldownHours ?? 1,
+        legacyCooldownHours ?? 0,
       ),
-      rolling_loss: positiveNumber(
+      rolling_loss: nonNegativeNumber(
         policy.lossCircuitRollingCooldownHours ?? policy.rollingCooldownHours,
-        legacyCooldownHours ?? 2,
+        legacyCooldownHours ?? 0,
       ),
-      single_loss: positiveNumber(
+      single_loss: nonNegativeNumber(
         policy.lossCircuitSingleCooldownHours ?? policy.singleCooldownHours,
-        legacyCooldownHours ?? 4,
+        legacyCooldownHours ?? 0,
       ),
     },
     recoverySizePct: fraction(policy.lossCircuitRecoverySizePct ?? policy.recoverySizePct, 0.5),
@@ -208,9 +213,13 @@ export function evaluateLossCircuitBreaker({ performance = [], policy = {}, now 
       pass: true,
       trigger: null,
       lastTrigger: latestTrigger.trigger,
-      reason: recoveryMode
-        ? `The ${cooldownHours}-hour realized-loss cooldown has expired; deploy sizing remains reduced until a profitable close.`
-        : "The latest realized-loss cooldown completed and a profitable close restored normal sizing.",
+      reason: cooldownHours === 0
+        ? recoveryMode
+          ? "No timed cooldown is configured; re-entry is available immediately under strict entry gates and reduced sizing until a profitable close."
+          : "No timed cooldown is configured and a profitable close restored normal sizing."
+        : recoveryMode
+          ? `The ${cooldownHours}-hour realized-loss cooldown has expired; deploy sizing remains reduced until a profitable close.`
+          : "The latest realized-loss cooldown completed and a profitable close restored normal sizing.",
       blockedUntil: null,
       cooldownHours,
       recoveryMode,
@@ -257,7 +266,11 @@ export function evaluateFreshPoolRisk({
   if (!detail || typeof detail !== "object") return reject("Fresh pool details are unavailable.");
 
   const tvl = numberOrNull(detail.tvl ?? detail.active_tvl ?? detail.liquidity);
-  const volume = numberOrNull(detail.volume ?? detail.volume_window);
+  const activeTvl = numberOrNull(detail.active_tvl ?? detail.tvl ?? detail.liquidity);
+  const sourceVolumeKey = screening.timeframe ? `volume_${screening.timeframe}` : null;
+  const volume = numberOrNull(
+    (sourceVolumeKey ? detail[sourceVolumeKey] : null) ?? detail.volume ?? detail.volume_window,
+  );
   const feeActiveTvlRatio = numberOrNull(detail.fee_active_tvl_ratio);
   const observedVolatility = numberOrNull(volatility ?? detail.volatility);
   const binStep = numberOrNull(detail?.dlmm_params?.bin_step ?? detail?.pool_config?.bin_step);
@@ -265,9 +278,14 @@ export function evaluateFreshPoolRisk({
   const marketCap = numberOrNull(detail?.token_x?.market_cap ?? detail.base_token_market_cap);
   const baseOrganic = numberOrNull(detail?.token_x?.organic_score ?? detail.base_token_organic_score);
   const quoteOrganic = numberOrNull(detail?.token_y?.organic_score ?? detail.quote_token_organic_score);
+  const volumeActiveTvlRatio = activeTvl != null && activeTvl > 0 && volume != null
+    ? volume / activeTvl
+    : null;
   const metrics = {
     tvl,
+    activeTvl,
     volume,
+    volumeActiveTvlRatio,
     feeActiveTvlRatio,
     volatility: observedVolatility,
     binStep,
@@ -302,6 +320,17 @@ export function evaluateFreshPoolRisk({
   const minimumVolume = numberOrNull(screening.minVolume);
   if (minimumVolume != null && (volume == null || volume < minimumVolume)) {
     return reject(`Pool volume $${volume ?? "unknown"} is below configured minimum $${minimumVolume}.`, metrics);
+  }
+
+  const minimumVolumeActiveTvlRatio = numberOrNull(screening.minVolumeActiveTvlRatio);
+  if (
+    minimumVolumeActiveTvlRatio != null &&
+    (volumeActiveTvlRatio == null || volumeActiveTvlRatio < minimumVolumeActiveTvlRatio)
+  ) {
+    return reject(
+      `Pool volume/active-TVL ${volumeActiveTvlRatio == null ? "unknown" : volumeActiveTvlRatio.toFixed(4)} is below configured minimum ${minimumVolumeActiveTvlRatio}.`,
+      metrics,
+    );
   }
 
   const minimumFeeRatio = numberOrNull(screening.minFeeActiveTvlRatio);
@@ -494,7 +523,7 @@ export function buildRiskIntelligenceBrief({ performance = [], policy = {}, maxV
   lines.push(!circuit.pass
     ? `- CIRCUIT OPEN: ${circuit.reason}`
     : circuit.recoveryMode
-      ? `- RECOVERY MODE: ${circuit.reason} Next deploy is capped at ${(circuit.recoverySizePct * 100).toFixed(0)}% of normal size.`
+      ? `- LOSS-AWARE RE-ENTRY: ${circuit.reason} Next deploy is capped at ${(circuit.recoverySizePct * 100).toFixed(0)}% of normal size.`
       : `- CIRCUIT CLOSED: ${circuit.reason}`);
   lines.push("- Treat this history as risk context, not proof of future returns; backend gates remain authoritative.");
   return lines.join("\n");

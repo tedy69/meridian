@@ -48,6 +48,11 @@ function positiveNumberConfig(value, fallback) {
   return numeric != null && numeric > 0 ? numeric : fallback;
 }
 
+function nonNegativeNumberConfig(value, fallback) {
+  const numeric = numericConfig(value);
+  return numeric != null && numeric >= 0 ? numeric : fallback;
+}
+
 function fractionConfig(value, fallback) {
   const numeric = numericConfig(value);
   return numeric != null && numeric > 0 && numeric <= 1 ? numeric : fallback;
@@ -67,7 +72,7 @@ const strategyDefaultBinsBelow = Math.max(
 );
 
 export function buildRiskConfig(userConfig = {}) {
-  const legacyLossCircuitCooldownHours = positiveNumberConfig(
+  const legacyLossCircuitCooldownHours = nonNegativeNumberConfig(
     userConfig.lossCircuitCooldownHours,
     null,
   );
@@ -86,23 +91,80 @@ export function buildRiskConfig(userConfig = {}) {
     maxConsecutiveLosses: positiveIntegerConfig(userConfig.maxConsecutiveLosses, 3),
     maxRollingLossPct: numericConfig(userConfig.maxRollingLossPct) ?? 12,
     maxSingleLossPct: numericConfig(userConfig.maxSingleLossPct) ?? 12,
-    // Adaptive cooldowns reopen faster after smaller drawdowns while reserving
-    // the longest pause for one severe loss. The legacy flat value remains a
-    // compatibility fallback when an existing configuration explicitly sets it.
-    lossCircuitCooldownHours: legacyLossCircuitCooldownHours ?? 2,
-    lossCircuitStreakCooldownHours: positiveNumberConfig(
+    // A zero-hour pause keeps loss context and reduced recovery sizing without
+    // blocking the next high-quality setup. Existing explicit cooldown values
+    // remain supported for backwards compatibility.
+    lossCircuitCooldownHours: legacyLossCircuitCooldownHours ?? 0,
+    lossCircuitStreakCooldownHours: nonNegativeNumberConfig(
       userConfig.lossCircuitStreakCooldownHours,
-      legacyLossCircuitCooldownHours ?? 1,
+      legacyLossCircuitCooldownHours ?? 0,
     ),
-    lossCircuitRollingCooldownHours: positiveNumberConfig(
+    lossCircuitRollingCooldownHours: nonNegativeNumberConfig(
       userConfig.lossCircuitRollingCooldownHours,
-      legacyLossCircuitCooldownHours ?? 2,
+      legacyLossCircuitCooldownHours ?? 0,
     ),
-    lossCircuitSingleCooldownHours: positiveNumberConfig(
+    lossCircuitSingleCooldownHours: nonNegativeNumberConfig(
       userConfig.lossCircuitSingleCooldownHours,
-      legacyLossCircuitCooldownHours ?? 4,
+      legacyLossCircuitCooldownHours ?? 0,
     ),
     lossCircuitRecoverySizePct: fractionConfig(userConfig.lossCircuitRecoverySizePct, 0.5),
+  };
+}
+
+export function buildScreeningConfig(userConfig = {}) {
+  return {
+    excludeHighSupplyConcentration: userConfig.excludeHighSupplyConcentration ?? true,
+    // Calibrated against a 107-close production-ledger snapshot: below 0.15% fee/active-TVL,
+    // organic <70, and volume <2% of active TVL were weak cohorts. These remain
+    // deterministic pre-deploy gates rather than suggestions to the model.
+    minFeeActiveTvlRatio: userConfig.minFeeActiveTvlRatio ?? 0.15,
+    minVolumeActiveTvlRatio: userConfig.minVolumeActiveTvlRatio ?? 0.02,
+    minTvl: userConfig.minTvl ?? 10_000,
+    maxTvl: userConfig.maxTvl !== undefined ? userConfig.maxTvl : 150_000,
+    minVolume: userConfig.minVolume ?? 500,
+    minOrganic: userConfig.minOrganic ?? 70,
+    minQuoteOrganic: userConfig.minQuoteOrganic ?? 60,
+    minHolders: userConfig.minHolders ?? 500,
+    minMcap: userConfig.minMcap ?? 150_000,
+    maxMcap: userConfig.maxMcap ?? 10_000_000,
+    minBinStep: userConfig.minBinStep ?? 80,
+    maxBinStep: userConfig.maxBinStep ?? 125,
+    maxVolatility: userConfig.maxVolatility ?? 12,
+    timeframe: userConfig.timeframe ?? "5m",
+    category: userConfig.category ?? "trending",
+    minTokenFeesSol: userConfig.minTokenFeesSol ?? 30,
+    useDiscordSignals: userConfig.useDiscordSignals ?? false,
+    discordSignalMode: userConfig.discordSignalMode ?? "merge",
+    avoidPvpSymbols: userConfig.avoidPvpSymbols ?? true,
+    blockPvpSymbols: userConfig.blockPvpSymbols ?? false,
+    maxBotHoldersPct: userConfig.maxBotHoldersPct ?? 30,
+    maxTop10Pct: userConfig.maxTop10Pct ?? 60,
+    requireTokenAudit: userConfig.requireTokenAudit ?? true,
+    loneCandidateMinDegen: userConfig.loneCandidateMinDegen ?? 50,
+    allowedLaunchpads: userConfig.allowedLaunchpads ?? [],
+    blockedLaunchpads: userConfig.blockedLaunchpads ?? [],
+    minTokenAgeHours: userConfig.minTokenAgeHours ?? null,
+    maxTokenAgeHours: userConfig.maxTokenAgeHours ?? null,
+  };
+}
+
+export function buildIndicatorConfig(userConfig = {}) {
+  const indicators = userConfig.chartIndicators ?? {};
+  return {
+    enabled: indicators.enabled ?? true,
+    entryPreset: indicators.entryPreset ?? "momentum_quality",
+    exitPreset: indicators.exitPreset ?? "supertrend_break",
+    rsiLength: indicators.rsiLength ?? 7,
+    intervals: Array.isArray(indicators.intervals)
+      ? indicators.intervals
+      : ["5_MINUTE", "15_MINUTE"],
+    candles: indicators.candles ?? 298,
+    rsiOversold: indicators.rsiOversold ?? 30,
+    rsiOverbought: indicators.rsiOverbought ?? 80,
+    entryRsiMin: indicators.entryRsiMin ?? 45,
+    entryRsiMax: indicators.entryRsiMax ?? 72,
+    requireAllIntervals: indicators.requireAllIntervals ?? true,
+    entryFailClosed: indicators.entryFailClosed ?? true,
   };
 }
 
@@ -116,8 +178,6 @@ if (u.dryRun !== undefined) process.env.DRY_RUN ||= String(u.dryRun);
 if (u.publicApiKey) process.env.PUBLIC_API_KEY ||= u.publicApiKey;
 if (u.agentMeridianApiUrl) process.env.AGENT_MERIDIAN_API_URL ||= u.agentMeridianApiUrl;
 if (u.telegramChatId) process.env.TELEGRAM_CHAT_ID ||= String(u.telegramChatId);
-
-const indicatorUserConfig = u.chartIndicators ?? {};
 
 // Optional standalone GMGN config file (mirrors user-config layering)
 const GMGN_CONFIG_PATH = repoPath("gmgn-config.json");
@@ -142,38 +202,7 @@ export const config = {
   risk: buildRiskConfig(u),
 
   // ─── Pool Screening Thresholds ───────────
-  screening: {
-    excludeHighSupplyConcentration: u.excludeHighSupplyConcentration ?? true,
-    minFeeActiveTvlRatio: u.minFeeActiveTvlRatio ?? 0.05,
-    minTvl:            u.minTvl            ?? 10_000,
-    maxTvl:            u.maxTvl !== undefined ? u.maxTvl : 150_000,
-    minVolume:         u.minVolume         ?? 500,
-    minOrganic:        u.minOrganic        ?? 60,
-    minQuoteOrganic:   u.minQuoteOrganic   ?? 60,
-    minHolders:        u.minHolders        ?? 500,
-    minMcap:           u.minMcap           ?? 150_000,
-    maxMcap:           u.maxMcap           ?? 10_000_000,
-    minBinStep:        u.minBinStep        ?? 80,
-    maxBinStep:        u.maxBinStep        ?? 125,
-    // Historical tail losses concentrate above this 30m volatility level.
-    // Re-checked from fresh data immediately before every deploy.
-    maxVolatility:     u.maxVolatility     ?? 12,
-    timeframe:         u.timeframe         ?? "5m",
-    category:          u.category          ?? "trending",
-    minTokenFeesSol:   u.minTokenFeesSol   ?? 30,  // global fees paid (priority+jito tips). below = bundled/scam
-    useDiscordSignals: u.useDiscordSignals ?? false,
-    discordSignalMode: u.discordSignalMode ?? "merge", // merge | only
-    avoidPvpSymbols:   u.avoidPvpSymbols   ?? true, // avoid exact-symbol rivals with real active pools
-    blockPvpSymbols:   u.blockPvpSymbols   ?? false, // hard-filter PVP rivals before the LLM sees them
-    maxBotHoldersPct:  u.maxBotHoldersPct  ?? 30,  // max bot holder addresses % (Jupiter audit)
-    maxTop10Pct:       u.maxTop10Pct       ?? 60,  // max top 10 holders concentration
-    requireTokenAudit: u.requireTokenAudit ?? true, // fail closed when fees/top10/bot audit cannot be refreshed
-    loneCandidateMinDegen: u.loneCandidateMinDegen ?? 50, // degen score that lets a SOLO candidate deploy without a narrative
-    allowedLaunchpads: u.allowedLaunchpads ?? [],  // allow-list launchpads, [] = no allow-list
-    blockedLaunchpads:  u.blockedLaunchpads  ?? [],  // e.g. ["letsbonk.fun", "pump.fun"]
-    minTokenAgeHours:   u.minTokenAgeHours   ?? null, // null = no minimum
-    maxTokenAgeHours:   u.maxTokenAgeHours   ?? null, // null = no maximum
-  },
+  screening: buildScreeningConfig(u),
 
   // ─── Position Management ────────────────
   management: {
@@ -296,6 +325,9 @@ export const config = {
   opportunity: {
     enabled: u.opportunityPollEnabled ?? true,
     pollIntervalSec: Number(u.opportunityPollIntervalSec ?? 45),
+    // This is only a model/API debounce, not a loss cooldown. A candidate can
+    // be reconsidered quickly while duplicate concurrent decisions stay blocked.
+    decisionMinIntervalSec: Number(u.opportunityDecisionMinIntervalSec ?? 90),
     limit: Number(u.opportunityPollLimit ?? 10),
     // Pre-gate: only trigger the full deploy decision when the best candidate's
     // Degen Score (0..100) clears this bar — avoids running screening every 45s.
@@ -339,19 +371,7 @@ export const config = {
     allowAgentConfigMutation: u.allowAgentConfigMutation === true,
   },
 
-  indicators: {
-    enabled: indicatorUserConfig.enabled ?? false,
-    entryPreset: indicatorUserConfig.entryPreset ?? "supertrend_break",
-    exitPreset: indicatorUserConfig.exitPreset ?? "supertrend_break",
-    rsiLength: indicatorUserConfig.rsiLength ?? 2,
-    intervals: Array.isArray(indicatorUserConfig.intervals)
-      ? indicatorUserConfig.intervals
-      : ["5_MINUTE"],
-    candles: indicatorUserConfig.candles ?? 298,
-    rsiOversold: indicatorUserConfig.rsiOversold ?? 30,
-    rsiOverbought: indicatorUserConfig.rsiOverbought ?? 80,
-    requireAllIntervals: indicatorUserConfig.requireAllIntervals ?? false,
-  },
+  indicators: buildIndicatorConfig(u),
 };
 
 /**
@@ -483,6 +503,7 @@ export function reloadScreeningThresholds() {
     if (fresh.minTvl         != null) s.minTvl         = fresh.minTvl;
     if (fresh.maxTvl         !== undefined) s.maxTvl   = fresh.maxTvl;
     if (fresh.minVolume      != null) s.minVolume      = fresh.minVolume;
+    if (fresh.minVolumeActiveTvlRatio != null) s.minVolumeActiveTvlRatio = fresh.minVolumeActiveTvlRatio;
     if (fresh.minBinStep     != null) s.minBinStep     = fresh.minBinStep;
     if (fresh.maxBinStep     != null) s.maxBinStep     = fresh.maxBinStep;
     if (fresh.maxVolatility  != null) s.maxVolatility  = fresh.maxVolatility;

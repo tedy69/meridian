@@ -651,9 +651,11 @@ export async function getTopCandidates({ limit = 10 } = {}) {
             pool: pool.pool,
             confirmation: {
               enabled: true,
-              confirmed: true,
+              confirmed: config.indicators.entryFailClosed === false,
               skipped: true,
-              reason: `Indicator confirmation unavailable: ${error.message}`,
+              reason: config.indicators.entryFailClosed === false
+                ? `Indicator confirmation unavailable; optional fallback: ${error.message}`
+                : `Indicator confirmation unavailable; refusing entry: ${error.message}`,
               intervals: [],
             },
           };
@@ -665,7 +667,10 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     const confirmedEligible = eligible.filter((pool) => {
       const confirmation = confirmationByPool.get(pool.pool);
       pool.indicator_confirmation = confirmation || null;
-      if (!confirmation || confirmation.confirmed) return true;
+      if (
+        confirmation?.confirmed === true &&
+        !(config.indicators.entryFailClosed !== false && confirmation.skipped === true)
+      ) return true;
       pushFilteredReason(filteredOut, pool, `indicator reject: ${confirmation.reason}`);
       log("screening", `Indicator rejected ${pool.name} (${pool.pool.slice(0, 8)}): ${confirmation.reason}`);
       return false;
