@@ -28,3 +28,13 @@ test("new configurations default to a three percent take-profit target", () => {
     /takeProfitPct:\s*u\.takeProfitPct\s*\?\?\s*u\.takeProfitFeePct\s*\?\?\s*3,/,
   );
 });
+
+test("spot screening trusts finalized RPC SOL instead of the indexed wallet API", () => {
+  const source = fs.readFileSync(new URL("../index.js", import.meta.url), "utf8");
+  const start = source.indexOf("async function runSpotScreeningCycle");
+  const end = source.indexOf("\nexport async function runManagementCycle", start);
+  const cycle = source.slice(start, end > start ? end : undefined);
+
+  assert.match(cycle, /getTokenBalanceByMint\(SOL_MINT\)/);
+  assert.doesNotMatch(cycle, /getWalletBalances\(\)/);
+});

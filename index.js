@@ -7,7 +7,7 @@ import { Connection } from "@solana/web3.js";
 import { agentLoop } from "./agent.js";
 import { log } from "./logger.js";
 import { getMyPositions, getActiveBin } from "./tools/dlmm.js";
-import { getWalletBalances } from "./tools/wallet.js";
+import { getTokenBalanceByMint, getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates, degenScore } from "./tools/screening.js";
 import {
   config,
@@ -43,7 +43,7 @@ import { stageSignals } from "./signal-tracker.js";
 import { getWeightsSummary } from "./signal-weights.js";
 import { bootstrapHiveMind, ensureAgentId, getHiveMindPullMode, isHiveMindEnabled, pullHiveMindLessons, pullHiveMindPresets, registerHiveMindAgent, startHiveMindBackgroundSync } from "./hivemind.js";
 import { appendDecision } from "./decision-log.js";
-import { assertMainnetRpc } from "./execution-guard.js";
+import { assertMainnetRpc, SOL_MINT } from "./execution-guard.js";
 import { executeClaimAll, formatClaimAllOutcome, formatClaimAllPreflight, prepareClaimAll } from "./claim-all.js";
 import { revalidateTrailingProfitFloor } from "./trailing-safety.js";
 import { revalidateStopLossExecution, selectExitConfirmationTicks } from "./stop-loss-safety.js";
@@ -471,16 +471,16 @@ async function runSpotScreeningCycle({ silent = false } = {}) {
 
     const [legacyPositions, balance] = await Promise.all([
       getMyPositions({ force: true, silent: true }),
-      getWalletBalances(),
+      process.env.DRY_RUN === "true"
+        ? Promise.resolve(null)
+        : getTokenBalanceByMint(SOL_MINT),
     ]);
     if ((legacyPositions?.total_positions ?? legacyPositions?.positions?.length ?? 0) > 0) {
       report = "Spot scan skipped — an LP position is still open; mixed exposure is blocked.";
       return report;
     }
-    if (process.env.DRY_RUN !== "true" && (balance?.error || Number(balance?.sol) < config.spot.minWalletSol)) {
-      report = balance?.error
-        ? `Spot scan skipped — wallet balance is not trustworthy: ${balance.error}.`
-        : `Spot scan skipped — ${Number(balance?.sol || 0).toFixed(6)} SOL available; ${config.spot.minWalletSol} SOL required.`;
+    if (process.env.DRY_RUN !== "true" && Number(balance?.amount) < config.spot.minWalletSol) {
+      report = `Spot scan skipped — ${Number(balance?.amount || 0).toFixed(6)} finalized SOL available; ${config.spot.minWalletSol} SOL required.`;
       return report;
     }
 
