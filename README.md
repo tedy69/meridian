@@ -501,11 +501,13 @@ All fields are optional — defaults shown. Edit `user-config.json`.
 | `maxMcap` | `10000000` | Maximum market cap (USD) |
 | `minBinStep` | `80` | Minimum bin step |
 | `maxBinStep` | `125` | Maximum bin step |
+| `maxVolatility` | `12` | Maximum 30-minute volatility accepted; checked again immediately before deploy |
 | `timeframe` | `5m` | Candle timeframe for screening |
 | `category` | `trending` | Pool category filter |
 | `minTokenFeesSol` | `30` | Minimum all-time fees in SOL |
 | `maxBotHoldersPct` | `30` | Maximum bot holder % (Jupiter audit) |
 | `maxTop10Pct` | `60` | Maximum top-10 holder concentration |
+| `requireTokenAudit` | `true` | Fail closed if fresh fees/top-10/bot-holder audit is unavailable |
 | `blockedLaunchpads` | `[]` | Launchpad names to never deploy into |
 
 ### Management
@@ -517,6 +519,12 @@ All fields are optional — defaults shown. Edit `user-config.json`.
 | `maxPositions` | `1` | Maximum simultaneously open positions |
 | `maxDeployAmount` | `0.5` | Maximum SOL cap per position; set `null` to disable this ceiling |
 | `maxDailyDeploySol` | `0.5` | Maximum deploy attempts per UTC day; set `null` to disable this aggregate cap. Uncertain attempts remain counted when enabled. |
+| `lossCircuitBreakerEnabled` | `true` | Pause new positions after realized loss limits trigger |
+| `lossCircuitWindowPositions` | `5` | Closed positions included in the rolling-loss window |
+| `maxConsecutiveLosses` | `3` | Consecutive realized losses allowed before pausing |
+| `maxRollingLossPct` | `12` | Maximum summed loss percentage in the rolling window |
+| `maxSingleLossPct` | `12` | Single-position realized loss magnitude that triggers a pause |
+| `lossCircuitCooldownHours` | `12` | Pause duration after the latest loss trigger |
 | `gasReserve` | `0.2` | Minimum SOL to keep for gas |
 | `minSolToOpen` | `0.55` | Minimum wallet SOL before opening |
 | `outOfRangeWaitMinutes` | `30` | Minutes OOR before acting |
@@ -531,6 +539,8 @@ All fields are optional — defaults shown. Edit `user-config.json`.
 | `strategy` | `bid_ask` | LP strategy: `spot`, `bid_ask`, or `curve` |
 
 `stopLossTriggerPct` must stay above `stopLossPct` (for example, `-8` and `-15`). This reduces execution overshoot, but a direct on-chain close cannot mathematically guarantee the final PnL during a sudden market move. The fast PnL watchdog keeps sampling while other workflows are busy and defers only transaction submission until the transaction lane is free. A negative settled stop-loss starts the pool/token cooldown so the bot does not immediately re-enter the same collapsing asset. When the LP relay is enabled and returns a valid zap-out order, Meridian uses the relay's configured minimum-output slippage bound before any local fallback.
+
+Before every deploy, Meridian also re-fetches pool fundamentals and token audit data. The realized-loss circuit breaker runs before those remote checks and cannot be overridden by the screener model. Its percentages are positive loss magnitudes (for example, `12` means a `-12%` limit).
 
 ### Schedule
 
@@ -651,6 +661,7 @@ prompt.js           System prompt builder (SCREENER / MANAGER / GENERAL roles)
 state.js            Position registry (state.json)
 decision-log.js     Structured decision log for deploy, close, skip, and no-deploy rationale
 lessons.js          Learning engine: records performance, derives lessons, evolves thresholds
+risk-intelligence.js Realized-loss circuit breaker, fresh pool/token gates, AI risk brief
 pool-memory.js      Per-pool deploy history + snapshots
 strategy-library.js Saved LP strategies
 telegram.js         Telegram bot: polling + notifications

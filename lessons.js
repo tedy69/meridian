@@ -10,6 +10,7 @@ import fs from "fs";
 import { log } from "./logger.js";
 import { getSharedLessonsForPrompt, pushHiveLesson, pushHivePerformanceEvent } from "./hivemind.js";
 import { repoPath } from "./repo-root.js";
+import { parsePerformanceLedger } from "./risk-intelligence.js";
 
 const USER_CONFIG_PATH = repoPath("user-config.json");
 
@@ -723,6 +724,15 @@ export function getPerformanceHistory({ hours = 24, limit = 50 } = {}) {
     win_rate_pct: filtered.length > 0 ? Math.round((wins / filtered.length) * 100) : null,
     positions: filtered,
   };
+}
+
+/**
+ * Return the full local performance ledger for deterministic risk controls.
+ * Callers receive copies so they cannot mutate the stored representation.
+ */
+export function getAllPerformanceRecords() {
+  if (!fs.existsSync(LESSONS_FILE)) return [];
+  return parsePerformanceLedger(fs.readFileSync(LESSONS_FILE, "utf8"));
 }
 
 /**

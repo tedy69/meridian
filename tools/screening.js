@@ -5,6 +5,7 @@ import { log } from "../logger.js";
 import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
 import { confirmIndicatorPreset } from "./chart-indicators.js";
 import { getAgentMeridianBase, getAgentMeridianHeaders } from "./agent-meridian.js";
+import { evaluateFreshPoolRisk } from "../risk-intelligence.js";
 
 const DATAPI_JUP = "https://datapi.jup.ag/v1";
 
@@ -132,48 +133,14 @@ function getVolatilityTimeframe(sourceTimeframe) {
 }
 
 function getRawPoolScreeningRejectReason(pool, s) {
-  const base = pool?.token_x || {};
-  const quote = pool?.token_y || {};
-  const binStep = numeric(pool?.dlmm_params?.bin_step);
-  const tvl = numeric(pool?.tvl ?? pool?.active_tvl);
-  const feeActiveTvlRatio = numeric(pool?.fee_active_tvl_ratio);
-  const volatility = numeric(pool?.volatility);
-  const volume = numeric(pool?.volume);
-  const holders = numeric(pool?.base_token_holders);
-  const mcap = numeric(base?.market_cap);
-  const baseOrganic = numeric(base?.organic_score);
-  const quoteOrganic = numeric(quote?.organic_score);
   const launchpad = getPoolLaunchpad(pool);
-  const createdAt = numeric(base?.created_at);
-
-  if (s.excludeHighSupplyConcentration && pool?.base_token_has_high_supply_concentration === true) {
-    return "base token has high supply concentration";
-  }
-  if (pool?.base_token_has_critical_warnings === true) return "base token has critical warnings";
-  if (pool?.quote_token_has_critical_warnings === true) return "quote token has critical warnings";
-  if (pool?.base_token_has_high_single_ownership === true) return "base token has high single ownership";
-  if (pool?.pool_type && pool.pool_type !== "dlmm") return `pool_type ${pool.pool_type} is not dlmm`;
-
-  if (mcap == null || mcap < s.minMcap) return `mcap ${mcap ?? "unknown"} below minMcap ${s.minMcap}`;
-  if (mcap > s.maxMcap) return `mcap ${mcap} above maxMcap ${s.maxMcap}`;
-  if (holders == null || holders < s.minHolders) return `holders ${holders ?? "unknown"} below minHolders ${s.minHolders}`;
-  if (volume == null || volume < s.minVolume) return `volume ${volume ?? "unknown"} below minVolume ${s.minVolume}`;
-  if (tvl == null || tvl < s.minTvl) return `TVL ${tvl ?? "unknown"} below minTvl ${s.minTvl}`;
-  if (s.maxTvl != null && tvl > s.maxTvl) return `TVL ${tvl} above maxTvl ${s.maxTvl}`;
-  if (binStep == null || binStep < s.minBinStep) return `bin_step ${binStep ?? "unknown"} below minBinStep ${s.minBinStep}`;
-  if (binStep > s.maxBinStep) return `bin_step ${binStep} above maxBinStep ${s.maxBinStep}`;
-  if (feeActiveTvlRatio == null || feeActiveTvlRatio < s.minFeeActiveTvlRatio) {
-    return `fee/active-TVL ${feeActiveTvlRatio ?? "unknown"} below minFeeActiveTvlRatio ${s.minFeeActiveTvlRatio}`;
-  }
-  if (!isUsableVolatility(volatility)) {
-    return `volatility ${volatility ?? "unknown"} is unusable`;
-  }
-  if (baseOrganic == null || baseOrganic < s.minOrganic) {
-    return `base organic ${baseOrganic ?? "unknown"} below minOrganic ${s.minOrganic}`;
-  }
-  if (quoteOrganic == null || quoteOrganic < s.minQuoteOrganic) {
-    return `quote organic ${quoteOrganic ?? "unknown"} below minQuoteOrganic ${s.minQuoteOrganic}`;
-  }
+  const poolRisk = evaluateFreshPoolRisk({
+    detail: pool,
+    volatility: pool?.volatility,
+    volatilityTimeframe: pool?.volatility_timeframe || getVolatilityTimeframe(s.timeframe),
+    screening: s,
+  });
+  if (!poolRisk.pass) return poolRisk.reason;
   if (
     pool?.discord_signal &&
     Array.isArray(s.allowedLaunchpads) &&
@@ -185,14 +152,6 @@ function getRawPoolScreeningRejectReason(pool, s) {
   }
   if (includesCaseInsensitive(s.blockedLaunchpads, launchpad)) {
     return `blocked launchpad (${launchpad})`;
-  }
-  if (s.minTokenAgeHours != null) {
-    const maxCreatedAt = Date.now() - s.minTokenAgeHours * 3_600_000;
-    if (createdAt == null || createdAt > maxCreatedAt) return `token age below minTokenAgeHours ${s.minTokenAgeHours}`;
-  }
-  if (s.maxTokenAgeHours != null) {
-    const minCreatedAt = Date.now() - s.maxTokenAgeHours * 3_600_000;
-    if (createdAt == null || createdAt < minCreatedAt) return `token age above maxTokenAgeHours ${s.maxTokenAgeHours}`;
   }
   return null;
 }

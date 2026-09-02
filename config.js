@@ -97,6 +97,14 @@ export const config = {
     // `null` deliberately disables the aggregate daily deploy cap. An absent
     // value retains the conservative default.
     maxDailyDeploySol: u.maxDailyDeploySol === null ? null : (u.maxDailyDeploySol ?? 0.5),
+    // Realized-loss circuit breaker. Values are positive loss magnitudes.
+    // This gate is deterministic and cannot be overridden by an LLM decision.
+    lossCircuitBreakerEnabled: u.lossCircuitBreakerEnabled ?? true,
+    lossCircuitWindowPositions: positiveIntegerConfig(u.lossCircuitWindowPositions, 5),
+    maxConsecutiveLosses: positiveIntegerConfig(u.maxConsecutiveLosses, 3),
+    maxRollingLossPct: numericConfig(u.maxRollingLossPct) ?? 12,
+    maxSingleLossPct: numericConfig(u.maxSingleLossPct) ?? 12,
+    lossCircuitCooldownHours: numericConfig(u.lossCircuitCooldownHours) ?? 12,
   },
 
   // ─── Pool Screening Thresholds ───────────
@@ -113,6 +121,9 @@ export const config = {
     maxMcap:           u.maxMcap           ?? 10_000_000,
     minBinStep:        u.minBinStep        ?? 80,
     maxBinStep:        u.maxBinStep        ?? 125,
+    // Historical tail losses concentrate above this 30m volatility level.
+    // Re-checked from fresh data immediately before every deploy.
+    maxVolatility:     u.maxVolatility     ?? 12,
     timeframe:         u.timeframe         ?? "5m",
     category:          u.category          ?? "trending",
     minTokenFeesSol:   u.minTokenFeesSol   ?? 30,  // global fees paid (priority+jito tips). below = bundled/scam
@@ -122,6 +133,7 @@ export const config = {
     blockPvpSymbols:   u.blockPvpSymbols   ?? false, // hard-filter PVP rivals before the LLM sees them
     maxBotHoldersPct:  u.maxBotHoldersPct  ?? 30,  // max bot holder addresses % (Jupiter audit)
     maxTop10Pct:       u.maxTop10Pct       ?? 60,  // max top 10 holders concentration
+    requireTokenAudit: u.requireTokenAudit ?? true, // fail closed when fees/top10/bot audit cannot be refreshed
     loneCandidateMinDegen: u.loneCandidateMinDegen ?? 50, // degen score that lets a SOLO candidate deploy without a narrative
     allowedLaunchpads: u.allowedLaunchpads ?? [],  // allow-list launchpads, [] = no allow-list
     blockedLaunchpads:  u.blockedLaunchpads  ?? [],  // e.g. ["letsbonk.fun", "pump.fun"]
@@ -397,6 +409,7 @@ export function reloadScreeningThresholds() {
     if (fresh.minVolume      != null) s.minVolume      = fresh.minVolume;
     if (fresh.minBinStep     != null) s.minBinStep     = fresh.minBinStep;
     if (fresh.maxBinStep     != null) s.maxBinStep     = fresh.maxBinStep;
+    if (fresh.maxVolatility  != null) s.maxVolatility  = fresh.maxVolatility;
     if (fresh.timeframe         != null) s.timeframe         = fresh.timeframe;
     if (fresh.category          != null) s.category          = fresh.category;
     if (fresh.minTokenAgeHours  !== undefined) s.minTokenAgeHours = fresh.minTokenAgeHours;
@@ -404,6 +417,7 @@ export function reloadScreeningThresholds() {
     if (fresh.avoidPvpSymbols   !== undefined) s.avoidPvpSymbols = fresh.avoidPvpSymbols;
     if (fresh.blockPvpSymbols   !== undefined) s.blockPvpSymbols = fresh.blockPvpSymbols;
     if (fresh.maxBotHoldersPct  != null) s.maxBotHoldersPct = fresh.maxBotHoldersPct;
+    if (fresh.requireTokenAudit !== undefined) s.requireTokenAudit = fresh.requireTokenAudit;
     if (fresh.allowedLaunchpads !== undefined) s.allowedLaunchpads = fresh.allowedLaunchpads;
     if (fresh.blockedLaunchpads !== undefined) s.blockedLaunchpads = fresh.blockedLaunchpads;
     const minBinsBelow = numericConfig(fresh.minBinsBelow) ?? config.strategy.minBinsBelow;

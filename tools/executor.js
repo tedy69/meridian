@@ -11,7 +11,7 @@ import {
 } from "./dlmm.js";
 import { getTokenBalanceByMint, getWalletBalances, normalizeMint, swapToken } from "./wallet.js";
 import { studyTopLPers } from "./study.js";
-import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
+import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getAllPerformanceRecords, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
 import {
   completePendingAutoSwap,
   getPendingAutoSwaps,
@@ -32,6 +32,7 @@ import fs from "fs";
 import { execSync, spawn } from "child_process";
 import { REPO_ROOT, repoPath } from "../repo-root.js";
 import { normalizeTimeframe, scaleScreeningToTimeframe } from "../screening-scales.js";
+import { evaluateFreshPoolRisk, evaluateLossCircuitBreaker, evaluateTokenAuditRisk } from "../risk-intelligence.js";
 import {
   assertAutonomousSwapAllowed,
   assertLiveTradingEnabled,
@@ -59,32 +60,11 @@ const TIMEFRAME_MINUTES = {
 import { log, logAction } from "../logger.js";
 import { notifyAutoSwapPending, notifyDeploy, notifyClose, notifySwap } from "../telegram.js";
 
-function numberOrNull(value) {
-  const n = Number(value);
-  return Number.isFinite(n) ? n : null;
-}
-
 function getVolatilityTimeframe(sourceTimeframe) {
   const source = String(sourceTimeframe || "").trim();
   const sourceMinutes = TIMEFRAME_MINUTES[source];
   const minMinutes = TIMEFRAME_MINUTES[MIN_VOLATILITY_TIMEFRAME];
   return sourceMinutes != null && sourceMinutes >= minMinutes ? source : MIN_VOLATILITY_TIMEFRAME;
-}
-
-function poolDetailTvl(pool) {
-  return numberOrNull(pool?.tvl ?? pool?.active_tvl ?? pool?.liquidity);
-}
-
-function poolDetailBinStep(pool) {
-  return numberOrNull(pool?.dlmm_params?.bin_step ?? pool?.pool_config?.bin_step);
-}
-
-function poolDetailFeeActiveTvlRatio(pool) {
-  return numberOrNull(pool?.fee_active_tvl_ratio);
-}
-
-function poolDetailVolatility(pool) {
-  return numberOrNull(pool?.volatility);
 }
 
 async function fetchFreshPoolDetail(poolAddress, timeframe = config.screening.timeframe || "5m") {
@@ -97,10 +77,15 @@ async function fetchFreshPoolDetail(poolAddress, timeframe = config.screening.ti
   return (data?.data || [])[0] ?? null;
 }
 
-async function validateDeployPoolThresholds(args) {
+export async function validateDeployPoolThresholds(args, {
+  screening = config.screening,
+  fetchPoolDetail = fetchFreshPoolDetail,
+  fetchTokenInfo = getTokenInfo,
+} = {}) {
+  const sourceTimeframe = screening.timeframe || "5m";
   let detail;
   try {
-    detail = await fetchFreshPoolDetail(args.pool_address);
+    detail = await fetchPoolDetail(args.pool_address, sourceTimeframe);
     if (!detail) throw new Error(`Pool ${args.pool_address} not found`);
   } catch (error) {
     return {
@@ -109,46 +94,12 @@ async function validateDeployPoolThresholds(args) {
     };
   }
 
-  const tvl = poolDetailTvl(detail);
-  const minTvl = numberOrNull(config.screening.minTvl);
-  const maxTvl = numberOrNull(config.screening.maxTvl);
-  if (tvl == null) {
-    return {
-      pass: false,
-      reason: "Could not verify pool TVL before deploy.",
-    };
-  }
-  if (minTvl != null && minTvl > 0 && tvl < minTvl) {
-    return {
-      pass: false,
-      reason: `Pool TVL $${tvl} is below configured minTvl $${minTvl}.`,
-    };
-  }
-  if (maxTvl != null && maxTvl > 0 && tvl > maxTvl) {
-    return {
-      pass: false,
-      reason: `Pool TVL $${tvl} is above configured maxTvl $${maxTvl}.`,
-    };
-  }
-
-  const feeActiveTvlRatio = poolDetailFeeActiveTvlRatio(detail);
-  const minFeeActiveTvlRatio = numberOrNull(config.screening.minFeeActiveTvlRatio);
-  if (
-    minFeeActiveTvlRatio != null &&
-    minFeeActiveTvlRatio > 0 &&
-    (feeActiveTvlRatio == null || feeActiveTvlRatio < minFeeActiveTvlRatio)
-  ) {
-    return {
-      pass: false,
-      reason: `Pool fee/active-TVL ${feeActiveTvlRatio ?? "unknown"}% is below configured minFeeActiveTvlRatio ${minFeeActiveTvlRatio}%.`,
-    };
-  }
-
-  const volatilityTimeframe = getVolatilityTimeframe(config.screening.timeframe || "5m");
+  const volatilityTimeframe = getVolatilityTimeframe(sourceTimeframe);
   let volatilityDetail = detail;
-  if ((config.screening.timeframe || "5m") !== volatilityTimeframe) {
+  if (sourceTimeframe !== volatilityTimeframe) {
     try {
-      volatilityDetail = await fetchFreshPoolDetail(args.pool_address, volatilityTimeframe);
+      volatilityDetail = await fetchPoolDetail(args.pool_address, volatilityTimeframe);
+      if (!volatilityDetail) throw new Error(`Pool ${args.pool_address} not found`);
     } catch (error) {
       return {
         pass: false,
@@ -157,39 +108,41 @@ async function validateDeployPoolThresholds(args) {
     }
   }
 
-  const volatility = poolDetailVolatility(volatilityDetail);
-  if (volatility == null || volatility <= 0) {
-    return {
-      pass: false,
-      reason: `Pool ${volatilityTimeframe} volatility ${volatility ?? "unknown"} is unusable. Refusing deploy.`,
-    };
+  const poolRisk = evaluateFreshPoolRisk({
+    detail,
+    volatility: volatilityDetail?.volatility,
+    volatilityTimeframe,
+    screening,
+  });
+  if (!poolRisk.pass) return poolRisk;
+
+  if (!poolRisk.baseMint && (screening.requireTokenAudit ?? true)) {
+    return { pass: false, reason: "Could not identify the base mint for fresh token audit." };
   }
 
-  const actualBinStep = poolDetailBinStep(detail);
-  const minStep = numberOrNull(config.screening.minBinStep);
-  const maxStep = numberOrNull(config.screening.maxBinStep);
-  if (actualBinStep != null && minStep != null && actualBinStep < minStep) {
-    return {
-      pass: false,
-      reason: `Pool bin_step ${actualBinStep} is below configured minBinStep ${minStep}.`,
-    };
+  let tokenInfo = null;
+  if (poolRisk.baseMint) {
+    try {
+      const tokenResult = await fetchTokenInfo({ query: poolRisk.baseMint });
+      tokenInfo = tokenResult?.results?.[0] ?? null;
+    } catch (error) {
+      return {
+        pass: false,
+        reason: `Could not refresh token audit before deploy: ${error.message}`,
+      };
+    }
   }
-  if (actualBinStep != null && maxStep != null && actualBinStep > maxStep) {
-    return {
-      pass: false,
-      reason: `Pool bin_step ${actualBinStep} is above configured maxBinStep ${maxStep}.`,
-    };
-  }
+  const tokenAudit = evaluateTokenAuditRisk(tokenInfo, screening, { expectedMint: poolRisk.baseMint });
+  if (!tokenAudit.pass) return tokenAudit;
 
-  const baseMint = detail?.token_x?.address || detail?.base_token_address || null;
-  const entryMarketData = {
-    entry_mcap: numberOrNull(detail?.token_x?.market_cap ?? detail?.base_token_market_cap),
-    entry_tvl: tvl,
-    entry_volume: numberOrNull(detail?.volume),
-    entry_holders: numberOrNull(detail?.base_token_holders ?? detail?.token_x?.holders),
+  return {
+    pass: true,
+    entryMarketData: poolRisk.entryMarketData,
+    riskMetrics: {
+      pool: poolRisk.metrics,
+      tokenAudit: tokenAudit.metrics,
+    },
   };
-
-  return { pass: true, entryMarketData };
 }
 
 // Registered by index.js so update_config can restart cron jobs when intervals change
@@ -1068,6 +1021,26 @@ export async function runSafetyChecks(name, args) {
         return {
           pass: false,
           reason: error.message,
+        };
+      }
+      let lossCircuit;
+      try {
+        lossCircuit = evaluateLossCircuitBreaker({
+          performance: getAllPerformanceRecords(),
+          policy: config.risk,
+        });
+      } catch (error) {
+        return {
+          pass: false,
+          reason: `Cannot verify realized-loss circuit breaker: ${error.message}`,
+        };
+      }
+      if (!lossCircuit.pass) {
+        return {
+          pass: false,
+          reason: `Realized-loss circuit breaker: ${lossCircuit.reason}`,
+          blocked_until: lossCircuit.blockedUntil,
+          trigger: lossCircuit.trigger,
         };
       }
       const poolThresholds = await validateDeployPoolThresholds(args);

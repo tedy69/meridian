@@ -10,7 +10,7 @@ import { getMyPositions, getActiveBin } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates, degenScore } from "./tools/screening.js";
 import { config, reloadScreeningThresholds, computeDeployAmount, formatSolAmount, getAutoDeploySizing } from "./config.js";
-import { evolveThresholds, getPerformanceSummary } from "./lessons.js";
+import { evolveThresholds, getAllPerformanceRecords, getPerformanceSummary } from "./lessons.js";
 import { drainPendingAutoSwaps, executeTool, registerCronRestarter } from "./tools/executor.js";
 import {
   startPolling,
@@ -41,6 +41,7 @@ import { revalidateTrailingProfitFloor } from "./trailing-safety.js";
 import { revalidateStopLossExecution, selectExitConfirmationTicks } from "./stop-loss-safety.js";
 import { getPnlWatchdogGate } from "./pnl-watchdog-safety.js";
 import { formatNetPnlPercent } from "./position-performance.js";
+import { buildRiskIntelligenceBrief, evaluateLossCircuitBreaker, evaluateTokenAuditRisk } from "./risk-intelligence.js";
 
 import { REPO_ROOT, repoPath } from "./repo-root.js";
 
@@ -456,6 +457,43 @@ export async function runScreeningCycle({ silent = false } = {}) {
   _screeningBusy = true; // set immediately — prevents TOCTOU race with concurrent callers
   _screeningLastTriggered = Date.now();
 
+  let performanceHistory;
+  try {
+    performanceHistory = getAllPerformanceRecords();
+  } catch (error) {
+    const reason = `Cannot verify realized-loss circuit breaker: ${error.message}`;
+    log("risk", `Screening skipped — ${reason}`);
+    appendDecision({
+      type: "skip",
+      actor: "SCREENER",
+      summary: "Screening paused because risk history is unreadable",
+      reason,
+    });
+    _screeningBusy = false;
+    return `Screening skipped — ${reason}`;
+  }
+  const lossCircuit = evaluateLossCircuitBreaker({
+    performance: performanceHistory,
+    policy: config.risk,
+  });
+  const riskIntelligenceBrief = buildRiskIntelligenceBrief({
+    performance: performanceHistory,
+    policy: config.risk,
+    maxVolatility: config.screening.maxVolatility,
+  });
+  if (!lossCircuit.pass) {
+    const reason = `Realized-loss circuit breaker: ${lossCircuit.reason}`;
+    log("risk", `Screening skipped — ${reason}`);
+    appendDecision({
+      type: "skip",
+      actor: "SCREENER",
+      summary: "Screening paused by loss circuit breaker",
+      reason,
+    });
+    _screeningBusy = false;
+    return `Screening skipped — ${reason}`;
+  }
+
   // Hard guards — don't even run the agent if preconditions aren't met
   let prePositions, preBalance, preDeploySizing;
   let liveMessage = null;
@@ -534,25 +572,16 @@ export async function runScreeningCycle({ silent = false } = {}) {
       await new Promise(r => setTimeout(r, 150)); // avoid 429s
     }
 
-    // Hard filters after token recon — block launchpads and excessive Jupiter bot holders
+    // Hard token-audit filters after recon. Missing audit data fails closed, and
+    // the LLM never gets to override global-fee or holder-concentration limits.
     const filteredOut = [];
     const passing = allCandidates.filter(({ pool, ti }) => {
-      const launchpad = ti?.launchpad ?? null;
-      if (launchpad && config.screening.allowedLaunchpads?.length > 0 && !config.screening.allowedLaunchpads.includes(launchpad)) {
-        log("screening", `Skipping ${pool.name} — launchpad ${launchpad} not in allow-list`);
-        filteredOut.push({ name: pool.name, reason: `launchpad ${launchpad} not in allow-list` });
-        return false;
-      }
-      if (launchpad && config.screening.blockedLaunchpads.includes(launchpad)) {
-        log("screening", `Skipping ${pool.name} — blocked launchpad (${launchpad})`);
-        filteredOut.push({ name: pool.name, reason: `blocked launchpad (${launchpad})` });
-        return false;
-      }
-      const botPct = ti?.audit?.bot_holders_pct;
-      const maxBotHoldersPct = config.screening.maxBotHoldersPct;
-      if (botPct != null && maxBotHoldersPct != null && botPct > maxBotHoldersPct) {
-        log("screening", `Bot-holder filter: dropped ${pool.name} — bots ${botPct}% > ${maxBotHoldersPct}%`);
-        filteredOut.push({ name: pool.name, reason: `bot holders ${botPct}% > ${maxBotHoldersPct}%` });
+      const auditRisk = evaluateTokenAuditRisk(ti, config.screening, {
+        expectedMint: pool.base?.mint ?? null,
+      });
+      if (!auditRisk.pass) {
+        log("screening", `Token-audit filter: dropped ${pool.name} — ${auditRisk.reason}`);
+        filteredOut.push({ name: pool.name, reason: auditRisk.reason });
         return false;
       }
       return true;
@@ -565,7 +594,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
         .join("\n");
       screenReport = combinedExamples
         ? `No candidates available.\nFiltered examples:\n${combinedExamples}`
-        : `No candidates available (all filtered by launchpad / holder-quality rules).`;
+        : `No candidates available (all filtered by deterministic risk and token-audit rules).`;
       appendDecision({
         type: "no_deploy",
         actor: "SCREENER",
@@ -665,12 +694,14 @@ SCREENING CYCLE
 ${strategyBlock}
 Positions: ${prePositions.total_positions}/${config.risk.maxPositions} | SOL: ${currentBalance.sol.toFixed(3)} | Deploy: ${deployAmount} SOL
 
+${riskIntelligenceBrief}
+
 PRE-LOADED CANDIDATES (${passing.length} pools):
 ${candidateBlocks.join("\n\n")}
 
 STEPS:
 1. Decide if any candidate is actually worth deploying. One surviving candidate is not automatically good enough.
-2. Pick the best candidate based on narrative quality, smart wallets, and pool metrics.
+2. Pick the best candidate based on realized risk context, narrative quality, smart wallets, and pool metrics. Prefer positive expectancy over headline win rate and avoid profiles resembling the high-volatility loss tail.
 3. Call deploy_position (active_bin is pre-fetched above — no need to call get_active_bin).
    bins_below = round(${config.strategy.minBinsBelow} + (candidate volatility/5)*(${config.strategy.maxBinsBelow - config.strategy.minBinsBelow})) clamped to [${config.strategy.minBinsBelow},${config.strategy.maxBinsBelow}].
    pass deploy_position.volatility = the candidate volatility value.
@@ -1162,7 +1193,9 @@ function formatConfigSnapshot() {
     `OOR: ${config.management.outOfRangeWaitMinutes}m | cooldown ${config.management.oorCooldownTriggerCount}x / ${config.management.oorCooldownHours}h`,
     `Repeat deploy cooldown: ${config.management.repeatDeployCooldownEnabled ? "on" : "off"} | ${config.management.repeatDeployCooldownTriggerCount}x / ${config.management.repeatDeployCooldownHours}h | min fee earned ${config.management.repeatDeployCooldownMinFeeEarnedPct}% | ${config.management.repeatDeployCooldownScope}`,
     `Yield floor: ${config.management.minFeePerTvl24h}% | min age ${config.management.minAgeBeforeYieldCheck}m`,
-    `Screening: ${config.screening.category} / ${config.screening.timeframe} | TVL ${config.screening.minTvl}-${config.screening.maxTvl}`,
+    `Screening: ${config.screening.category} / ${config.screening.timeframe} | TVL ${config.screening.minTvl}-${config.screening.maxTvl} | max volatility ${config.screening.maxVolatility}`,
+    `Token audit: ${config.screening.requireTokenAudit ? "required" : "optional"} | fees ≥ ${config.screening.minTokenFeesSol} SOL | top10 ≤ ${config.screening.maxTop10Pct}% | bots ≤ ${config.screening.maxBotHoldersPct}%`,
+    `Loss circuit: ${config.risk.lossCircuitBreakerEnabled ? "on" : "off"} | ${config.risk.maxConsecutiveLosses} losses / rolling ${config.risk.maxRollingLossPct}% / single ${config.risk.maxSingleLossPct}% | cooldown ${config.risk.lossCircuitCooldownHours}h`,
     `Intervals: manage ${config.schedule.managementIntervalMin}m | screen ${config.schedule.screeningIntervalMin}m`,
     `HiveMind: ${isHiveMindEnabled() ? "enabled" : "disabled"}${config.hiveMind.agentId ? ` | ${config.hiveMind.agentId}` : ""}`,
   ].join("\n");
@@ -2155,6 +2188,8 @@ Commands:
       console.log(`  minTokenFeesSol:      ${s.minTokenFeesSol}`);
       console.log(`  maxBotHoldersPct:     ${s.maxBotHoldersPct}`);
       console.log(`  maxTop10Pct:          ${s.maxTop10Pct}`);
+      console.log(`  maxVolatility:        ${s.maxVolatility}`);
+      console.log(`  requireTokenAudit:    ${s.requireTokenAudit}`);
       console.log(`  timeframe:            ${s.timeframe}`);
       const perf = getPerformanceSummary();
       if (perf) {
