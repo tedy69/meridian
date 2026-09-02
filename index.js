@@ -34,6 +34,7 @@ import {
 } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
 import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, confirmPeak, registerExitSignal } from "./state.js";
+import { getSpotPosition as readSpotPosition } from "./spot-state.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
@@ -50,6 +51,7 @@ import { getPnlWatchdogGate } from "./pnl-watchdog-safety.js";
 import { formatNetPnlPercent } from "./position-performance.js";
 import { buildRiskIntelligenceBrief, evaluateLossCircuitBreaker, evaluateTokenAuditRisk } from "./risk-intelligence.js";
 import { getSpotMomentumCandidates, getSpotPositionSnapshot, getSpotStatus } from "./tools/spot.js";
+import { createSpotRealtimeMonitor } from "./spot-realtime.js";
 
 import { REPO_ROOT, repoPath } from "./repo-root.js";
 
@@ -115,7 +117,10 @@ function formatPositionNetPnlValue(position, currency) {
 
 function buildPrompt() {
   if (config.trading.mode === "spot_momentum") {
-    return `[spot manage: ${config.spot.managementPollIntervalSec}s | scan: ${config.spot.scanIntervalSec}s]\n> `;
+    const management = config.spot.realtimeEnabled
+      ? `realtime/${config.spot.managementPollIntervalSec}s fallback`
+      : `${config.spot.managementPollIntervalSec}s`;
+    return `[spot manage: ${management} | scan: ${config.spot.scanIntervalSec}s]\n> `;
   }
   const mgmt = formatCountdown(nextRunIn(timers.managementLastRun, config.schedule.managementIntervalMin));
   const scrn = formatCountdown(nextRunIn(timers.screeningLastRun, config.schedule.screeningIntervalMin));
@@ -132,6 +137,7 @@ let _claimAllBusy = false;   // prevents claim-all from racing another transacti
 let _screeningLastTriggered = 0; // epoch ms — prevents management from spamming screening
 let _spotExitKey = null;
 let _spotExitCount = 0;
+let _spotRealtimeMonitor = null;
 // Exit/peak confirmation is now done by consecutive-tick counting in state.js
 // (registerExitSignal / confirmPeak), driven by the 3s RPC poller — no setTimeout rechecks.
 
@@ -191,6 +197,11 @@ function stopCronJobs() {
   if (_cronTasks._opportunityPollInterval) clearInterval(_cronTasks._opportunityPollInterval);
   if (_cronTasks._spotManagementPollInterval) clearInterval(_cronTasks._spotManagementPollInterval);
   if (_cronTasks._spotScanInterval) clearInterval(_cronTasks._spotScanInterval);
+  if (_spotRealtimeMonitor) {
+    const monitor = _spotRealtimeMonitor;
+    _spotRealtimeMonitor = null;
+    monitor.stop().catch((error) => log("spot_realtime_warn", `Stop failed: ${error.message}`));
+  }
   _cronTasks = [];
 }
 
@@ -391,6 +402,7 @@ async function runSpotManagementCycle({ silent = false } = {}) {
     }
   } catch (error) {
     log("cron_error", `Spot management failed: ${error.message}`);
+    if (silent) throw error;
     report = `Spot management failed: ${error.message}`;
   } finally {
     _managementBusy = false;
@@ -1273,15 +1285,27 @@ Summarize the current portfolio health, total fees earned, and performance of al
   let spotManagementPollInterval = null;
   let spotScanInterval = null;
   if (config.trading.mode === "spot_momentum") {
-    const managementMs = Math.max(1, Number(config.spot.managementPollIntervalSec ?? 5)) * 1000;
+    const managementMs = Math.max(1, Number(config.spot.managementPollIntervalSec ?? 1)) * 1000;
     const scanMs = Math.max(5, Number(config.spot.scanIntervalSec ?? 30)) * 1000;
-    spotManagementPollInterval = setInterval(() => {
-      runManagementCycle({ silent: true }).catch((error) => log("cron_error", `Spot poll failed: ${error.message}`));
-    }, managementMs);
+    if (config.spot.realtimeEnabled) {
+      _spotRealtimeMonitor = createSpotRealtimeMonitor({
+        getPosition: readSpotPosition,
+        onRefresh: () => runManagementCycle({ silent: true }),
+        commitment: config.spot.realtimeCommitment,
+        eventDebounceMs: config.spot.realtimeEventDebounceMs,
+        minRefreshMs: config.spot.realtimeMinRefreshMs,
+        fallbackIntervalMs: managementMs,
+      });
+      _spotRealtimeMonitor.start().catch((error) => log("spot_realtime_error", `Start failed: ${error.message}`));
+    } else {
+      spotManagementPollInterval = setInterval(() => {
+        runManagementCycle({ silent: true }).catch((error) => log("cron_error", `Spot poll failed: ${error.message}`));
+      }, managementMs);
+      runManagementCycle({ silent: true }).catch((error) => log("cron_error", `Initial spot status failed: ${error.message}`));
+    }
     spotScanInterval = setInterval(() => {
       runScreeningCycle({ silent: true }).catch((error) => log("cron_error", `Spot scan failed: ${error.message}`));
     }, scanMs);
-    runManagementCycle({ silent: true }).catch((error) => log("cron_error", `Initial spot status failed: ${error.message}`));
   }
 
   _cronTasks = [mgmtTask, screenTask, healthTask, briefingTask, briefingWatchdog, settlementTask];
@@ -1292,7 +1316,7 @@ Summarize the current portfolio health, total fees earned, and performance of al
   _cronTasks._spotScanInterval = spotScanInterval;
   drainPendingAutoSwaps().catch((error) => log("cron_error", `Startup settlement retry failed: ${error.message}`));
   const strategySchedule = config.trading.mode === "spot_momentum"
-    ? `spot management every ${config.spot.managementPollIntervalSec}s, momentum scan every ${config.spot.scanIntervalSec}s`
+    ? `${config.spot.realtimeEnabled ? `spot management via ${config.spot.realtimeCommitment} WebSocket with ${config.spot.managementPollIntervalSec}s fallback` : `spot management every ${config.spot.managementPollIntervalSec}s`}, momentum scan every ${config.spot.scanIntervalSec}s`
     : `management every ${config.schedule.managementIntervalMin}m, screening every ${config.schedule.screeningIntervalMin}m${config.opportunity.enabled ? `, opportunity poll every ${config.opportunity.pollIntervalSec}s` : ""}`;
   log("cron", `Cycles started — ${strategySchedule}, settlement retry every 1m`);
 }

@@ -142,7 +142,7 @@ LIVE_TRADING_ENABLED=true
 
 Existing installs remain in `dlmm_lp` mode until `tradingMode` is explicitly changed. Its default limits are one position, 0.3 SOL maximum per position, and 0.5 SOL maximum deploy attempts per UTC day.
 
-In `spot_momentum` mode, the default entry is exactly 0.5 SOL with one open position, a 0.2 SOL gas reserve, 2 SOL maximum buy turnover per UTC day, and a 0.05 SOL realized-loss circuit breaker. This requires at least 0.7 SOL in the execution wallet. The LLM cannot change these execution limits. Spot mode has no timed re-entry cooldown, but every new entry must pass a completely fresh backend preflight.
+In `spot_momentum` mode, the default entry is exactly 0.5 SOL with one open position, a 0.1 SOL gas reserve, 2 SOL maximum buy turnover per UTC day, and a 0.05 SOL realized-loss circuit breaker. This requires at least 0.6 SOL in the execution wallet. The LLM cannot change these execution limits. Spot mode has no timed re-entry cooldown, but every new entry must pass a completely fresh backend preflight.
 
 On startup Meridian fetches your wallet balance, open positions, and top pool candidates, then begins autonomous cycles immediately.
 
@@ -501,7 +501,7 @@ All fields are optional — defaults shown. Edit `user-config.json`.
 | `tradingMode` | `dlmm_lp` | Set to `spot_momentum` to enable the fast spot engine; existing installs never switch implicitly |
 | `spotTradeAmountSol` | `0.5` | Exact SOL input for each accepted entry |
 | `spotMaxTradeAmountSol` | `0.5` | Hard backend ceiling; must not be lower than the configured entry |
-| `spotGasReserveSol` | `0.2` | SOL that must remain available beyond the entry capital |
+| `spotGasReserveSol` | `0.1` | SOL that must remain available beyond the entry capital |
 | `spotMaxDailyBuySol` | `2` | Maximum buy turnover per UTC day, including uncertain submissions |
 | `spotMaxDailyLossSol` | `0.05` | Stops new entries after this realized daily loss |
 | `spotMinLiquidityUsd` | `50000` | Minimum pool liquidity before deeper checks |
@@ -517,7 +517,13 @@ All fields are optional — defaults shown. Edit `user-config.json`.
 | `spotTrailingDropPct` | `1.5` | Exit after this retracement from peak PnL |
 | `spotMaxHoldMinutes` | `30` | Maximum time in one momentum position |
 | `spotScanIntervalSec` | `30` | Candidate scan interval |
-| `spotManagementPollIntervalSec` | `5` | Finalized balance and price monitoring interval |
+| `spotManagementPollIntervalSec` | `1` | Fallback position/PnL refresh interval when no WebSocket event arrives |
+| `spotRealtimeEnabled` | `true` | Subscribe to the active pool account and trigger position management on each coalesced update |
+| `spotRealtimeCommitment` | `processed` | Fast WebSocket signal commitment; execution still revalidates finalized balance and price data |
+| `spotRealtimeEventDebounceMs` | `100` | Coalescing window for bursts of pool-account updates |
+| `spotRealtimeMinRefreshMs` | `1000` | Minimum interval between full PnL refreshes; values below 1000 require a Jupiter plan that permits more than 1 request/second |
+
+The realtime monitor is event-driven: Solana pool-account changes can arrive between fallback ticks, are coalesced to prevent overlapping work, and expose p50/p95/p99 trigger and refresh latency in `get_spot_status`. Failed price/RPC refreshes use bounded exponential backoff and recover automatically. The default full PnL valuation remains capped at once per second because it uses Jupiter Price API data. WebSocket delivery, RPC slots, price publication, and transaction landing are not guaranteed millisecond operations.
 
 Spot entries require a SOL quote, legacy SPL Token ownership, disabled mint and freeze authorities, a fresh token audit, 5-minute and 15-minute momentum confirmation, positive buyer pressure, and bounded concentration. Jupiter orders are checked for the exact mint pair and amount, explicit minimum output, quote age, price impact, fees, expiry, local simulation, mainnet identity, and finalized outcome. These controls reduce avoidable execution risk; they cannot guarantee profit or prevent all memecoin losses.
 

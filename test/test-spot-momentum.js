@@ -92,11 +92,21 @@ test("spot momentum explicitly enables a backend-capped 0.5 SOL trade", () => {
   assert.throws(() => buildSpotConfig({ spotEntrySlippageBps: 501 }), /spotEntrySlippageBps/i);
   assert.equal(spot.tradeAmountSol, 0.5);
   assert.equal(spot.maxTradeAmountSol, 0.5);
-  assert.equal(spot.minWalletSol, 0.7);
+  assert.equal(spot.gasReserveSol, 0.1);
+  assert.equal(spot.minWalletSol, 0.6);
   assert.equal(spot.maxOpenPositions, 1);
   assert.equal(spot.stopLossTriggerPct, -4);
   assert.equal(spot.stopLossPct, -5);
   assert.equal(spot.takeProfitPct, 6);
+  assert.equal(spot.managementPollIntervalSec, 1);
+  assert.equal(spot.realtimeEnabled, true);
+  assert.equal(spot.realtimeCommitment, "processed");
+  assert.equal(spot.realtimeEventDebounceMs, 100);
+  assert.equal(spot.realtimeMinRefreshMs, 1_000);
+  assert.equal(buildSpotConfig({ spotRealtimeMinRefreshMs: 200 }).realtimeMinRefreshMs, 200);
+  assert.throws(() => buildSpotConfig({ spotRealtimeEnabled: "false" }), /spotRealtimeEnabled/i);
+  assert.throws(() => buildSpotConfig({ spotRealtimeCommitment: "fastest" }), /spotRealtimeCommitment/i);
+  assert.throws(() => buildSpotConfig({ spotRealtimeEventDebounceMs: 10 }), /spotRealtimeEventDebounceMs/i);
 });
 
 test("candidate gate requires safe audit, SOL quote, and confirmed momentum", () => {

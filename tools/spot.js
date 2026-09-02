@@ -3,6 +3,7 @@ import { config } from "../config.js";
 import { appendDecision } from "../decision-log.js";
 import { assertSpotSwapAllowed, isDryRun, SOL_MINT } from "../execution-guard.js";
 import { log } from "../logger.js";
+import { getSpotRealtimeTelemetry } from "../spot-realtime.js";
 import {
   calculateSpotPnlPct,
   evaluateSpotExit,
@@ -676,6 +677,7 @@ export function getSpotStatus(_args = {}, overrides = {}) {
   return {
     mode: deps.tradingMode,
     position: deps.readSpotPosition(),
+    realtime: getSpotRealtimeTelemetry(),
     recent_trades: deps.getSpotHistory(10),
     risk_budget: {
       ...riskBudget,

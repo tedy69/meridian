@@ -52,6 +52,15 @@ function boundedPositiveIntegerConfig(value, fallback, maximum, label) {
   return numeric;
 }
 
+function boundedIntegerConfig(value, fallback, minimum, maximum, label) {
+  if (value == null) return fallback;
+  const numeric = numericConfig(value);
+  if (numeric == null || !Number.isInteger(numeric) || numeric < minimum || numeric > maximum) {
+    throw new Error(`${label} must be an integer from ${minimum} to ${maximum}`);
+  }
+  return numeric;
+}
+
 function positiveNumberConfig(value, fallback) {
   const numeric = numericConfig(value);
   return numeric != null && numeric > 0 ? numeric : fallback;
@@ -192,12 +201,20 @@ export function buildSpotConfig(userConfig = {}) {
   if (tradeAmountSol > maxTradeAmountSol || maxTradeAmountSol > 0.5) {
     throw new Error("Spot trade amount and maximum must not exceed 0.5 SOL");
   }
-  const gasReserveSol = positiveNumberConfig(userConfig.spotGasReserveSol, 0.2);
+  const gasReserveSol = positiveNumberConfig(userConfig.spotGasReserveSol, 0.1);
   const stopLossPct = numericConfig(userConfig.spotStopLossPct) ?? -5;
   const configuredStopTrigger = numericConfig(userConfig.spotStopLossTriggerPct) ?? -4;
   const stopLossTriggerPct = stopLossPct < 0 && configuredStopTrigger < 0 && configuredStopTrigger > stopLossPct
     ? configuredStopTrigger
     : -4;
+
+  const realtimeCommitment = String(userConfig.spotRealtimeCommitment ?? "processed").trim().toLowerCase();
+  if (!["processed", "confirmed", "finalized"].includes(realtimeCommitment)) {
+    throw new Error("spotRealtimeCommitment must be processed, confirmed, or finalized");
+  }
+  if (userConfig.spotRealtimeEnabled != null && typeof userConfig.spotRealtimeEnabled !== "boolean") {
+    throw new Error("spotRealtimeEnabled must be true or false");
+  }
 
   return {
     tradeAmountSol,
@@ -247,7 +264,11 @@ export function buildSpotConfig(userConfig = {}) {
     maxHoldMinutes: positiveNumberConfig(userConfig.spotMaxHoldMinutes, 30),
     exitConfirmTicks: positiveIntegerConfig(userConfig.spotExitConfirmTicks, 2),
     scanIntervalSec: positiveIntegerConfig(userConfig.spotScanIntervalSec, 30),
-    managementPollIntervalSec: positiveIntegerConfig(userConfig.spotManagementPollIntervalSec, 5),
+    managementPollIntervalSec: positiveIntegerConfig(userConfig.spotManagementPollIntervalSec, 1),
+    realtimeEnabled: userConfig.spotRealtimeEnabled ?? true,
+    realtimeCommitment,
+    realtimeEventDebounceMs: boundedIntegerConfig(userConfig.spotRealtimeEventDebounceMs, 100, 25, 1_000, "spotRealtimeEventDebounceMs"),
+    realtimeMinRefreshMs: boundedIntegerConfig(userConfig.spotRealtimeMinRefreshMs, 1_000, 100, 10_000, "spotRealtimeMinRefreshMs"),
   };
 }
 
