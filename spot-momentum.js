@@ -179,7 +179,7 @@ export function evaluateSpotExit({ position, currentValueSol, now = new Date(), 
   }
 
   const stopLossTriggerPct = finite(policy.stopLossTriggerPct) ?? -3;
-  const takeProfitPct = finite(policy.takeProfitPct) ?? 3;
+  const takeProfitPct = finite(policy.takeProfitPct) ?? 1;
   const trailingTriggerPct = finite(policy.trailingTriggerPct) ?? 1.5;
   const trailingDropPct = finite(policy.trailingDropPct) ?? 0.5;
   const maxHoldMinutes = finite(policy.maxHoldMinutes) ?? 5;

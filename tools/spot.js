@@ -1,4 +1,4 @@
-import { PublicKey } from "@solana/web3.js";
+import { LAMPORTS_PER_SOL, PublicKey } from "@solana/web3.js";
 import { config } from "../config.js";
 import { appendDecision } from "../decision-log.js";
 import { assertSpotSwapAllowed, isDryRun, SOL_MINT } from "../execution-guard.js";
@@ -66,6 +66,38 @@ function measuredSpotEntryCost(solBefore, solAfter, spotConfig) {
     throw new Error(`Finalized SOL debit ${Number.isFinite(measured) ? measured.toFixed(9) : "unknown"} is outside the exact entry plus bounded-fee range ${expected.toFixed(9)}-${(expected + maximumFees).toFixed(9)} SOL`);
   }
   return measured;
+}
+
+function profitProtectedExit(reason) {
+  const action = String(reason || "").split(":", 1)[0].trim().toUpperCase();
+  return action === "TAKE_PROFIT" || action === "TRAILING_TAKE_PROFIT";
+}
+
+function spotExitExecutionPolicy(reason, position, spotConfig) {
+  if (!profitProtectedExit(reason)) return {};
+
+  const entryCostSol = Number(position?.entryCostSol);
+  const minimumProfitPct = Number(spotConfig?.minProfitExitPct);
+  const slippageBps = Number(spotConfig?.profitExitSlippageBps);
+  if (!Number.isFinite(entryCostSol) || entryCostSol <= 0) {
+    throw new Error("Spot entry cost is invalid; a profitable exit cannot be proven");
+  }
+  if (!Number.isFinite(minimumProfitPct) || minimumProfitPct <= 0) {
+    throw new Error("Spot minimum profit exit percentage is invalid");
+  }
+  if (!Number.isInteger(slippageBps) || slippageBps <= 0) {
+    throw new Error("Spot profit exit slippage is invalid");
+  }
+
+  const entryCostLamports = Math.round(entryCostSol * LAMPORTS_PER_SOL);
+  const minimumNetOutputLamports = Math.ceil(entryCostLamports * (1 + minimumProfitPct / 100));
+  if (!Number.isSafeInteger(entryCostLamports) || entryCostLamports <= 0 || !Number.isSafeInteger(minimumNetOutputLamports)) {
+    throw new Error("Spot profitable exit floor is outside the safe lamport range");
+  }
+  return {
+    slippageBps,
+    minimumNetOutputLamports: String(minimumNetOutputLamports),
+  };
 }
 
 function tokenCreatedAtMs(raw) {
@@ -612,13 +644,19 @@ export async function closeSpotPosition({ reason = "manual spot close" } = {}, o
   if (trackedRaw <= 0n || walletRawBefore < trackedRaw) {
     return { success: false, blocked: true, reason: "Finalized RPC shows no token balance to sell; manual reconciliation is required." };
   }
+  const executionPolicy = spotExitExecutionPolicy(reason, position, deps.spotConfig);
   deps.markSpotClosing(position.id, {
     reason,
     solBalanceBeforeClose: solBefore.amount,
     tokenBalanceBeforeClose: tokenBefore.amount,
   });
   const trackedAmount = atomicToUiAmount(trackedRaw, position.tokenDecimals);
-  const sell = await deps.sellSpotToken({ mint: position.mint, amount: trackedAmount, rawAmount: trackedRaw.toString() });
+  const sell = await deps.sellSpotToken({
+    mint: position.mint,
+    amount: trackedAmount,
+    rawAmount: trackedRaw.toString(),
+    ...executionPolicy,
+  });
   if (sell?.success !== true) {
     if (!sell?.submission_attempted) deps.restoreSpotOpen(position.id, sell?.error || "sell rejected before submission");
     return {

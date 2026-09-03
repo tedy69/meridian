@@ -399,6 +399,7 @@ export function validateJupiterOrder(order, {
   maxFeeBps = null,
   maxPriorityFeeLamports = null,
   maxTotalFeeLamports = null,
+  minimumNetOutputLamports = null,
   requestedAt = Date.now(),
   now = Date.now(),
   quoteMaxAgeMs = null,
@@ -446,7 +447,8 @@ export function validateJupiterOrder(order, {
   }
   const transactionFees = [order.signatureFeeLamports, order.prioritizationFeeLamports, order.rentFeeLamports]
     .map(Number);
-  if (maxTotalFeeLamports != null && transactionFees.some((value) => !Number.isFinite(value) || value < 0)) {
+  const requiresTransactionFeeBreakdown = maxTotalFeeLamports != null || minimumNetOutputLamports != null;
+  if (requiresTransactionFeeBreakdown && transactionFees.some((value) => !Number.isSafeInteger(value) || value < 0)) {
     throw new Error("Jupiter order transaction fee breakdown is missing or invalid");
   }
   const priorityFeeLamports = Number(order.prioritizationFeeLamports);
@@ -455,8 +457,28 @@ export function validateJupiterOrder(order, {
   }
   const totalFeeLamports = transactionFees
     .reduce((sum, value) => sum + (Number.isFinite(value) ? value : 0), 0);
+  if (requiresTransactionFeeBreakdown && !Number.isSafeInteger(totalFeeLamports)) {
+    throw new Error("Jupiter order total transaction fee is outside the safe integer range");
+  }
   if (maxTotalFeeLamports != null && totalFeeLamports > Number(maxTotalFeeLamports)) {
     throw new Error(`Jupiter order transaction fees ${totalFeeLamports} lamports exceed ${maxTotalFeeLamports}`);
+  }
+  let minimumNetOutputAmount = null;
+  if (minimumNetOutputLamports != null) {
+    if (outputMint !== SOL_MINT) {
+      throw new Error("Jupiter net output floor is only supported for SOL output");
+    }
+    const requiredNetOutput = nonNegativeInteger(minimumNetOutputLamports, "minimumNetOutputLamports");
+    const grossMinimumOutput = BigInt(String(order.otherAmountThreshold));
+    const transactionFeeAmount = BigInt(totalFeeLamports);
+    if (grossMinimumOutput < transactionFeeAmount) {
+      throw new Error("Jupiter order net output floor cannot be met after transaction fees");
+    }
+    const netMinimumOutput = grossMinimumOutput - transactionFeeAmount;
+    if (netMinimumOutput < requiredNetOutput) {
+      throw new Error(`Jupiter order net output floor ${netMinimumOutput} lamports is below required ${requiredNetOutput} lamports`);
+    }
+    minimumNetOutputAmount = netMinimumOutput.toString();
   }
   if (requireTakerPaysFees) {
     if (!expectedTaker) throw new Error("Expected taker is required to validate Jupiter fee payers");
@@ -486,6 +508,7 @@ export function validateJupiterOrder(order, {
     priceImpactPct: impact,
     feeBps,
     totalFeeLamports,
+    minimumNetOutputAmount,
   };
 }
 
@@ -776,6 +799,7 @@ async function executeJupiterSwap({
     input_amount_atomic: executed.inputAmount,
     output_amount_atomic: executed.outputAmount,
     minimum_output_amount: validatedOrder.minimumOutAmount,
+    minimum_net_output_amount: validatedOrder.minimumNetOutputAmount,
     expected_output_amount: validatedOrder.outAmount,
     price_impact_pct: validatedOrder.priceImpactPct,
     slippage_bps: Number(order.slippageBps),
@@ -873,7 +897,13 @@ export async function buySpotToken({ mint, amountSol }) {
   }
 }
 
-export async function sellSpotToken({ mint, amount, rawAmount = null }) {
+export async function sellSpotToken({
+  mint,
+  amount,
+  rawAmount = null,
+  slippageBps = null,
+  minimumNetOutputLamports = null,
+}) {
   const inputMint = normalizeMint(mint);
   const numericAmount = assertSpotSwapAllowed({
     mode: config.trading.mode,
@@ -888,13 +918,14 @@ export async function sellSpotToken({ mint, amount, rawAmount = null }) {
     return { dry_run: true, would_swap: { input_mint: inputMint, output_mint: SOL_MINT, amount: numericAmount }, message: "DRY RUN — no spot sell sent" };
   }
   assertLiveTradingEnabled("close_spot_position");
+  const resolvedSlippageBps = slippageBps ?? config.spot.exitSlippageBps;
   try {
     return await executeJupiterSwap({
       inputMint,
       outputMint: SOL_MINT,
       amount: numericAmount,
       amountAtomic: rawAmount,
-      slippageBps: config.spot.exitSlippageBps,
+      slippageBps: resolvedSlippageBps,
       operation: "close_spot_position",
       excludeRouters: "jupiterz",
       priorityFeeLamports: config.spot.maxPriorityFeeLamports,
@@ -903,6 +934,7 @@ export async function sellSpotToken({ mint, amount, rawAmount = null }) {
         maxFeeBps: config.spot.maxFeeBps,
         maxPriorityFeeLamports: config.spot.maxPriorityFeeLamports,
         maxTotalFeeLamports: config.spot.maxTotalFeeLamports,
+        minimumNetOutputLamports,
         quoteMaxAgeMs: config.spot.quoteMaxAgeMs,
       },
     });

@@ -270,6 +270,7 @@ export function buildSpotConfig(userConfig = {}) {
 
     entrySlippageBps: boundedPositiveIntegerConfig(userConfig.spotEntrySlippageBps, 150, 500, "spotEntrySlippageBps"),
     exitSlippageBps: boundedPositiveIntegerConfig(userConfig.spotExitSlippageBps, 300, 1_000, "spotExitSlippageBps"),
+    profitExitSlippageBps: boundedPositiveIntegerConfig(userConfig.spotProfitExitSlippageBps, 50, 300, "spotProfitExitSlippageBps"),
     maxEntryPriceImpactPct: positiveNumberConfig(userConfig.spotMaxEntryPriceImpactPct, 1),
     maxExitPriceImpactPct: positiveNumberConfig(userConfig.spotMaxExitPriceImpactPct, 3),
     maxFeeBps: positiveIntegerConfig(userConfig.spotMaxFeeBps, 60),
@@ -278,7 +279,8 @@ export function buildSpotConfig(userConfig = {}) {
     quoteMaxAgeMs: positiveIntegerConfig(userConfig.spotQuoteMaxAgeMs, 3_000),
     maxPriceBlockLag: positiveIntegerConfig(userConfig.spotMaxPriceBlockLag, 150),
 
-    takeProfitPct: positiveNumberConfig(userConfig.spotTakeProfitPct, 3),
+    takeProfitPct: positiveNumberConfig(userConfig.spotTakeProfitPct, 1),
+    minProfitExitPct: positiveNumberConfig(userConfig.spotMinProfitExitPct, 0.1),
     stopLossPct: stopLossPct < 0 ? stopLossPct : -5,
     stopLossTriggerPct,
     trailingTriggerPct: positiveNumberConfig(userConfig.spotTrailingTriggerPct, 1.5),

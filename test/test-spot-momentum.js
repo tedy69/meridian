@@ -107,7 +107,9 @@ test("spot momentum explicitly enables a backend-capped 0.5 SOL trade", () => {
   assert.equal(spot.maxOpenPositions, 1);
   assert.equal(spot.stopLossTriggerPct, -3);
   assert.equal(spot.stopLossPct, -5);
-  assert.equal(spot.takeProfitPct, 3);
+  assert.equal(spot.takeProfitPct, 1);
+  assert.equal(spot.minProfitExitPct, 0.1);
+  assert.equal(spot.profitExitSlippageBps, 50);
   assert.equal(spot.trailingTriggerPct, 1.5);
   assert.equal(spot.trailingDropPct, 0.5);
   assert.equal(spot.maxHoldMinutes, 5);
@@ -361,12 +363,16 @@ test("spike scalp exits immediately at the tight stop, quick profit, fade, or fi
     openedAt: "2026-09-02T00:00:00.000Z",
     peakPnlPct: 0,
   };
-  assert.equal(evaluateSpotExit({ position, currentValueSol: 0.485 }).action, "STOP_LOSS");
-  assert.equal(evaluateSpotExit({ position, currentValueSol: 0.515 }).action, "TAKE_PROFIT");
+  const beforeTimeout = new Date("2026-09-02T00:01:00.000Z");
+  assert.equal(evaluateSpotExit({ position, currentValueSol: 0.485, now: beforeTimeout }).action, "STOP_LOSS");
+  assert.equal(evaluateSpotExit({ position, currentValueSol: 0.505, now: beforeTimeout }).action, "TAKE_PROFIT");
+  assert.equal(evaluateSpotExit({ position, currentValueSol: 0.5049, now: beforeTimeout }).action, "HOLD");
 
   const trailing = evaluateSpotExit({
     position: { ...position, peakPnlPct: 2 },
     currentValueSol: 0.5075,
+    now: beforeTimeout,
+    policy: { takeProfitPct: 3 },
   });
   assert.equal(trailing.action, "TRAILING_TAKE_PROFIT");
 
@@ -603,6 +609,54 @@ test("Jupiter order validation binds mints, minimum output, impact, fees, and fr
   }), /fee payer/i);
 });
 
+test("a profit exit rejects any Jupiter order whose minimum net SOL can fall below locked profit", () => {
+  const sellOrder = {
+    transaction: "base64-transaction",
+    requestId: "request-profit",
+    swapMode: "ExactIn",
+    taker: "Wallet11111111111111111111111111111111111",
+    router: "metis",
+    lastValidBlockHeight: "123456",
+    inputMint: "TokenMint111111111111111111111111111111111",
+    outputMint: SOL_MINT,
+    inAmount: "1000000",
+    outAmount: "505000000",
+    otherAmountThreshold: "502000000",
+    slippageBps: 50,
+    priceImpact: -0.2,
+    feeBps: 0,
+    feeMint: SOL_MINT,
+    signatureFeeLamports: 5000,
+    signatureFeePayer: "Wallet11111111111111111111111111111111111",
+    prioritizationFeeLamports: 300000,
+    prioritizationFeePayer: "Wallet11111111111111111111111111111111111",
+    rentFeeLamports: 0,
+    rentFeePayer: "Wallet11111111111111111111111111111111111",
+    gasless: false,
+  };
+  const policy = {
+    inputMint: sellOrder.inputMint,
+    outputMint: SOL_MINT,
+    inAmount: sellOrder.inAmount,
+    expectedTaker: sellOrder.taker,
+    allowedRouters: ["metis", "dflow", "okx"],
+    requireTakerPaysFees: true,
+    maxSlippageBps: 50,
+    maxPriceImpactPct: 3,
+    maxFeeBps: 60,
+    maxPriorityFeeLamports: 2000000,
+    maxTotalFeeLamports: 5000000,
+    minimumNetOutputLamports: "501000000",
+  };
+
+  const accepted = validateJupiterOrder(sellOrder, policy);
+  assert.equal(accepted.minimumNetOutputAmount, "501695000");
+  assert.throws(
+    () => validateJupiterOrder(sellOrder, { ...policy, minimumNetOutputLamports: "501700000" }),
+    /net output floor/i,
+  );
+});
+
 test("simulation effects enforce exact input and bounded minimum output", () => {
   assert.doesNotThrow(() => validateSimulatedSwapEffects({
     inputMint: SOL_MINT,
@@ -834,8 +888,13 @@ test("spot snapshot and close value only the tracked tokens, not unrelated walle
   let solReads = 0;
   let sold = null;
   let recordedPnl = null;
-  const closed = await closeSpotPosition({ reason: "test close" }, {
+  const closed = await closeSpotPosition({ reason: "TAKE_PROFIT: lock a real net gain" }, {
     dryRun: false,
+    spotConfig: buildSpotConfig({
+      spotTakeProfitPct: 1,
+      spotMinProfitExitPct: 0.1,
+      spotProfitExitSlippageBps: 50,
+    }),
     readSpotPosition: () => position,
     getTokenBalanceByMint: async (requestedMint) => {
       if (requestedMint === SOL_MINT) {
@@ -857,6 +916,8 @@ test("spot snapshot and close value only the tracked tokens, not unrelated walle
   });
   assert.equal(sold.rawAmount, "100000");
   assert.equal(sold.amount, 100);
+  assert.equal(sold.slippageBps, 50);
+  assert.equal(sold.minimumNetOutputLamports, "500500000");
   assert.equal(closed.trade_status, "closed");
   assert.ok(Math.abs(recordedPnl - 0.03) < 1e-12);
 });
