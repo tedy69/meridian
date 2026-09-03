@@ -31,7 +31,7 @@ import {
   reserveSpotBuy,
 } from "../spot-risk-budget.js";
 import { confirmIndicatorPreset } from "./chart-indicators.js";
-import { getMyPositions } from "./dlmm.js";
+import { getActiveBin, getMyPositions } from "./dlmm.js";
 import { discoverPools, getPoolDetail } from "./screening.js";
 import { getTokenInfo } from "./token.js";
 import {
@@ -135,6 +135,7 @@ function spotDeps(overrides = {}) {
     getPoolDetail,
     getTokenInfo,
     confirmIndicatorPreset,
+    getActiveBin,
     getMyPositions,
     getTokenBalanceByMint,
     inspectMintSafety,
@@ -521,32 +522,54 @@ export async function getSpotPositionSnapshot(_args = {}, overrides = {}) {
   }
   if (position.status !== "open") return { position, status: position.status, priceable: false };
 
-  const [balance, prices, finalizedSlot] = await Promise.all([
+  const [balance, activeBinResult] = await Promise.all([
     deps.getTokenBalanceByMint(position.mint),
-    deps.getJupiterPrices([position.mint, SOL_MINT]),
-    deps.getFinalizedSlot(),
+    deps.getActiveBin({ pool_address: position.pool })
+      .then((value) => ({ value, error: null }))
+      .catch((error) => ({ value: null, error })),
   ]);
-  const tokenPrice = safeNumber(prices?.[position.mint]?.usdPrice);
-  const solPrice = safeNumber(prices?.[SOL_MINT]?.usdPrice);
-  const tokenBlock = safeNumber(prices?.[position.mint]?.blockId);
-  const solBlock = safeNumber(prices?.[SOL_MINT]?.blockId);
-  if (tokenPrice == null || tokenPrice <= 0 || solPrice == null || solPrice <= 0 || tokenBlock == null || solBlock == null) {
-    return { position, status: "open", priceable: false, reason: "Jupiter declined to provide a trustworthy current price." };
-  }
-  const rawBlockLag = finalizedSlot - Math.min(tokenBlock, solBlock);
-  const blockLag = Math.max(0, rawBlockLag);
-  // Price V3 may observe a recent confirmed slot ahead of this RPC's finalized
-  // root. That is fresh (lag 0), not stale; only an older price is rejected.
-  if (!Number.isFinite(rawBlockLag) || rawBlockLag > deps.spotConfig.maxPriceBlockLag) {
-    return { position, status: "open", priceable: false, reason: `Jupiter price is stale by ${rawBlockLag} slots.` };
-  }
   const trackedRaw = BigInt(String(position.tokenRawAmount || "0"));
   const walletRaw = BigInt(String(balance.raw_amount || "0"));
   if (trackedRaw <= 0n || walletRaw < trackedRaw) {
     return { position, status: "open", priceable: false, reason: "Finalized wallet balance is below the position's tracked token amount; reconciliation is required." };
   }
   const trackedTokenAmount = atomicToUiAmount(trackedRaw, position.tokenDecimals);
-  const currentValueSol = (trackedTokenAmount * tokenPrice) / solPrice;
+  const activeBinPrice = safeNumber(activeBinResult.value?.price);
+  let currentValueSol;
+  let tokenPrice = null;
+  let solPrice = null;
+  let priceSource;
+  let blockLag = null;
+  let activeBinId = null;
+  let poolPriceSolPerToken = null;
+
+  if (activeBinPrice != null && activeBinPrice > 0) {
+    currentValueSol = trackedTokenAmount * activeBinPrice;
+    priceSource = "meteora_active_bin_confirmed";
+    activeBinId = safeNumber(activeBinResult.value?.binId);
+    poolPriceSolPerToken = activeBinPrice;
+  } else {
+    const [prices, finalizedSlot] = await Promise.all([
+      deps.getJupiterPrices([position.mint, SOL_MINT]),
+      deps.getFinalizedSlot(),
+    ]);
+    tokenPrice = safeNumber(prices?.[position.mint]?.usdPrice);
+    solPrice = safeNumber(prices?.[SOL_MINT]?.usdPrice);
+    const tokenBlock = safeNumber(prices?.[position.mint]?.blockId);
+    const solBlock = safeNumber(prices?.[SOL_MINT]?.blockId);
+    if (tokenPrice == null || tokenPrice <= 0 || solPrice == null || solPrice <= 0 || tokenBlock == null || solBlock == null) {
+      return { position, status: "open", priceable: false, reason: `Meteora active-bin price was unavailable${activeBinResult.error ? ` (${activeBinResult.error.message})` : ""}, and Jupiter declined to provide a trustworthy fallback price.` };
+    }
+    const rawBlockLag = finalizedSlot - Math.min(tokenBlock, solBlock);
+    blockLag = Math.max(0, rawBlockLag);
+    // Price V3 may observe a recent confirmed slot ahead of this RPC's finalized
+    // root. That is fresh (lag 0), not stale; only an older price is rejected.
+    if (!Number.isFinite(rawBlockLag) || rawBlockLag > deps.spotConfig.maxPriceBlockLag) {
+      return { position, status: "open", priceable: false, reason: `Jupiter fallback price is stale by ${rawBlockLag} slots.` };
+    }
+    currentValueSol = (trackedTokenAmount * tokenPrice) / solPrice;
+    priceSource = "jupiter_price_v3_fallback";
+  }
   const exit = evaluateSpotExit({ position, currentValueSol, now: deps.now(), policy: deps.spotConfig });
   const updated = deps.updateSpotObservation(position.id, {
     pnlPct: exit.pnlPct,
@@ -560,10 +583,13 @@ export async function getSpotPositionSnapshot(_args = {}, overrides = {}) {
     token_balance: { ...balance, position_amount: trackedTokenAmount, position_raw_amount: trackedRaw.toString() },
     token_price_usd: tokenPrice,
     sol_price_usd: solPrice,
+    pool_price_sol_per_token: poolPriceSolPerToken,
     current_value_sol: currentValueSol,
     pnl_pct: exit.pnlPct,
     peak_pnl_pct: exit.peakPnlPct,
     exit,
+    price_source: priceSource,
+    active_bin_id: activeBinId,
     block_lag: blockLag,
   };
 }

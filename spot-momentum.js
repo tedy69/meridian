@@ -22,15 +22,32 @@ export function spotScreeningPolicy(spot = {}) {
     maxTokenAgeHours: finite(spot.maxTokenAgeHours) ?? 2_160,
     maxTop10Pct: finite(spot.maxTop10Pct) ?? 30,
     maxBotHoldersPct: finite(spot.maxBotHoldersPct) ?? 20,
-    minPriceChange5mPct: finite(spot.minPriceChange5mPct) ?? 0.2,
-    maxPriceChange5mPct: finite(spot.maxPriceChange5mPct) ?? 12,
-    minVolumeChangePct: finite(spot.minVolumeChangePct) ?? -10,
-    minBuySellVolumeRatio: finite(spot.minBuySellVolumeRatio) ?? 1.05,
+    minPriceChange5mPct: finite(spot.minPriceChange5mPct) ?? 1.5,
+    maxPriceChange5mPct: finite(spot.maxPriceChange5mPct) ?? 8,
+    minVolumeChangePct: finite(spot.minVolumeChangePct) ?? 20,
+    minBuySellVolumeRatio: finite(spot.minBuySellVolumeRatio) ?? 1.15,
+    minSpikeScore: finite(spot.minSpikeScore) ?? 40,
     requirePositiveNetBuyers: spot.requirePositiveNetBuyers !== false,
     requireMintAuthorityDisabled: spot.requireMintAuthorityDisabled !== false,
     requireFreezeAuthorityDisabled: spot.requireFreezeAuthorityDisabled !== false,
     requireMomentumConfirmation: spot.requireMomentumConfirmation !== false,
   };
+}
+
+export function calculateSpotSpikeScore({
+  priceChange5mPct,
+  volumeChangePct,
+  buySellVolumeRatio,
+} = {}) {
+  const price = finite(priceChange5mPct);
+  const volume = finite(volumeChangePct);
+  const buySell = finite(buySellVolumeRatio);
+  if (price == null || volume == null || buySell == null) return null;
+
+  const priceStrength = Math.min(1, Math.max(0, price) / 5);
+  const volumeStrength = Math.min(1, Math.max(0, volume) / 100);
+  const buyerStrength = Math.min(1, Math.max(0, buySell - 1) / 0.5);
+  return Number(((priceStrength * 0.45 + volumeStrength * 0.35 + buyerStrength * 0.2) * 100).toFixed(2));
 }
 
 /**
@@ -61,6 +78,7 @@ export function evaluateSpotMomentumCandidate({ pool, tokenInfo, policy = {} } =
   const buySellVolumeRatio = buyVolume != null && sellVolume != null
     ? buyVolume / Math.max(sellVolume, 1)
     : null;
+  const spikeScore = calculateSpotSpikeScore({ priceChange5mPct, volumeChangePct, buySellVolumeRatio });
   const momentumConfirmed = pool?.indicator_confirmation?.confirmed === true
     && pool?.indicator_confirmation?.skipped !== true;
 
@@ -83,6 +101,8 @@ export function evaluateSpotMomentumCandidate({ pool, tokenInfo, policy = {} } =
     buySellVolumeRatio,
     netBuyers,
     momentumConfirmed,
+    spikeScore,
+    entryStyle: "early_spike",
   };
 
   if (!baseMint) return reject("Base token mint is missing.", metrics);
@@ -123,6 +143,9 @@ export function evaluateSpotMomentumCandidate({ pool, tokenInfo, policy = {} } =
   if (p.requirePositiveNetBuyers && (netBuyers == null || netBuyers <= 0)) {
     return reject("Net organic buyers are not positive.", metrics);
   }
+  if (spikeScore == null || spikeScore < p.minSpikeScore) {
+    return reject(`Composite spike strength is below ${p.minSpikeScore}.`, metrics);
+  }
   if (p.requireMomentumConfirmation && !momentumConfirmed) {
     return reject("Fresh 5-minute and 15-minute momentum is not confirmed.", metrics);
   }
@@ -131,10 +154,10 @@ export function evaluateSpotMomentumCandidate({ pool, tokenInfo, policy = {} } =
   const volumeScore = Math.min(1, volumeLiquidityRatio / Math.max(p.minVolumeLiquidityRatio * 3, 0.0001));
   const organicScore = Math.min(1, organic / 100);
   const buyerScore = Math.min(1, buySellVolumeRatio / Math.max(p.minBuySellVolumeRatio * 2, 0.0001));
-  const momentumScore = Math.min(1, priceChange5mPct / Math.max(p.maxPriceChange5mPct / 2, 0.0001));
+  const momentumScore = Math.min(1, spikeScore / 100);
   const score = Number(((liquidityScore + volumeScore + organicScore + buyerScore + momentumScore) * 20).toFixed(2));
 
-  return { pass: true, reason: "Candidate passed deterministic spot-momentum gates.", metrics, score };
+  return { pass: true, reason: "Candidate passed deterministic early-spike gates.", metrics, score };
 }
 
 export function calculateSpotPnlPct(entryCostSol, currentValueSol) {
@@ -155,11 +178,11 @@ export function evaluateSpotExit({ position, currentValueSol, now = new Date(), 
     return { action: "HOLD", reason: "Spot position is not currently priceable.", pnlPct: null, peakPnlPct: finite(position?.peakPnlPct) ?? 0 };
   }
 
-  const stopLossTriggerPct = finite(policy.stopLossTriggerPct) ?? -4;
-  const takeProfitPct = finite(policy.takeProfitPct) ?? 6;
-  const trailingTriggerPct = finite(policy.trailingTriggerPct) ?? 3;
-  const trailingDropPct = finite(policy.trailingDropPct) ?? 1.5;
-  const maxHoldMinutes = finite(policy.maxHoldMinutes) ?? 30;
+  const stopLossTriggerPct = finite(policy.stopLossTriggerPct) ?? -3;
+  const takeProfitPct = finite(policy.takeProfitPct) ?? 3;
+  const trailingTriggerPct = finite(policy.trailingTriggerPct) ?? 1.5;
+  const trailingDropPct = finite(policy.trailingDropPct) ?? 0.5;
+  const maxHoldMinutes = finite(policy.maxHoldMinutes) ?? 5;
   const previousPeak = finite(position?.peakPnlPct) ?? 0;
   const peakPnlPct = Math.max(previousPeak, pnlPct);
 

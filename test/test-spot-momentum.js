@@ -7,7 +7,7 @@ import { PublicKey } from "@solana/web3.js";
 import { buildSpotConfig, buildSpotDiscoveryConfig, buildTradingConfig } from "../config.js";
 import { SOL_MINT } from "../execution-guard.js";
 import {
-  calculateSpotPnlPct,
+  calculateSpotSpikeScore,
   evaluateSpotExit,
   evaluateSpotMomentumCandidate,
 } from "../spot-momentum.js";
@@ -105,14 +105,24 @@ test("spot momentum explicitly enables a backend-capped 0.5 SOL trade", () => {
   assert.equal(spot.gasReserveSol, 0.1);
   assert.equal(spot.minWalletSol, 0.6);
   assert.equal(spot.maxOpenPositions, 1);
-  assert.equal(spot.stopLossTriggerPct, -4);
+  assert.equal(spot.stopLossTriggerPct, -3);
   assert.equal(spot.stopLossPct, -5);
-  assert.equal(spot.takeProfitPct, 6);
+  assert.equal(spot.takeProfitPct, 3);
+  assert.equal(spot.trailingTriggerPct, 1.5);
+  assert.equal(spot.trailingDropPct, 0.5);
+  assert.equal(spot.maxHoldMinutes, 5);
+  assert.equal(spot.exitConfirmTicks, 1);
+  assert.equal(spot.scanIntervalSec, 15);
   assert.equal(spot.managementPollIntervalSec, 1);
   assert.equal(spot.realtimeEnabled, true);
   assert.equal(spot.realtimeCommitment, "processed");
   assert.equal(spot.realtimeEventDebounceMs, 100);
-  assert.equal(spot.realtimeMinRefreshMs, 1_000);
+  assert.equal(spot.realtimeMinRefreshMs, 500);
+  assert.equal(spot.minPriceChange5mPct, 1.5);
+  assert.equal(spot.maxPriceChange5mPct, 8);
+  assert.equal(spot.minVolumeChangePct, 20);
+  assert.equal(spot.minBuySellVolumeRatio, 1.15);
+  assert.equal(spot.minSpikeScore, 40);
   assert.equal(buildSpotConfig({ spotRealtimeMinRefreshMs: 200 }).realtimeMinRefreshMs, 200);
   assert.throws(() => buildSpotConfig({ spotRealtimeEnabled: "false" }), /spotRealtimeEnabled/i);
   assert.throws(() => buildSpotConfig({ spotRealtimeCommitment: "fastest" }), /spotRealtimeCommitment/i);
@@ -167,9 +177,9 @@ test("spot discovery is broad while the fresh entry gate stays selective", () =>
     maxMcap: 30_000_000,
     minAgeMinutes: 30,
     maxAgeHours: 2_160,
-    priceChange: 0.2,
-    volumeChange: -10,
-    buySellRatio: 1.05,
+    priceChange: 1.5,
+    volumeChange: 20,
+    buySellRatio: 1.15,
   });
   assert.equal(entry.allowMetadataOnlyToken2022, true);
   assert.equal(entry.requireLegacyTokenProgram, false);
@@ -315,6 +325,13 @@ test("candidate gate requires safe audit, SOL quote, and confirmed momentum", ()
   const accepted = evaluateSpotMomentumCandidate(candidate);
   assert.equal(accepted.pass, true);
   assert.ok(accepted.score > 0);
+  assert.ok(accepted.metrics.spikeScore >= 40);
+  assert.equal(accepted.metrics.entryStyle, "early_spike");
+  assert.equal(calculateSpotSpikeScore({
+    priceChange5mPct: 2.426576794539904,
+    volumeChangePct: 54.6,
+    buySellVolumeRatio: 1.2035908481453539,
+  }), 49.09);
   candidate.pool.volume_active_tvl_ratio = 99;
   assert.equal(evaluateSpotMomentumCandidate(candidate).metrics.volumeLiquidityRatio, 0.15);
 
@@ -323,29 +340,42 @@ test("candidate gate requires safe audit, SOL quote, and confirmed momentum", ()
   assert.match(evaluateSpotMomentumCandidate(authorityEnabled).reason, /mint authority/i);
 
   const chasing = structuredClone(candidate);
-  chasing.pool.price_change_pct = 18;
+  chasing.pool.price_change_pct = 9;
   assert.match(evaluateSpotMomentumCandidate(chasing).reason, /chase limit/i);
+
+  const weakSpike = structuredClone(candidate);
+  weakSpike.pool.price_change_pct = 1.5;
+  weakSpike.pool.volume_change_pct = 20;
+  weakSpike.tokenInfo.stats_1h.buy_vol = "28750";
+  weakSpike.tokenInfo.stats_1h.sell_vol = "25000";
+  assert.match(evaluateSpotMomentumCandidate(weakSpike).reason, /spike strength/i);
 
   const staleMomentum = structuredClone(candidate);
   staleMomentum.pool.indicator_confirmation.skipped = true;
   assert.match(evaluateSpotMomentumCandidate(staleMomentum).reason, /momentum/i);
 });
 
-test("spot exits prioritize the early stop trigger and fixed take profit", () => {
+test("spike scalp exits immediately at the tight stop, quick profit, fade, or five-minute timeout", () => {
   const position = {
     entryCostSol: 0.5,
     openedAt: "2026-09-02T00:00:00.000Z",
     peakPnlPct: 0,
   };
-  assert.equal(calculateSpotPnlPct(0.5, 0.48), -4.0000000000000036);
-  assert.equal(evaluateSpotExit({ position, currentValueSol: 0.48 }).action, "STOP_LOSS");
-  assert.equal(evaluateSpotExit({ position, currentValueSol: 0.53 }).action, "TAKE_PROFIT");
+  assert.equal(evaluateSpotExit({ position, currentValueSol: 0.485 }).action, "STOP_LOSS");
+  assert.equal(evaluateSpotExit({ position, currentValueSol: 0.515 }).action, "TAKE_PROFIT");
 
   const trailing = evaluateSpotExit({
-    position: { ...position, peakPnlPct: 5 },
-    currentValueSol: 0.5175,
+    position: { ...position, peakPnlPct: 2 },
+    currentValueSol: 0.5075,
   });
   assert.equal(trailing.action, "TRAILING_TAKE_PROFIT");
+
+  const timed = evaluateSpotExit({
+    position,
+    currentValueSol: 0.501,
+    now: new Date("2026-09-02T00:05:00.000Z"),
+  });
+  assert.equal(timed.action, "MAX_HOLD");
 });
 
 test("spot state persists opening, open, observation, and closed transitions", () => {
@@ -417,6 +447,7 @@ test("opening spot state reconciles from finalized balance growth", async () => 
       if (priceReads === 1) throw new Error("temporary price outage");
       return { [mint]: { usdPrice: 0.5, blockId: 1_000 }, [SOL_MINT]: { usdPrice: 100, blockId: 1_000 } };
     },
+    getActiveBin: async () => { throw new Error("temporary active-bin outage"); },
     confirmSpotOpen: (_id, data) => {
       confirmed = data;
       return { ...opening, ...data, status: "open", openedAt: "2026-09-02T00:00:00.000Z", peakPnlPct: 0 };
@@ -430,6 +461,7 @@ test("opening spot state reconciles from finalized balance growth", async () => 
   assert.equal(confirmed.tokenAmount, 100);
   assert.equal(confirmed.entryTokenUsd, null);
   assert.ok(Math.abs(confirmed.entryCostSol - 0.505) < 1e-12);
+  assert.equal(snapshot.price_source, "jupiter_price_v3_fallback");
 });
 
 test("opening reconciliation rejects an airdrop without the exact SOL debit", async () => {
@@ -778,18 +810,25 @@ test("spot snapshot and close value only the tracked tokens, not unrelated walle
     openedAt: "2026-09-02T00:00:00.000Z",
     peakPnlPct: 0,
   };
+  let jupiterPriceReads = 0;
   const snapshot = await getSpotPositionSnapshot({}, {
     spotConfig: buildSpotConfig({}),
     readSpotPosition: () => position,
     getTokenBalanceByMint: async () => ({ amount: 150, raw_amount: "150000", decimals: 3 }),
-    getJupiterPrices: async () => ({ [mint]: { usdPrice: 1, blockId: 1_005 }, [SOL_MINT]: { usdPrice: 100, blockId: 1_006 } }),
-    getFinalizedSlot: async () => 1_000,
+    getActiveBin: async () => ({ binId: 42, price: "0.01" }),
+    getJupiterPrices: async () => {
+      jupiterPriceReads += 1;
+      throw new Error("Jupiter price API must not be used when the on-chain active bin is available");
+    },
     updateSpotObservation: (_id, observation) => ({ ...position, ...observation }),
     now: () => new Date("2026-09-02T00:01:00.000Z"),
   });
   assert.equal(snapshot.current_value_sol, 1);
-  assert.equal(snapshot.block_lag, 0);
+  assert.equal(snapshot.price_source, "meteora_active_bin_confirmed");
+  assert.equal(snapshot.active_bin_id, 42);
+  assert.equal(snapshot.block_lag, null);
   assert.equal(snapshot.token_balance.position_amount, 100);
+  assert.equal(jupiterPriceReads, 0);
 
   let tokenReads = 0;
   let solReads = 0;

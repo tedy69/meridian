@@ -433,6 +433,8 @@ function compactSpotCandidate(candidate) {
     `  price_change_5m_pct: ${metrics.priceChange5mPct}`,
     `  volume_change_pct: ${metrics.volumeChangePct}`,
     `  buy_sell_volume_ratio_1h: ${metrics.buySellVolumeRatio}`,
+    `  spike_score: ${metrics.spikeScore}`,
+    `  entry_style: ${metrics.entryStyle}`,
     `  net_buyers_1h: ${metrics.netBuyers}`,
     `  organic: ${metrics.organic}`,
     `  holders: ${metrics.holders}`,
@@ -515,7 +517,7 @@ The following ${candidates.length} candidates passed deterministic discovery che
 
 ${candidates.map(compactSpotCandidate).join("\n\n")}
 
-Choose at most one candidate. A high score alone is insufficient: reject a stretched candle or weak exit-liquidity profile. If conviction is clean, call open_spot_position once using only the exact pool_address above. The backend will repeat fresh pool, audit, on-chain mint, and 5m+15m momentum checks before any signature. Otherwise report ⛔ NO TRADE and the specific reason.
+Choose at most one early-spike candidate. A high score alone is insufficient: reject a stretched candle, fading volume, weak buyer pressure, or weak exit-liquidity profile. If conviction is clean, call open_spot_position once using only the exact pool_address above. The backend will repeat fresh pool, composite spike, audit, on-chain mint, and 5m+15m momentum checks before any signature. Otherwise report ⛔ NO TRADE and the specific reason.
     `, config.llm.maxSteps, [], "SCREENER", config.llm.screeningModel, 1600, {
       onToolStart: async ({ name }) => {
         if (name === "open_spot_position") openAttempted = true;

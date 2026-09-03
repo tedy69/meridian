@@ -4,14 +4,14 @@
 
 **Links:** [Website](https://agentmeridian.xyz) | [Telegram](https://t.me/agentmeridian) | [X](https://x.com/meridian_agent)
 
-Meridian can run either the original Meteora DLMM strategy or a fast spot-momentum strategy. Spot mode uses deterministic token, liquidity, momentum, quote, and transaction gates around an AI candidate-ranking step.
+Meridian can run either the original Meteora DLMM strategy or a fast spot-momentum strategy. Spot mode targets early momentum spikes and uses deterministic token, liquidity, momentum, quote, and transaction gates around an AI candidate-ranking step.
 
 ---
 
 ## What it does
 
 - **Screens opportunities** — scans SOL-quoted pools and applies mode-specific liquidity, organic activity, holder, concentration, momentum, and market-cap gates
-- **Trades spot momentum** — optionally buys one freshly revalidated memecoin setup at a time, then applies mechanical stop, profit, trailing, and maximum-hold exits
+- **Trades spot momentum** — optionally buys one freshly revalidated early-spike memecoin setup at a time, then applies mechanical stop, quick profit, tight trailing, and maximum-hold exits
 - **Manages DLMM positions** — retains the original LP deploy, fee claim, range, yield, and close workflow when `tradingMode` is `dlmm_lp`
 - **Learns from performance** — studies top LPers in target pools, saves structured lessons, and evolves screening thresholds based on closed position history
 - **Discord signals** — optional Discord listener watches LP Army channels for Solana token calls and queues them for screening
@@ -41,7 +41,7 @@ The harness also keeps a structured decision log in `decision-log.json` for depl
 - `@meteora-ag/dlmm` SDK — on-chain position data, active bin, deploy/close transactions
 - Meteora DLMM PnL API — position yield, fee accrual, PnL
 - Pool screening API — fee/TVL ratios, volume, organic scores, holder counts
-- Jupiter APIs — token audit, price data, bounded minimum-output orders, and spot execution
+- Jupiter APIs — token audit, fallback price data, bounded minimum-output orders, and spot execution
 
 Agents are powered via **OpenRouter** and can be swapped for any compatible model.
 
@@ -53,7 +53,7 @@ Agents are powered via **OpenRouter** and can be swapped for any compatible mode
 - [OpenRouter](https://openrouter.ai) API key
 - Solana wallet (base58 private key)
 - Solana RPC endpoint ([Helius](https://helius.xyz) recommended)
-- Jupiter API key (required for spot price and order/execute requests)
+- Jupiter API key (required for spot price fallback and order/execute requests)
 - Telegram bot token (optional)
 - [Claude Code](https://claude.ai/code) CLI (optional, for terminal slash commands)
 
@@ -526,31 +526,34 @@ All fields are optional — defaults shown. Edit `user-config.json`.
 | `spotMaxMarketCapUsd` | `30000000` | Fresh entry maximum market cap |
 | `spotMinTokenAgeMinutes` | `30` | Fresh entry minimum token age |
 | `spotMaxTokenAgeHours` | `2160` | Fresh entry maximum token age (90 days) |
-| `spotMinPriceChange5mPct` | `0.2` | Minimum positive five-minute price momentum |
-| `spotMinVolumeChangePct` | `-10` | Minimum short-window volume acceleration; small cooling is permitted |
-| `spotMinBuySellVolumeRatio` | `1.05` | Minimum fresh buy/sell-volume pressure |
+| `spotMinPriceChange5mPct` | `1.5` | Minimum five-minute price acceleration for an early spike |
+| `spotMaxPriceChange5mPct` | `8` | Reject a five-minute candle above this level to avoid chasing a stretched spike |
+| `spotMinVolumeChangePct` | `20` | Minimum short-window volume acceleration |
+| `spotMinBuySellVolumeRatio` | `1.15` | Minimum fresh buy/sell-volume pressure |
+| `spotMinSpikeScore` | `40` | Minimum composite strength from price acceleration, volume acceleration, and buyer pressure |
 | `spotMaxTop10Pct` | `30` | Maximum top-10 holder concentration |
 | `spotMaxBotHoldersPct` | `20` | Maximum bot-holder percentage |
 | `spotRequireLegacyTokenProgram` | `false` | Set true to reject every Token-2022 mint |
 | `spotAllowMetadataOnlyToken2022` | `true` | Permit Token-2022 only when every extension is metadata-only |
 | `spotEntrySlippageBps` | `150` | Entry minimum-output tolerance; the order must also satisfy impact and fee caps |
 | `spotExitSlippageBps` | `300` | Exit minimum-output tolerance; the order must also satisfy impact and fee caps |
-| `spotStopLossTriggerPct` | `-4` | Early mechanical stop trigger |
+| `spotStopLossTriggerPct` | `-3` | Early mechanical stop trigger |
 | `spotStopLossPct` | `-5` | Intended maximum-loss target; fast markets can still execute beyond it |
-| `spotTakeProfitPct` | `6` | Fixed take-profit trigger |
-| `spotTrailingTriggerPct` | `3` | Enables trailing protection after this PnL |
-| `spotTrailingDropPct` | `1.5` | Exit after this retracement from peak PnL |
-| `spotMaxHoldMinutes` | `30` | Maximum time in one momentum position |
-| `spotScanIntervalSec` | `30` | Candidate scan interval |
+| `spotTakeProfitPct` | `3` | Fixed quick take-profit trigger |
+| `spotTrailingTriggerPct` | `1.5` | Enables tight trailing protection after this PnL |
+| `spotTrailingDropPct` | `0.5` | Exit after this retracement from peak PnL |
+| `spotMaxHoldMinutes` | `5` | Maximum time in one spike position |
+| `spotExitConfirmTicks` | `1` | Consecutive matching exit decisions required before submission |
+| `spotScanIntervalSec` | `15` | Candidate scan interval |
 | `spotManagementPollIntervalSec` | `1` | Fallback position/PnL refresh interval when no WebSocket event arrives |
 | `spotRealtimeEnabled` | `true` | Subscribe to the active pool account and trigger position management on each coalesced update |
-| `spotRealtimeCommitment` | `processed` | Fast WebSocket signal commitment; execution still revalidates finalized balance and price data |
+| `spotRealtimeCommitment` | `processed` | Fast WebSocket signal commitment; execution still revalidates finalized balances and transaction results |
 | `spotRealtimeEventDebounceMs` | `100` | Coalescing window for bursts of pool-account updates |
-| `spotRealtimeMinRefreshMs` | `1000` | Minimum interval between full PnL refreshes; values below 1000 require a Jupiter plan that permits more than 1 request/second |
+| `spotRealtimeMinRefreshMs` | `500` | Minimum interval between full PnL refreshes from the pool's on-chain active-bin price |
 
-The realtime monitor is event-driven: Solana pool-account changes can arrive between fallback ticks, are coalesced to prevent overlapping work, and expose p50/p95/p99 trigger and refresh latency in `get_spot_status`. Failed price/RPC refreshes use bounded exponential backoff and recover automatically. The default full PnL valuation remains capped at once per second because it uses Jupiter Price API data. WebSocket delivery, RPC slots, price publication, and transaction landing are not guaranteed millisecond operations.
+The realtime monitor is event-driven: Solana pool-account changes can arrive between fallback ticks, are coalesced to prevent overlapping work, and expose p50/p95/p99 trigger and refresh latency in `get_spot_status`. Open-position valuation uses the confirmed Meteora active-bin price directly from RPC and calls Jupiter Price V3 only as a bounded fallback, preserving Jupiter capacity for the sell order. Failed price/RPC refreshes use bounded exponential backoff and recover automatically. WebSocket delivery, RPC slots, price publication, and transaction landing are not guaranteed millisecond operations.
 
-Spot discovery is intentionally broader than the fresh entry gate, so more momentum pools reach the expensive token and indicator checks without weakening the final decision. Spot entries require a SOL quote, disabled mint and freeze authorities, a fresh token audit, 5-minute and 15-minute momentum confirmation, positive buyer pressure, and bounded concentration. Legacy SPL tokens are supported; Token-2022 mints are supported only with no extensions or the `MetadataPointer`/`TokenMetadata` extensions. Every behavioral or unknown extension—including transfer fees, hooks, permanent delegates, pausing, non-transferability, and mint-close authority—is rejected fail-closed. Jupiter orders are checked for the exact mint pair and amount, explicit minimum output, quote age, price impact, fees, expiry, local simulation, mainnet identity, and finalized outcome. These controls reduce avoidable execution risk; they cannot guarantee profit or prevent all memecoin losses.
+Spot discovery is intentionally broader than the fresh entry gate, so more pools reach the expensive token and indicator checks without weakening the final decision. The final entry gate looks for an early spike rather than a late pump: 5-minute price acceleration must remain inside the configured band, volume and buyer pressure must be rising, and their composite spike score must pass. It also requires a SOL quote, disabled mint and freeze authorities, a fresh token audit, 5-minute and 15-minute momentum confirmation, positive buyers, and bounded concentration. Legacy SPL tokens are supported; Token-2022 mints are supported only with no extensions or the `MetadataPointer`/`TokenMetadata` extensions. Every behavioral or unknown extension—including transfer fees, hooks, permanent delegates, pausing, non-transferability, and mint-close authority—is rejected fail-closed. Jupiter orders are checked for the exact mint pair and amount, explicit minimum output, quote age, price impact, fees, expiry, local simulation, mainnet identity, and finalized outcome. These controls reduce avoidable execution risk; they cannot guarantee profit or prevent all memecoin losses.
 
 ### Screening
 

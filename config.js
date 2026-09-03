@@ -217,10 +217,10 @@ export function buildSpotConfig(userConfig = {}) {
   }
   const gasReserveSol = positiveNumberConfig(userConfig.spotGasReserveSol, 0.1);
   const stopLossPct = numericConfig(userConfig.spotStopLossPct) ?? -5;
-  const configuredStopTrigger = numericConfig(userConfig.spotStopLossTriggerPct) ?? -4;
+  const configuredStopTrigger = numericConfig(userConfig.spotStopLossTriggerPct) ?? -3;
   const stopLossTriggerPct = stopLossPct < 0 && configuredStopTrigger < 0 && configuredStopTrigger > stopLossPct
     ? configuredStopTrigger
-    : -4;
+    : -3;
 
   const realtimeCommitment = String(userConfig.spotRealtimeCommitment ?? "processed").trim().toLowerCase();
   if (!["processed", "confirmed", "finalized"].includes(realtimeCommitment)) {
@@ -256,10 +256,11 @@ export function buildSpotConfig(userConfig = {}) {
     maxTokenAgeHours: positiveNumberConfig(userConfig.spotMaxTokenAgeHours, 2_160),
     maxTop10Pct: positiveNumberConfig(userConfig.spotMaxTop10Pct, 30),
     maxBotHoldersPct: positiveNumberConfig(userConfig.spotMaxBotHoldersPct, 20),
-    minPriceChange5mPct: numericConfig(userConfig.spotMinPriceChange5mPct) ?? 0.2,
-    maxPriceChange5mPct: positiveNumberConfig(userConfig.spotMaxPriceChange5mPct, 12),
-    minVolumeChangePct: numericConfig(userConfig.spotMinVolumeChangePct) ?? -10,
-    minBuySellVolumeRatio: positiveNumberConfig(userConfig.spotMinBuySellVolumeRatio, 1.05),
+    minPriceChange5mPct: numericConfig(userConfig.spotMinPriceChange5mPct) ?? 1.5,
+    maxPriceChange5mPct: positiveNumberConfig(userConfig.spotMaxPriceChange5mPct, 8),
+    minVolumeChangePct: numericConfig(userConfig.spotMinVolumeChangePct) ?? 20,
+    minBuySellVolumeRatio: positiveNumberConfig(userConfig.spotMinBuySellVolumeRatio, 1.15),
+    minSpikeScore: positiveNumberConfig(userConfig.spotMinSpikeScore, 40),
     requirePositiveNetBuyers: userConfig.spotRequirePositiveNetBuyers ?? true,
     requireMintAuthorityDisabled: userConfig.spotRequireMintAuthorityDisabled ?? true,
     requireFreezeAuthorityDisabled: userConfig.spotRequireFreezeAuthorityDisabled ?? true,
@@ -277,19 +278,19 @@ export function buildSpotConfig(userConfig = {}) {
     quoteMaxAgeMs: positiveIntegerConfig(userConfig.spotQuoteMaxAgeMs, 3_000),
     maxPriceBlockLag: positiveIntegerConfig(userConfig.spotMaxPriceBlockLag, 150),
 
-    takeProfitPct: positiveNumberConfig(userConfig.spotTakeProfitPct, 6),
+    takeProfitPct: positiveNumberConfig(userConfig.spotTakeProfitPct, 3),
     stopLossPct: stopLossPct < 0 ? stopLossPct : -5,
     stopLossTriggerPct,
-    trailingTriggerPct: positiveNumberConfig(userConfig.spotTrailingTriggerPct, 3),
-    trailingDropPct: positiveNumberConfig(userConfig.spotTrailingDropPct, 1.5),
-    maxHoldMinutes: positiveNumberConfig(userConfig.spotMaxHoldMinutes, 30),
-    exitConfirmTicks: positiveIntegerConfig(userConfig.spotExitConfirmTicks, 2),
-    scanIntervalSec: positiveIntegerConfig(userConfig.spotScanIntervalSec, 30),
+    trailingTriggerPct: positiveNumberConfig(userConfig.spotTrailingTriggerPct, 1.5),
+    trailingDropPct: positiveNumberConfig(userConfig.spotTrailingDropPct, 0.5),
+    maxHoldMinutes: positiveNumberConfig(userConfig.spotMaxHoldMinutes, 5),
+    exitConfirmTicks: positiveIntegerConfig(userConfig.spotExitConfirmTicks, 1),
+    scanIntervalSec: positiveIntegerConfig(userConfig.spotScanIntervalSec, 15),
     managementPollIntervalSec: positiveIntegerConfig(userConfig.spotManagementPollIntervalSec, 1),
     realtimeEnabled: userConfig.spotRealtimeEnabled ?? true,
     realtimeCommitment,
     realtimeEventDebounceMs: boundedIntegerConfig(userConfig.spotRealtimeEventDebounceMs, 100, 25, 1_000, "spotRealtimeEventDebounceMs"),
-    realtimeMinRefreshMs: boundedIntegerConfig(userConfig.spotRealtimeMinRefreshMs, 1_000, 100, 10_000, "spotRealtimeMinRefreshMs"),
+    realtimeMinRefreshMs: boundedIntegerConfig(userConfig.spotRealtimeMinRefreshMs, 500, 100, 10_000, "spotRealtimeMinRefreshMs"),
   };
 }
 
