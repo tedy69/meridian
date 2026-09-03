@@ -33,6 +33,7 @@ import {
   validateMintProgramSafety,
   validateJupiterExecutionResult,
   validateJupiterOrder,
+  validateJupiterQuote,
   validateJupiterTransactionEnvelope,
   validateSimulatedSwapEffects,
 } from "../tools/wallet.js";
@@ -40,6 +41,7 @@ import {
   closeSpotPosition,
   getSpotMomentumCandidates,
   getSpotPositionSnapshot,
+  getSpotStatus,
   openSpotPosition,
 } from "../tools/spot.js";
 
@@ -72,7 +74,15 @@ function passingCandidate() {
       token_age_hours: 4,
       price_change_pct: 4.2,
       volume_change_pct: 35,
-      indicator_confirmation: { confirmed: true, skipped: false },
+      indicator_confirmation: {
+        enabled: true,
+        confirmed: true,
+        skipped: false,
+        intervals: [
+          { interval: "5_MINUTE", ok: true, confirmed: true },
+          { interval: "15_MINUTE", ok: true, confirmed: true },
+        ],
+      },
     },
     tokenInfo: {
       mint,
@@ -105,6 +115,9 @@ test("spot momentum explicitly enables a backend-capped 0.5 SOL trade", () => {
   assert.equal(spot.gasReserveSol, 0.1);
   assert.equal(spot.minWalletSol, 0.6);
   assert.equal(spot.maxOpenPositions, 1);
+  assert.equal(spot.maxDailyBuySol, null);
+  assert.equal(buildSpotConfig({ spotMaxDailyBuySol: 2 }).maxDailyBuySol, 2);
+  assert.throws(() => buildSpotConfig({ spotMaxDailyBuySol: "unlimited" }), /spotMaxDailyBuySol/i);
   assert.equal(spot.stopLossTriggerPct, -3);
   assert.equal(spot.stopLossPct, -5);
   assert.equal(spot.takeProfitPct, 1);
@@ -114,7 +127,7 @@ test("spot momentum explicitly enables a backend-capped 0.5 SOL trade", () => {
   assert.equal(spot.trailingDropPct, 0.5);
   assert.equal(spot.maxHoldMinutes, 5);
   assert.equal(spot.exitConfirmTicks, 1);
-  assert.equal(spot.scanIntervalSec, 15);
+  assert.equal(spot.scanIntervalSec, 5);
   assert.equal(spot.managementPollIntervalSec, 1);
   assert.equal(spot.realtimeEnabled, true);
   assert.equal(spot.realtimeCommitment, "processed");
@@ -125,6 +138,11 @@ test("spot momentum explicitly enables a backend-capped 0.5 SOL trade", () => {
   assert.equal(spot.minVolumeChangePct, 20);
   assert.equal(spot.minBuySellVolumeRatio, 1.15);
   assert.equal(spot.minSpikeScore, 40);
+  assert.equal(spot.maxEntryRoundTripLossPct, 0.75);
+  assert.throws(
+    () => buildSpotConfig({ spotMaxEntryRoundTripLossPct: 0.9 }),
+    /roundtriplosspct.*below.*takeprofitpct/i,
+  );
   assert.equal(buildSpotConfig({ spotRealtimeMinRefreshMs: 200 }).realtimeMinRefreshMs, 200);
   assert.throws(() => buildSpotConfig({ spotRealtimeEnabled: "false" }), /spotRealtimeEnabled/i);
   assert.throws(() => buildSpotConfig({ spotRealtimeCommitment: "fastest" }), /spotRealtimeCommitment/i);
@@ -357,6 +375,56 @@ test("candidate gate requires safe audit, SOL quote, and confirmed momentum", ()
   assert.match(evaluateSpotMomentumCandidate(staleMomentum).reason, /momentum/i);
 });
 
+test("required momentum rejects disabled or evidence-free indicator confirmations", () => {
+  const disabled = passingCandidate();
+  disabled.pool.indicator_confirmation = {
+    enabled: false,
+    confirmed: true,
+    skipped: false,
+    intervals: [],
+  };
+  const disabledResult = evaluateSpotMomentumCandidate(disabled);
+  assert.equal(disabledResult.pass, false);
+  assert.match(disabledResult.reason, /indicator evidence/i);
+
+  const empty = passingCandidate();
+  empty.pool.indicator_confirmation.intervals = [];
+  const emptyResult = evaluateSpotMomentumCandidate(empty);
+  assert.equal(emptyResult.pass, false);
+  assert.match(emptyResult.reason, /indicator evidence/i);
+});
+
+test("round-trip execution gate rejects entries whose spread consumes the profit target", async () => {
+  const { evaluateSpotRoundTripQuote } = await import("../spot-momentum.js");
+  assert.equal(typeof evaluateSpotRoundTripQuote, "function");
+
+  const viable = evaluateSpotRoundTripQuote({
+    inputLamports: "500000000",
+    expectedReturnLamports: "496994891",
+    maxLossPct: 0.75,
+  });
+  assert.equal(viable.pass, true);
+  assert.ok(Math.abs(viable.expectedLossPct - 0.6010218) < 1e-9);
+
+  const expensive = evaluateSpotRoundTripQuote({
+    inputLamports: "500000000",
+    expectedReturnLamports: "487756591",
+    maxLossPct: 0.75,
+  });
+  assert.equal(expensive.pass, false);
+  assert.match(expensive.reason, /round-trip.*2\.45%.*0\.75%/i);
+});
+
+test("entry selector favors lower executable round-trip cost after all gates pass", async () => {
+  const { selectSpotEntryCandidate } = await import("../spot-momentum.js");
+  assert.equal(typeof selectSpotEntryCandidate, "function");
+  const selected = selectSpotEntryCandidate([
+    { pool: "high-score", spot_score: 90, round_trip_quote: { expectedLossPct: 0.7 } },
+    { pool: "cleaner-exit", spot_score: 82, round_trip_quote: { expectedLossPct: 0.2 } },
+  ]);
+  assert.equal(selected.pool, "cleaner-exit");
+});
+
 test("spike scalp exits immediately at the tight stop, quick profit, fade, or five-minute timeout", () => {
   const position = {
     entryCostSol: 0.5,
@@ -423,6 +491,41 @@ test("spot state persists opening, open, observation, and closed transitions", (
     }, options);
     assert.equal(closed.status, "closed");
     assert.equal(getSpotPosition(options), null);
+  });
+});
+
+test("spot opening completion is idempotent when realtime reconciliation wins the race", () => {
+  withTempFiles(({ statePath }) => {
+    const options = { statePath };
+    const opening = beginSpotOpen({
+      pool: "pool",
+      poolName: "MEME-SOL",
+      mint: "mint",
+      symbol: "MEME",
+      entryCostSol: 0.5,
+      solBalanceBefore: 1,
+      tokenBalanceBefore: 0,
+      tokenRawBalanceBefore: "0",
+      tokenDecimals: 4,
+    }, options);
+    confirmSpotOpen(opening.id, {
+      tokenAmount: 100,
+      tokenRawAmount: "1000000",
+      tokenDecimals: 4,
+      entryCostSol: 0.5,
+    }, options);
+
+    assert.doesNotThrow(() => markSpotOpeningSubmitted(opening.id, { buyTx: "buy-tx" }, options));
+    const reconciledAgain = confirmSpotOpen(opening.id, {
+      tokenAmount: 100,
+      tokenRawAmount: "1000000",
+      tokenDecimals: 4,
+      entryCostSol: 0.502,
+      buyTx: "buy-tx",
+    }, options);
+    assert.equal(reconciledAgain.status, "open");
+    assert.equal(reconciledAgain.buyTx, "buy-tx");
+    assert.equal(reconciledAgain.entryCostSol, 0.502);
   });
 });
 
@@ -510,6 +613,49 @@ test("spot budget caps turnover and blocks after the realized loss limit", () =>
     );
     assert.equal(getSpotRiskBudget({ budgetPath, now }).realizedPnlSol, -0.05);
   });
+});
+
+test("spot daily buy turnover can be unlimited while the daily loss breaker stays active", () => {
+  withTempFiles(({ budgetPath }) => {
+    const now = new Date("2026-09-02T10:00:00.000Z");
+    const first = reserveSpotBuy({ amountSol: 0.5, maxDailyBuySol: null, maxDailyLossSol: 0.05, budgetPath, now });
+    commitSpotBuy(first, { budgetPath, now });
+    const second = reserveSpotBuy({ amountSol: 0.5, maxDailyBuySol: null, maxDailyLossSol: 0.05, budgetPath, now });
+    commitSpotBuy(second, { budgetPath, now });
+
+    const budget = getSpotRiskBudget({ budgetPath, now, maxDailyBuySol: null, maxDailyLossSol: 0.05 });
+    assert.equal(budget.boughtSol, 1);
+    assert.equal(budget.maxDailyBuySol, null);
+
+    recordSpotRealizedPnl({ pnlSol: -0.05, budgetPath, now });
+    assert.throws(
+      () => reserveSpotBuy({ amountSol: 0.5, maxDailyBuySol: null, maxDailyLossSol: 0.05, budgetPath, now }),
+      /daily spot loss cap/i,
+    );
+  });
+});
+
+test("spot status reports unlimited turnover without treating prior buys as blocked", () => {
+  const status = getSpotStatus({}, {
+    tradingMode: "spot_momentum",
+    spotConfig: buildSpotConfig({ spotMaxDailyBuySol: null }),
+    readSpotPosition: () => null,
+    getSpotHistory: () => [],
+    getSpotRiskBudget: () => ({
+      date: "2026-09-02",
+      boughtSol: 100,
+      reservedSol: 0,
+      realizedPnlSol: 0,
+      reservations: {},
+      maxDailyBuySol: null,
+      maxDailyLossSol: 0.05,
+    }),
+  });
+
+  assert.equal(status.risk_budget.maxDailyBuySol, null);
+  assert.equal(status.risk_budget.remainingBuySol, null);
+  assert.equal(status.risk_budget.blocked, false);
+  assert.equal(status.risk_budget.reason, null);
 });
 
 test("Jupiter order validation binds mints, minimum output, impact, fees, and freshness", () => {
@@ -607,6 +753,44 @@ test("Jupiter order validation binds mints, minimum output, impact, fees, and fr
     expectedTaker: order.taker,
     requireTakerPaysFees: true,
   }), /fee payer/i);
+});
+
+test("round-trip quote validation binds both mints, amount, impact, fee, and minimum output", () => {
+  const quote = {
+    swapMode: "ExactIn",
+    inputMint: SOL_MINT,
+    outputMint: "TokenMint111111111111111111111111111111111",
+    inAmount: "500000000",
+    outAmount: "1000000",
+    otherAmountThreshold: "985000",
+    slippageBps: 150,
+    priceImpact: -0.4,
+    feeBps: 10,
+    feeMint: SOL_MINT,
+    router: "metis",
+    mode: "manual",
+  };
+  const validated = validateJupiterQuote(quote, {
+    inputMint: quote.inputMint,
+    outputMint: quote.outputMint,
+    inAmount: quote.inAmount,
+    maxSlippageBps: 150,
+    maxPriceImpactPct: 1,
+    maxFeeBps: 60,
+  });
+  assert.equal(validated.outAmount, "1000000");
+  assert.equal(validated.priceImpactPct, -0.4);
+
+  assert.throws(() => validateJupiterQuote({ ...quote, outputMint: "attacker" }, {
+    inputMint: quote.inputMint,
+    outputMint: quote.outputMint,
+    inAmount: quote.inAmount,
+  }), /mint pair/i);
+  assert.throws(() => validateJupiterQuote({ ...quote, otherAmountThreshold: "1000001" }, {
+    inputMint: quote.inputMint,
+    outputMint: quote.outputMint,
+    inAmount: quote.inAmount,
+  }), /minimum output exceeds/i);
 });
 
 test("a profit exit rejects any Jupiter order whose minimum net SOL can fall below locked profit", () => {
@@ -757,6 +941,8 @@ test("spot open records only tokens acquired by the fixed 0.5 SOL entry", async 
   let tokenReads = 0;
   let buyArgs = null;
   let confirmed = null;
+  let roundTripReads = 0;
+  let openingData = null;
   const result = await openSpotPosition({ pool_address: pool }, {
     tradingMode: "spot_momentum",
     spotConfig,
@@ -777,8 +963,12 @@ test("spot open records only tokens acquired by the fixed 0.5 SOL entry", async 
       volume_change_pct: 35,
     }),
     getTokenInfo: async () => ({ results: [{ ...passingCandidate().tokenInfo, mint }] }),
-    confirmIndicatorPreset: async () => ({ confirmed: true, skipped: false, intervals: [] }),
+    confirmIndicatorPreset: async () => passingCandidate().pool.indicator_confirmation,
     inspectMintSafety: async () => ({ mint, mintAuthorityDisabled: true, freezeAuthorityDisabled: true }),
+    getSpotRoundTripQuote: async () => {
+      roundTripReads += 1;
+      return { pass: true, expectedLossPct: 0.4, expectedReturnLamports: "498000000" };
+    },
     getTokenBalanceByMint: async (requestedMint) => {
       if (requestedMint === SOL_MINT) {
         solReads += 1;
@@ -792,7 +982,7 @@ test("spot open records only tokens acquired by the fixed 0.5 SOL entry", async 
         : { amount: 150, raw_amount: "150000", decimals: 3 };
     },
     reserveSpotBuy: () => ({ id: "reservation", amountSol: 0.5 }),
-    beginSpotOpen: () => ({ id: "spot-test" }),
+    beginSpotOpen: (data) => { openingData = data; return { id: "spot-test" }; },
     markSpotOpeningSubmitted: () => true,
     buySpotToken: async (args) => { buyArgs = args; return { success: true, tx: "buy-tx" }; },
     commitSpotBuy: () => true,
@@ -811,6 +1001,8 @@ test("spot open records only tokens acquired by the fixed 0.5 SOL entry", async 
   assert.equal(confirmed.tokenRawAmount, "100000");
   assert.equal(confirmed.tokenAmount, 100);
   assert.ok(Math.abs(confirmed.entryCostSol - 0.505) < 1e-12);
+  assert.equal(roundTripReads, 1);
+  assert.equal(openingData.signalSnapshot.roundTripExpectedLossPct, 0.4);
 });
 
 test("dry-run spot entry performs no transaction, state, or budget write", async () => {
@@ -837,8 +1029,9 @@ test("dry-run spot entry performs no transaction, state, or budget write", async
       volume_change_pct: 35,
     }),
     getTokenInfo: async () => ({ results: [{ ...passingCandidate().tokenInfo, mint }] }),
-    confirmIndicatorPreset: async () => ({ confirmed: true, skipped: false, intervals: [] }),
+    confirmIndicatorPreset: async () => passingCandidate().pool.indicator_confirmation,
     inspectMintSafety: async () => ({ mint, mintAuthorityDisabled: true, freezeAuthorityDisabled: true }),
+    getSpotRoundTripQuote: async () => ({ pass: true, expectedLossPct: 0.4, expectedReturnLamports: "498000000" }),
     reserveSpotBuy: () => { writeAttempts += 1; },
     beginSpotOpen: () => { writeAttempts += 1; },
     buySpotToken: async () => { buyAttempts += 1; },

@@ -38,3 +38,14 @@ test("spot screening trusts finalized RPC SOL instead of the indexed wallet API"
   assert.match(cycle, /getTokenBalanceByMint\(SOL_MINT\)/);
   assert.doesNotMatch(cycle, /getWalletBalances\(\)/);
 });
+
+test("automatic spot entry keeps the LLM out of the latency-critical transaction path", () => {
+  const source = fs.readFileSync(new URL("../index.js", import.meta.url), "utf8");
+  const start = source.indexOf("async function runSpotScreeningCycle");
+  const end = source.indexOf("\nexport async function runManagementCycle", start);
+  const cycle = source.slice(start, end > start ? end : undefined);
+
+  assert.match(cycle, /selectSpotEntryCandidate\(candidates\)/);
+  assert.doesNotMatch(cycle, /agentLoop\s*\(/);
+  assert.match(cycle, /executeTool\("open_spot_position"/);
+});

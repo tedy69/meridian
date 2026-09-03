@@ -142,7 +142,7 @@ LIVE_TRADING_ENABLED=true
 
 Existing installs remain in `dlmm_lp` mode until `tradingMode` is explicitly changed. Its default limits are one position, 0.3 SOL maximum per position, and 0.5 SOL maximum deploy attempts per UTC day.
 
-In `spot_momentum` mode, the default entry is exactly 0.5 SOL with one open position, a 0.1 SOL gas reserve, 2 SOL maximum buy turnover per UTC day, and a 0.05 SOL realized-loss circuit breaker. This requires at least 0.6 SOL in the execution wallet. The LLM cannot change these execution limits. Spot mode has no timed re-entry cooldown, but every new entry must pass a completely fresh backend preflight.
+In `spot_momentum` mode, the default entry is exactly 0.5 SOL with one open position, a 0.1 SOL gas reserve, no daily turnover ceiling, and a 0.05 SOL realized-loss circuit breaker. This requires at least 0.6 SOL in the execution wallet. The LLM cannot change these execution limits. Spot mode has no timed re-entry cooldown, but every new entry must pass a completely fresh backend preflight.
 
 On startup Meridian fetches your wallet balance, open positions, and top pool candidates, then begins autonomous cycles immediately.
 
@@ -506,7 +506,7 @@ All fields are optional — defaults shown. Edit `user-config.json`.
 | `spotTradeAmountSol` | `0.5` | Exact SOL input for each accepted entry |
 | `spotMaxTradeAmountSol` | `0.5` | Hard backend ceiling; must not be lower than the configured entry |
 | `spotGasReserveSol` | `0.1` | SOL that must remain available beyond the entry capital |
-| `spotMaxDailyBuySol` | `2` | Maximum buy turnover per UTC day, including uncertain submissions |
+| `spotMaxDailyBuySol` | `null` | Optional maximum buy turnover per UTC day; `null` disables the turnover cap while retaining accounting and the daily loss breaker |
 | `spotMaxDailyLossSol` | `0.05` | Stops new entries after this realized daily loss |
 | `spotDiscoveryMinLiquidityUsd` | `20000` | Broad discovery liquidity floor before RPC/token-audit work |
 | `spotDiscoveryMinVolume5mUsd` | `500` | Broad discovery five-minute volume floor |
@@ -538,6 +538,7 @@ All fields are optional — defaults shown. Edit `user-config.json`.
 | `spotEntrySlippageBps` | `150` | Entry minimum-output tolerance; the order must also satisfy impact and fee caps |
 | `spotExitSlippageBps` | `300` | Exit minimum-output tolerance; the order must also satisfy impact and fee caps |
 | `spotProfitExitSlippageBps` | `50` | Tighter tolerance for take-profit exits; stop-loss, max-hold, and manual exits keep the normal exit tolerance |
+| `spotMaxEntryRoundTripLossPct` | `0.75` | Reject an entry when fresh buy-then-sell quotes show spread, fees, and impact would consume at least this much capital |
 | `spotStopLossTriggerPct` | `-3` | Early mechanical stop trigger |
 | `spotStopLossPct` | `-5` | Intended maximum-loss target; fast markets can still execute beyond it |
 | `spotTakeProfitPct` | `1` | Indicative realtime PnL that immediately triggers a take-profit quote |
@@ -546,7 +547,7 @@ All fields are optional — defaults shown. Edit `user-config.json`.
 | `spotTrailingDropPct` | `0.5` | Exit after this retracement from peak PnL |
 | `spotMaxHoldMinutes` | `5` | Maximum time in one spike position |
 | `spotExitConfirmTicks` | `1` | Consecutive matching exit decisions required before submission |
-| `spotScanIntervalSec` | `15` | Candidate scan interval |
+| `spotScanIntervalSec` | `5` | Candidate scan interval; overlapping scans remain blocked |
 | `spotManagementPollIntervalSec` | `1` | Fallback position/PnL refresh interval when no WebSocket event arrives |
 | `spotRealtimeEnabled` | `true` | Subscribe to the active pool account and trigger position management on each coalesced update |
 | `spotRealtimeCommitment` | `processed` | Fast WebSocket signal commitment; execution still revalidates finalized balances and transaction results |
@@ -557,7 +558,7 @@ The realtime monitor is event-driven: Solana pool-account changes can arrive bet
 
 Active-bin PnL is only an indicative trigger. Before signing `TAKE_PROFIT` or `TRAILING_TAKE_PROFIT`, the bot requires Jupiter's minimum SOL output minus transaction fees to exceed the measured entry cost by `spotMinProfitExitPct`; otherwise the order is rejected before submission and retried on a later signal. Emergency stop-loss, max-hold, and manual exits intentionally remain able to realize a loss because blocking those exits could increase it. No strategy can guarantee profit when the executable market price gaps below the entry or an RPC/router is unavailable.
 
-Spot discovery is intentionally broader than the fresh entry gate, so more pools reach the expensive token and indicator checks without weakening the final decision. The final entry gate looks for an early spike rather than a late pump: 5-minute price acceleration must remain inside the configured band, volume and buyer pressure must be rising, and their composite spike score must pass. It also requires a SOL quote, disabled mint and freeze authorities, a fresh token audit, 5-minute and 15-minute momentum confirmation, positive buyers, and bounded concentration. Legacy SPL tokens are supported; Token-2022 mints are supported only with no extensions or the `MetadataPointer`/`TokenMetadata` extensions. Every behavioral or unknown extension—including transfer fees, hooks, permanent delegates, pausing, non-transferability, and mint-close authority—is rejected fail-closed. Jupiter orders are checked for the exact mint pair and amount, explicit minimum output, quote age, price impact, fees, expiry, local simulation, mainnet identity, and finalized outcome. These controls reduce avoidable execution risk; they cannot guarantee profit or prevent all memecoin losses.
+Spot discovery is intentionally broader than the fresh entry gate, so more pools reach the expensive token and indicator checks without weakening the final decision. The final entry gate looks for an early spike rather than a late pump: 5-minute price acceleration must remain inside the configured band, volume and buyer pressure must be rising, and their composite spike score must pass. It also requires a SOL quote, disabled mint and freeze authorities, a fresh token audit, real 5-minute and 15-minute indicator evidence, positive buyers, bounded concentration, and a fresh round-trip quote whose expected cost fits below the configured profit target. A disabled or evidence-free indicator service fails closed. After all gates pass, the backend selects the lowest executable round-trip cost deterministically and revalidates immediately; the LLM is not in the automatic transaction hot path. Legacy SPL tokens are supported; Token-2022 mints are supported only with no extensions or the `MetadataPointer`/`TokenMetadata` extensions. Every behavioral or unknown extension—including transfer fees, hooks, permanent delegates, pausing, non-transferability, and mint-close authority—is rejected fail-closed. Jupiter orders are checked for the exact mint pair and amount, explicit minimum output, quote age, price impact, fees, expiry, local simulation, mainnet identity, and finalized outcome. These controls reduce avoidable execution risk; they cannot guarantee profit or prevent all memecoin losses.
 
 ### Screening
 

@@ -9,6 +9,11 @@ function reject(reason, metrics = {}) {
   return { pass: false, reason, metrics };
 }
 
+function positiveAtomicAmount(value) {
+  const text = String(value ?? "");
+  return /^[0-9]+$/.test(text) && BigInt(text) > 0n ? BigInt(text) : null;
+}
+
 export function spotScreeningPolicy(spot = {}) {
   return {
     minLiquidityUsd: finite(spot.minLiquidityUsd) ?? 30_000,
@@ -51,8 +56,8 @@ export function calculateSpotSpikeScore({
 }
 
 /**
- * Deterministic candidate gate. The LLM only sees candidates that pass this
- * function, and the same checks are repeated from fresh data before a buy.
+ * Deterministic candidate gate. Automatic execution only considers candidates
+ * that pass here, and the same checks are repeated from fresh data before a buy.
  */
 export function evaluateSpotMomentumCandidate({ pool, tokenInfo, policy = {} } = {}) {
   const p = spotScreeningPolicy(policy);
@@ -79,8 +84,15 @@ export function evaluateSpotMomentumCandidate({ pool, tokenInfo, policy = {} } =
     ? buyVolume / Math.max(sellVolume, 1)
     : null;
   const spikeScore = calculateSpotSpikeScore({ priceChange5mPct, volumeChangePct, buySellVolumeRatio });
-  const momentumConfirmed = pool?.indicator_confirmation?.confirmed === true
-    && pool?.indicator_confirmation?.skipped !== true;
+  const indicatorConfirmation = pool?.indicator_confirmation;
+  const indicatorIntervals = Array.isArray(indicatorConfirmation?.intervals)
+    ? indicatorConfirmation.intervals
+    : [];
+  const momentumEvidenceAvailable = indicatorConfirmation?.enabled === true
+    && indicatorConfirmation?.skipped !== true
+    && indicatorIntervals.some((entry) => entry?.ok === true && entry?.confirmed === true);
+  const momentumConfirmed = momentumEvidenceAvailable
+    && indicatorConfirmation?.confirmed === true;
 
   const metrics = {
     baseMint,
@@ -100,6 +112,7 @@ export function evaluateSpotMomentumCandidate({ pool, tokenInfo, policy = {} } =
     sellVolume,
     buySellVolumeRatio,
     netBuyers,
+    momentumEvidenceAvailable,
     momentumConfirmed,
     spikeScore,
     entryStyle: "early_spike",
@@ -146,6 +159,9 @@ export function evaluateSpotMomentumCandidate({ pool, tokenInfo, policy = {} } =
   if (spikeScore == null || spikeScore < p.minSpikeScore) {
     return reject(`Composite spike strength is below ${p.minSpikeScore}.`, metrics);
   }
+  if (p.requireMomentumConfirmation && !momentumEvidenceAvailable) {
+    return reject("Fresh chart indicator evidence is unavailable; refusing a momentum entry.", metrics);
+  }
   if (p.requireMomentumConfirmation && !momentumConfirmed) {
     return reject("Fresh 5-minute and 15-minute momentum is not confirmed.", metrics);
   }
@@ -158,6 +174,51 @@ export function evaluateSpotMomentumCandidate({ pool, tokenInfo, policy = {} } =
   const score = Number(((liquidityScore + volumeScore + organicScore + buyerScore + momentumScore) * 20).toFixed(2));
 
   return { pass: true, reason: "Candidate passed deterministic early-spike gates.", metrics, score };
+}
+
+export function evaluateSpotRoundTripQuote({
+  inputLamports,
+  expectedReturnLamports,
+  maxLossPct,
+} = {}) {
+  const input = positiveAtomicAmount(inputLamports);
+  const expectedReturn = positiveAtomicAmount(expectedReturnLamports);
+  const maximumLoss = finite(maxLossPct);
+  if (input == null || expectedReturn == null || maximumLoss == null || maximumLoss <= 0) {
+    return {
+      pass: false,
+      reason: "A trustworthy round-trip execution quote is unavailable.",
+      expectedLossPct: null,
+    };
+  }
+
+  const expectedLossPct = (Number(input - expectedReturn) / Number(input)) * 100;
+  if (!Number.isFinite(expectedLossPct)) {
+    return { pass: false, reason: "Round-trip execution cost is not finite.", expectedLossPct: null };
+  }
+  if (expectedLossPct > maximumLoss + Number.EPSILON) {
+    return {
+      pass: false,
+      reason: `Expected round-trip execution loss ${expectedLossPct.toFixed(2)}% exceeds ${maximumLoss.toFixed(2)}%.`,
+      expectedLossPct,
+    };
+  }
+  return {
+    pass: true,
+    reason: `Expected round-trip execution loss ${expectedLossPct.toFixed(2)}% is within ${maximumLoss.toFixed(2)}%.`,
+    expectedLossPct,
+  };
+}
+
+export function selectSpotEntryCandidate(candidates = []) {
+  if (!Array.isArray(candidates)) return null;
+  return [...candidates]
+    .filter((candidate) => Number.isFinite(Number(candidate?.round_trip_quote?.expectedLossPct)))
+    .sort((a, b) => {
+      const costDifference = Number(a.round_trip_quote.expectedLossPct) - Number(b.round_trip_quote.expectedLossPct);
+      if (Math.abs(costDifference) > Number.EPSILON) return costDifference;
+      return (finite(b?.spot_score) ?? -Infinity) - (finite(a?.spot_score) ?? -Infinity);
+    })[0] ?? null;
 }
 
 export function calculateSpotPnlPct(entryCostSol, currentValueSol) {

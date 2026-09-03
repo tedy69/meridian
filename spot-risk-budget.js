@@ -73,14 +73,14 @@ export function getSpotRiskBudget({ budgetPath = DEFAULT_PATH, now = new Date(),
 
 export function reserveSpotBuy({ amountSol, maxDailyBuySol, maxDailyLossSol, budgetPath = DEFAULT_PATH, now = new Date() } = {}) {
   const amount = finitePositive(amountSol, "Spot buy amount");
-  const buyCap = finitePositive(maxDailyBuySol, "maxDailyBuySol");
+  const buyCap = maxDailyBuySol == null ? null : finitePositive(maxDailyBuySol, "maxDailyBuySol");
   const lossCap = finitePositive(maxDailyLossSol, "maxDailyLossSol");
   const budget = read(budgetPath, now);
   if (budget.realizedPnlSol <= -lossCap + Number.EPSILON) {
     throw new Error(`Daily spot loss cap reached: ${budget.realizedPnlSol.toFixed(6)} SOL <= -${lossCap.toFixed(6)} SOL.`);
   }
   const used = budget.boughtSol + reservedSol(budget);
-  if (used + amount > buyCap + 1e-9) {
+  if (buyCap != null && used + amount > buyCap + 1e-9) {
     throw new Error(`Daily spot buy cap reached: ${used.toFixed(6)} + ${amount.toFixed(6)} SOL exceeds ${buyCap.toFixed(6)} SOL.`);
   }
   const id = randomUUID();

@@ -38,6 +38,7 @@ import {
   buySpotToken,
   getFinalizedSlot,
   getJupiterPrices,
+  getSpotRoundTripQuote,
   getTokenBalanceByMint,
   inspectMintSafety,
   sellSpotToken,
@@ -173,6 +174,7 @@ function spotDeps(overrides = {}) {
     inspectMintSafety,
     getJupiterPrices,
     getFinalizedSlot,
+    getSpotRoundTripQuote,
     buySpotToken,
     sellSpotToken,
     readSpotPosition,
@@ -249,10 +251,24 @@ export async function getSpotMomentumCandidates({ limit = 10 } = {}, overrides =
       if (!evaluation.pass) {
         filtered.push({ name: pool.name, reason: evaluation.reason });
       } else {
+        const roundTripQuote = await deps.getSpotRoundTripQuote({
+          mint,
+          amountSol: deps.spotConfig.tradeAmountSol,
+        });
+        if (!roundTripQuote?.pass) {
+          filtered.push({ name: pool.name, reason: roundTripQuote?.reason || "Round-trip execution quote failed closed." });
+          continue;
+        }
         candidates.push({
           ...candidate,
           spot_score: evaluation.score,
-          spot_metrics: evaluation.metrics,
+          spot_metrics: {
+            ...evaluation.metrics,
+            roundTripExpectedLossPct: roundTripQuote.expectedLossPct,
+            buyPriceImpactPct: roundTripQuote.buy?.priceImpactPct ?? null,
+            sellPriceImpactPct: roundTripQuote.sell?.priceImpactPct ?? null,
+          },
+          round_trip_quote: roundTripQuote,
           mint_safety: mintSafety,
           token_audit: tokenInfo?.audit ?? null,
           token_stats_1h: tokenInfo?.stats_1h ?? null,
@@ -301,7 +317,7 @@ export async function validateSpotEntry(poolAddressValue, overrides = {}) {
 
   const baseMint = raw?.token_x?.address ?? raw?.base_token_address ?? null;
   try {
-    const [tokenResult, momentum, mintSafety] = await Promise.all([
+    const [tokenResult, momentum, mintSafety, roundTripQuote] = await Promise.all([
       deps.getTokenInfo({ query: baseMint }),
       deps.confirmIndicatorPreset({
         mint: baseMint,
@@ -314,22 +330,41 @@ export async function validateSpotEntry(poolAddressValue, overrides = {}) {
         requireLegacyTokenProgram: deps.spotConfig.requireLegacyTokenProgram,
         allowMetadataOnlyToken2022: deps.spotConfig.allowMetadataOnlyToken2022,
       }),
+      deps.getSpotRoundTripQuote({
+        mint: baseMint,
+        amountSol: deps.spotConfig.tradeAmountSol,
+      }),
     ]);
     const tokenInfo = tokenResult?.results?.[0] ?? null;
     const candidate = freshPoolCandidate(raw, momentum);
     const evaluation = evaluateSpotMomentumCandidate({ pool: candidate, tokenInfo, policy: deps.spotConfig });
     if (!evaluation.pass) return evaluation;
+    if (!roundTripQuote?.pass) {
+      return {
+        pass: false,
+        reason: roundTripQuote?.reason || "Round-trip execution quote failed closed.",
+        metrics: {
+          ...evaluation.metrics,
+          roundTripExpectedLossPct: roundTripQuote?.expectedLossPct ?? null,
+        },
+      };
+    }
     return {
       pass: true,
       reason: "Fresh spot entry checks passed.",
       pool: candidate,
       tokenInfo,
       mintSafety,
+      roundTripQuote,
       signalSnapshot: {
         checkedAt: new Date().toISOString(),
         spotScore: evaluation.score,
         ...evaluation.metrics,
         momentum: momentum?.intervals ?? [],
+        roundTripExpectedLossPct: roundTripQuote.expectedLossPct,
+        roundTripQuoteCheckedAt: roundTripQuote.checkedAt ?? null,
+        buyPriceImpactPct: roundTripQuote.buy?.priceImpactPct ?? null,
+        sellPriceImpactPct: roundTripQuote.sell?.priceImpactPct ?? null,
       },
     };
   } catch (error) {
@@ -369,11 +404,13 @@ export async function openSpotPosition({ pool_address } = {}, overrides = {}) {
   if (!request.pass) return { success: false, blocked: true, reason: request.reason };
   const existing = deps.readSpotPosition();
   if (existing) return { success: false, blocked: true, reason: `Spot position ${existing.id} is already ${existing.status}.` };
-  const lpPositions = await deps.getMyPositions({ force: true, silent: true });
+  const [lpPositions, preflight] = await Promise.all([
+    deps.getMyPositions({ force: true, silent: true }),
+    validateSpotEntry(pool_address, overrides),
+  ]);
   if ((lpPositions?.total_positions ?? lpPositions?.positions?.length ?? 0) > 0) {
     return { success: false, blocked: true, reason: "An LP position is still open; mixed LP and spot exposure is blocked." };
   }
-  const preflight = await validateSpotEntry(pool_address, overrides);
   if (!preflight.pass) return { success: false, blocked: true, reason: preflight.reason, risk_metrics: preflight.metrics ?? null };
   const amountSol = deps.spotConfig.tradeAmountSol;
   if (deps.dryRun) {
@@ -391,11 +428,13 @@ export async function openSpotPosition({ pool_address } = {}, overrides = {}) {
     };
   }
 
-  const solBefore = await deps.getTokenBalanceByMint(SOL_MINT);
+  const [solBefore, tokenBefore] = await Promise.all([
+    deps.getTokenBalanceByMint(SOL_MINT),
+    deps.getTokenBalanceByMint(preflight.pool.base.mint),
+  ]);
   if (solBefore.amount + Number.EPSILON < deps.spotConfig.minWalletSol) {
     return { success: false, blocked: true, reason: `Insufficient SOL: ${solBefore.amount} available; ${deps.spotConfig.minWalletSol} required for ${amountSol} SOL capital plus reserve.` };
   }
-  const tokenBefore = await deps.getTokenBalanceByMint(preflight.pool.base.mint);
   let reservation;
   try {
     reservation = deps.reserveSpotBuy({
@@ -747,8 +786,9 @@ export function getSpotStatus(_args = {}, overrides = {}) {
     maxDailyLossSol: deps.spotConfig.maxDailyLossSol,
   });
   const usedBuySol = Number(riskBudget.boughtSol || 0) + Number(riskBudget.reservedSol || 0);
+  const buyCap = deps.spotConfig.maxDailyBuySol;
   const lossBlocked = Number(riskBudget.realizedPnlSol || 0) <= -deps.spotConfig.maxDailyLossSol + Number.EPSILON;
-  const turnoverBlocked = usedBuySol + deps.spotConfig.tradeAmountSol > deps.spotConfig.maxDailyBuySol + 1e-9;
+  const turnoverBlocked = buyCap != null && usedBuySol + deps.spotConfig.tradeAmountSol > buyCap + 1e-9;
   const riskReason = lossBlocked
     ? `Daily realized loss ${Number(riskBudget.realizedPnlSol).toFixed(6)} SOL reached the ${deps.spotConfig.maxDailyLossSol.toFixed(6)} SOL cap`
     : turnoverBlocked
@@ -762,7 +802,7 @@ export function getSpotStatus(_args = {}, overrides = {}) {
     risk_budget: {
       ...riskBudget,
       usedBuySol,
-      remainingBuySol: Math.max(0, deps.spotConfig.maxDailyBuySol - usedBuySol),
+      remainingBuySol: buyCap == null ? null : Math.max(0, buyCap - usedBuySol),
       blocked: Boolean(riskReason),
       reason: riskReason,
     },

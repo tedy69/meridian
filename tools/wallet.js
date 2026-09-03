@@ -24,6 +24,7 @@ import {
   SOL_MINT,
 } from "../execution-guard.js";
 import { normalizeSlippageBps } from "../trailing-safety.js";
+import { evaluateSpotRoundTripQuote } from "../spot-momentum.js";
 
 let _connection = null;
 let _wallet = null;
@@ -387,6 +388,53 @@ function integerString(value) {
   return typeof value === "string" && /^[0-9]+$/.test(value) && BigInt(value) > 0n;
 }
 
+export function validateJupiterQuote(order, {
+  inputMint,
+  outputMint,
+  inAmount,
+  maxSlippageBps = null,
+  maxPriceImpactPct = null,
+  maxFeeBps = null,
+} = {}) {
+  if (!order || typeof order !== "object") throw new Error("Jupiter quote is missing");
+  if (order.errorCode || order.errorMessage || order.error) {
+    throw new Error(`Jupiter quote error: ${order.errorMessage || order.error || order.errorCode}`);
+  }
+  if (order.swapMode !== "ExactIn") throw new Error("Jupiter quote must use ExactIn mode");
+  if (order.inputMint !== inputMint || order.outputMint !== outputMint) {
+    throw new Error("Jupiter quote mint pair does not match the requested swap");
+  }
+  if (String(order.inAmount) !== String(inAmount)) throw new Error("Jupiter quote input amount does not match the requested swap");
+  if (!integerString(String(order.outAmount || ""))) throw new Error("Jupiter quote output amount is invalid");
+  if (!integerString(String(order.otherAmountThreshold || ""))) throw new Error("Jupiter quote minimum output is required");
+  if (BigInt(String(order.otherAmountThreshold)) > BigInt(String(order.outAmount))) {
+    throw new Error("Jupiter quote minimum output exceeds its expected output");
+  }
+  const slippage = Number(order.slippageBps);
+  if (!Number.isFinite(slippage) || slippage < 0 || (maxSlippageBps != null && slippage > Number(maxSlippageBps))) {
+    throw new Error(`Jupiter quote slippage ${order.slippageBps ?? "unknown"} bps exceeds ${maxSlippageBps} bps`);
+  }
+  const impact = Number(order.priceImpact);
+  if (maxPriceImpactPct != null && (!Number.isFinite(impact) || Math.abs(impact) > Number(maxPriceImpactPct))) {
+    throw new Error(`Jupiter quote price impact ${order.priceImpact ?? "unknown"}% exceeds ${maxPriceImpactPct}%`);
+  }
+  const feeBps = Number(order.feeBps);
+  if (!Number.isFinite(feeBps) || feeBps < 0 || (maxFeeBps != null && feeBps > Number(maxFeeBps))) {
+    throw new Error(`Jupiter quote fee ${order.feeBps ?? "unknown"} bps exceeds ${maxFeeBps} bps`);
+  }
+  if (feeBps > 0 && order.feeMint !== inputMint && order.feeMint !== outputMint) {
+    throw new Error("Jupiter quote fee mint is not part of the requested pair");
+  }
+  return {
+    outAmount: String(order.outAmount),
+    minimumOutAmount: String(order.otherAmountThreshold),
+    priceImpactPct: impact,
+    feeBps,
+    router: String(order.router || "unknown"),
+    mode: String(order.mode || "unknown"),
+  };
+}
+
 export function validateJupiterOrder(order, {
   inputMint,
   outputMint,
@@ -650,6 +698,86 @@ export async function getJupiterPrices(mints) {
 
 export async function getFinalizedSlot() {
   return getConnection().getSlot("finalized");
+}
+
+async function fetchJupiterQuoteOnly({
+  inputMint,
+  outputMint,
+  amountAtomic,
+  slippageBps,
+  maxPriceImpactPct,
+}) {
+  const apiKey = requireJupiterApiKey();
+  const search = new URLSearchParams({
+    inputMint,
+    outputMint,
+    amount: String(amountAtomic),
+    swapMode: "ExactIn",
+    slippageBps: String(slippageBps),
+    excludeRouters: "jupiterz",
+  });
+  const referralParams = getJupiterReferralParams();
+  if (referralParams) {
+    search.set("referralAccount", referralParams.referralAccount);
+    search.set("referralFee", String(referralParams.referralFee));
+  }
+  const response = await fetch(`${JUPITER_SWAP_V2_API}/order?${search.toString()}`, {
+    headers: { "x-api-key": apiKey },
+  });
+  if (!response.ok) throw new Error(`Swap V2 quote failed: ${response.status} ${await response.text()}`);
+  const order = await response.json();
+  return validateJupiterQuote(order, {
+    inputMint,
+    outputMint,
+    inAmount: String(amountAtomic),
+    maxSlippageBps: slippageBps,
+    maxPriceImpactPct,
+    maxFeeBps: config.spot.maxFeeBps,
+  });
+}
+
+export async function getSpotRoundTripQuote({ mint, amountSol }) {
+  const outputMint = normalizeMint(mint);
+  const amount = assertSpotSwapAllowed({
+    mode: config.trading.mode,
+    direction: "buy",
+    inputMint: SOL_MINT,
+    outputMint,
+    amount: amountSol,
+    configuredTradeAmountSol: config.spot.tradeAmountSol,
+    maxTradeAmountSol: config.spot.maxTradeAmountSol,
+  });
+  const inputLamports = atomicAmount(amount, 9);
+  const startedAt = Date.now();
+  const buy = await fetchJupiterQuoteOnly({
+    inputMint: SOL_MINT,
+    outputMint,
+    amountAtomic: inputLamports,
+    slippageBps: config.spot.entrySlippageBps,
+    maxPriceImpactPct: config.spot.maxEntryPriceImpactPct,
+  });
+  const sell = await fetchJupiterQuoteOnly({
+    inputMint: outputMint,
+    outputMint: SOL_MINT,
+    amountAtomic: buy.outAmount,
+    slippageBps: config.spot.profitExitSlippageBps,
+    maxPriceImpactPct: config.spot.maxExitPriceImpactPct,
+  });
+  const viability = evaluateSpotRoundTripQuote({
+    inputLamports,
+    expectedReturnLamports: sell.outAmount,
+    maxLossPct: config.spot.maxEntryRoundTripLossPct,
+  });
+  return {
+    ...viability,
+    checkedAt: new Date().toISOString(),
+    durationMs: Date.now() - startedAt,
+    inputLamports,
+    expectedReturnLamports: sell.outAmount,
+    minimumReturnLamports: sell.minimumOutAmount,
+    buy: { router: buy.router, mode: buy.mode, priceImpactPct: buy.priceImpactPct, feeBps: buy.feeBps },
+    sell: { router: sell.router, mode: sell.mode, priceImpactPct: sell.priceImpactPct, feeBps: sell.feeBps },
+  };
 }
 
 async function executeJupiterSwap({

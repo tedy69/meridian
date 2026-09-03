@@ -66,6 +66,16 @@ function positiveNumberConfig(value, fallback) {
   return numeric != null && numeric > 0 ? numeric : fallback;
 }
 
+function nullablePositiveNumberConfig(value, fallback, label) {
+  if (value === null) return null;
+  if (value === undefined) return fallback;
+  const numeric = numericConfig(value);
+  if (numeric == null || numeric <= 0) {
+    throw new Error(`${label} must be null or a positive number`);
+  }
+  return numeric;
+}
+
 function nonNegativeNumberConfig(value, fallback) {
   const numeric = numericConfig(value);
   return numeric != null && numeric >= 0 ? numeric : fallback;
@@ -221,6 +231,12 @@ export function buildSpotConfig(userConfig = {}) {
   const stopLossTriggerPct = stopLossPct < 0 && configuredStopTrigger < 0 && configuredStopTrigger > stopLossPct
     ? configuredStopTrigger
     : -3;
+  const takeProfitPct = positiveNumberConfig(userConfig.spotTakeProfitPct, 1);
+  const minProfitExitPct = positiveNumberConfig(userConfig.spotMinProfitExitPct, 0.1);
+  const maxEntryRoundTripLossPct = positiveNumberConfig(userConfig.spotMaxEntryRoundTripLossPct, 0.75);
+  if (maxEntryRoundTripLossPct + minProfitExitPct >= takeProfitPct) {
+    throw new Error("spotMaxEntryRoundTripLossPct plus spotMinProfitExitPct must stay below spotTakeProfitPct");
+  }
 
   const realtimeCommitment = String(userConfig.spotRealtimeCommitment ?? "processed").trim().toLowerCase();
   if (!["processed", "confirmed", "finalized"].includes(realtimeCommitment)) {
@@ -242,7 +258,7 @@ export function buildSpotConfig(userConfig = {}) {
     gasReserveSol,
     minWalletSol: Number((tradeAmountSol + gasReserveSol).toFixed(9)),
     maxOpenPositions: 1,
-    maxDailyBuySol: positiveNumberConfig(userConfig.spotMaxDailyBuySol, 2),
+    maxDailyBuySol: nullablePositiveNumberConfig(userConfig.spotMaxDailyBuySol, null, "spotMaxDailyBuySol"),
     maxDailyLossSol: positiveNumberConfig(userConfig.spotMaxDailyLossSol, 0.05),
 
     minLiquidityUsd: positiveNumberConfig(userConfig.spotMinLiquidityUsd, 30_000),
@@ -273,21 +289,22 @@ export function buildSpotConfig(userConfig = {}) {
     profitExitSlippageBps: boundedPositiveIntegerConfig(userConfig.spotProfitExitSlippageBps, 50, 300, "spotProfitExitSlippageBps"),
     maxEntryPriceImpactPct: positiveNumberConfig(userConfig.spotMaxEntryPriceImpactPct, 1),
     maxExitPriceImpactPct: positiveNumberConfig(userConfig.spotMaxExitPriceImpactPct, 3),
+    maxEntryRoundTripLossPct,
     maxFeeBps: positiveIntegerConfig(userConfig.spotMaxFeeBps, 60),
     maxPriorityFeeLamports: positiveIntegerConfig(userConfig.spotMaxPriorityFeeLamports, 2_000_000),
     maxTotalFeeLamports: positiveIntegerConfig(userConfig.spotMaxTotalFeeLamports, 5_000_000),
     quoteMaxAgeMs: positiveIntegerConfig(userConfig.spotQuoteMaxAgeMs, 3_000),
     maxPriceBlockLag: positiveIntegerConfig(userConfig.spotMaxPriceBlockLag, 150),
 
-    takeProfitPct: positiveNumberConfig(userConfig.spotTakeProfitPct, 1),
-    minProfitExitPct: positiveNumberConfig(userConfig.spotMinProfitExitPct, 0.1),
+    takeProfitPct,
+    minProfitExitPct,
     stopLossPct: stopLossPct < 0 ? stopLossPct : -5,
     stopLossTriggerPct,
     trailingTriggerPct: positiveNumberConfig(userConfig.spotTrailingTriggerPct, 1.5),
     trailingDropPct: positiveNumberConfig(userConfig.spotTrailingDropPct, 0.5),
     maxHoldMinutes: positiveNumberConfig(userConfig.spotMaxHoldMinutes, 5),
     exitConfirmTicks: positiveIntegerConfig(userConfig.spotExitConfirmTicks, 1),
-    scanIntervalSec: positiveIntegerConfig(userConfig.spotScanIntervalSec, 15),
+    scanIntervalSec: positiveIntegerConfig(userConfig.spotScanIntervalSec, 5),
     managementPollIntervalSec: positiveIntegerConfig(userConfig.spotManagementPollIntervalSec, 1),
     realtimeEnabled: userConfig.spotRealtimeEnabled ?? true,
     realtimeCommitment,

@@ -87,7 +87,7 @@ export function beginSpotOpen(data, options = {}) {
 
 export function markSpotOpeningSubmitted(id, data = {}, options = {}) {
   const state = read(options);
-  if (!state.position || state.position.id !== id || state.position.status !== "opening") {
+  if (!state.position || state.position.id !== id || !["opening", "open"].includes(state.position.status)) {
     throw new Error(`Pending spot open ${id} was not found.`);
   }
   state.position.buyTx = data.buyTx || state.position.buyTx || null;
@@ -98,7 +98,7 @@ export function markSpotOpeningSubmitted(id, data = {}, options = {}) {
 
 export function confirmSpotOpen(id, data, options = {}) {
   const state = read(options);
-  if (!state.position || state.position.id !== id || state.position.status !== "opening") {
+  if (!state.position || state.position.id !== id || !["opening", "open"].includes(state.position.status)) {
     throw new Error(`Pending spot open ${id} was not found.`);
   }
   state.position = {
@@ -112,11 +112,11 @@ export function confirmSpotOpen(id, data, options = {}) {
     tokenDecimals: Number(data.tokenDecimals),
     entryTokenUsd: data.entryTokenUsd != null && Number.isFinite(Number(data.entryTokenUsd))
       ? Number(data.entryTokenUsd)
-      : null,
+      : state.position.entryTokenUsd ?? null,
     entrySolUsd: data.entrySolUsd != null && Number.isFinite(Number(data.entrySolUsd))
       ? Number(data.entrySolUsd)
-      : null,
-    openedAt: data.openedAt || new Date().toISOString(),
+      : state.position.entrySolUsd ?? null,
+    openedAt: state.position.openedAt || data.openedAt || new Date().toISOString(),
     buyTx: data.buyTx || state.position.buyTx || null,
   };
   write(state, options);
