@@ -25,6 +25,8 @@ import {
 } from "../execution-guard.js";
 import { normalizeSlippageBps } from "../trailing-safety.js";
 import { evaluateSpotRoundTripQuote } from "../spot-momentum.js";
+import { createMarketDataCache } from "../market-data-cache.js";
+const exitQuoteCache = createMarketDataCache({ maxEntries: 16 });
 
 let _connection = null;
 let _wallet = null;
@@ -723,8 +725,11 @@ async function fetchJupiterQuoteOnly({
   }
   const response = await fetch(`${JUPITER_SWAP_V2_API}/order?${search.toString()}`, {
     headers: { "x-api-key": apiKey },
+    signal: AbortSignal.timeout(config.spot.quoteMaxAgeMs),
   });
-  if (!response.ok) throw new Error(`Swap V2 quote failed: ${response.status} ${await response.text()}`);
+  if (!response.ok) throw Object.assign(new Error(`Swap V2 quote HTTP ${response.status}`), {
+    status: response.status, retryAfter: response.headers.get("retry-after"),
+  });
   const order = await response.json();
   return validateJupiterQuote(order, {
     inputMint,
@@ -734,6 +739,18 @@ async function fetchJupiterQuoteOnly({
     maxPriceImpactPct,
     maxFeeBps: config.spot.maxFeeBps,
   });
+}
+
+export async function getSpotExitQuote({ mint, rawAmount }) {
+  const inputMint = new PublicKey(mint).toBase58();
+  if (inputMint === SOL_MINT || !/^[1-9][0-9]*$/.test(String(rawAmount))) throw new Error("Valid tracked token amount is required for an exit quote");
+  return exitQuoteCache.get(`${inputMint}:${rawAmount}:${config.spot.profitExitSlippageBps}:${config.spot.maxTotalFeeLamports}`, async () => {
+    const quote = await fetchJupiterQuoteOnly({ inputMint, outputMint: SOL_MINT, amountAtomic: rawAmount,
+      slippageBps: config.spot.profitExitSlippageBps, maxPriceImpactPct: config.spot.maxExitPriceImpactPct });
+    const minimum = BigInt(quote.minimumOutAmount) - BigInt(config.spot.maxTotalFeeLamports);
+    return { ...quote, netValueSol: Number(minimum > 0n ? minimum : 0n) / LAMPORTS_PER_SOL,
+      checkedAt: new Date().toISOString(), basis: "minimum output less maximum transaction fee buffer" };
+  }, { ttlMs: config.spot.quoteMaxAgeMs, rateLimitKey: "jupiter-exit-quotes" });
 }
 
 export async function getSpotRoundTripQuote({ mint, amountSol }) {

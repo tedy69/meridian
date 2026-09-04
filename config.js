@@ -199,10 +199,23 @@ export function buildIndicatorConfig(userConfig = {}) {
 export function buildTradingConfig(userConfig = {}) {
   // Preserve existing installations unless they explicitly opt into spot.
   const requested = String(userConfig.tradingMode ?? "dlmm_lp").trim().toLowerCase();
-  if (!["dlmm_lp", "spot_momentum"].includes(requested)) {
-    throw new Error('tradingMode must be either "dlmm_lp" or "spot_momentum"');
+  if (!["dlmm_lp", "spot_momentum", "hybrid"].includes(requested)) {
+    throw new Error('tradingMode must be "dlmm_lp", "spot_momentum", or "hybrid"');
   }
   return { mode: requested };
+}
+
+export function buildHybridConfig(userConfig = {}) {
+  const spot = buildSpotConfig(userConfig);
+  return {
+    maxPositionSol: Math.min(0.5, spot.maxTradeAmountSol),
+    reserveSol: Math.max(0.1, spot.gasReserveSol),
+    maxDailyLossSol: Math.min(0.05, spot.maxDailyLossSol),
+    spotCostBufferSol: spot.maxTotalFeeLamports / 1e9,
+    // Recoverable LP rent still needs funding during the trade. Simulation
+    // enforces this cap against the total wallet debit before every native tx.
+    lpCostBufferSol: 0.06,
+  };
 }
 
 export function buildSpotDiscoveryConfig(userConfig = {}) {
@@ -345,6 +358,7 @@ function nonEmptyString(...values) {
 export const config = {
   // ─── Trading mode ─────────────────────────
   trading: buildTradingConfig(u),
+  hybrid: buildHybridConfig(u),
 
   // ─── Risk Limits ─────────────────────────
   risk: buildRiskConfig(u),
@@ -542,7 +556,8 @@ export const config = {
  *   4.0 SOL wallet → 1.33 SOL deploy
  */
 export function computeDeployAmount(walletSol, overrides = {}) {
-  const reserve  = overrides.gasReserve ?? config.management.gasReserve ?? 0.2;
+  const reserve  = overrides.gasReserve ?? (config.trading.mode === "hybrid"
+    ? config.hybrid.reserveSol + config.hybrid.lpCostBufferSol : config.management.gasReserve ?? 0.2);
   const pct      = overrides.positionSizePct ?? config.management.positionSizePct ?? 0.35;
   const floor    = overrides.deployAmountSol ?? config.management.deployAmountSol;
   const ceil     = Object.hasOwn(overrides, "maxDeployAmount")
@@ -551,7 +566,8 @@ export function computeDeployAmount(walletSol, overrides = {}) {
   const deployable = Math.max(0, walletSol - reserve);
   const dynamic    = deployable * pct;
   const uncapped   = Math.min(deployable, Math.max(floor, dynamic));
-  const result     = ceil === null ? uncapped : Math.min(ceil, uncapped);
+  let result     = ceil === null ? uncapped : Math.min(ceil, uncapped);
+  if (config.trading.mode === "hybrid") result = Math.min(result, config.hybrid.maxPositionSol);
   // Floor, rather than round, so full-wallet sizing never consumes part of
   // the configured gas reserve through a half-cent-style rounding increase.
   return Math.floor((result + Number.EPSILON) * 100) / 100;
@@ -564,7 +580,8 @@ export function computeDeployAmount(walletSol, overrides = {}) {
  * affordable, but lets a smaller wallet use all of its deployable SOL.
  */
 export function getAutoDeploySizing(walletSol, overrides = {}) {
-  const reserve = overrides.gasReserve ?? config.management.gasReserve ?? 0.2;
+  const reserve = overrides.gasReserve ?? (config.trading.mode === "hybrid"
+    ? config.hybrid.reserveSol + config.hybrid.lpCostBufferSol : config.management.gasReserve ?? 0.2);
   const configuredFloor = Number(overrides.deployAmountSol ?? config.management.deployAmountSol);
   const preferredMinimum = Number.isFinite(configuredFloor)
     ? Math.max(MIN_DEPLOY_AMOUNT_SOL, configuredFloor)

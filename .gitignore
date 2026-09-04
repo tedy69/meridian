@@ -27,6 +27,8 @@ decision-log.json
 execution-budget.json
 spot-state.json
 spot-risk-budget.json
+hybrid-risk-budget.json
+hybrid-entry-lock.json
 hivemind-cache.json
 signal-weights.json
 

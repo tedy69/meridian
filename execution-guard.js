@@ -133,8 +133,8 @@ export function assertSpotSwapAllowed({
   }
 
   if (direction === "buy") {
-    if (mode !== "spot_momentum") {
-      throw new Error("Spot buy is blocked unless tradingMode=spot_momentum.");
+    if (!["spot_momentum", "hybrid"].includes(mode)) {
+      throw new Error("Spot buy is blocked unless tradingMode=spot_momentum or hybrid.");
     }
     if (inputMint !== SOL_MINT || !outputMint || outputMint === SOL_MINT) {
       throw new Error("Spot buy must swap SOL into one validated non-SOL token.");

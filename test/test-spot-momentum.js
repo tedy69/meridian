@@ -43,6 +43,7 @@ import {
   getSpotPositionSnapshot,
   getSpotStatus,
   openSpotPosition,
+  validateSpotEntry,
 } from "../tools/spot.js";
 
 function withTempFiles(callback) {
@@ -310,10 +311,46 @@ test("broadly discovered pools still must pass the stricter fresh entry policy",
     sleep: async () => {},
   });
 
-  assert.equal(auditReads, 1, "pool should survive broad discovery and reach the fresh audit");
+  assert.equal(auditReads, 0, "known entry rejection should not consume audit/indicator API requests");
   assert.equal(result.shortlist_size, 1);
   assert.equal(result.candidates.length, 0);
   assert.match(result.filtered_examples[0].reason, /liquidity.*30000/i);
+});
+
+test("spot preflight accepts a normalized cross-DEX market in hybrid mode", async () => {
+  const { pool, tokenInfo } = passingCandidate();
+  pool.pool = "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2";
+  pool.venue = "raydium";
+  pool.price_source = "jupiter_quote";
+  const result = await validateSpotEntry(pool.pool, {
+    tradingMode: "hybrid", spotConfig: buildSpotConfig({}),
+    getPoolDetail: async () => pool,
+    getTokenInfo: async () => ({ results: [tokenInfo] }),
+    confirmIndicatorPreset: async () => pool.indicator_confirmation,
+    inspectMintSafety: async () => ({ legacyTokenProgram: true }),
+    getSpotRoundTripQuote: async () => ({ pass: true, expectedLossPct: 0.2 }),
+  });
+  assert.equal(result.pass, true, result.reason);
+  assert.equal(result.pool.venue, "raydium");
+});
+
+test("cross-DEX positions use tracked-size net exit quotes and never decode DLMM", async () => {
+  const position = { id: "spot-other", status: "open", mint: "mint", pool: "pool", priceSource: "jupiter_quote",
+    tokenRawAmount: "100000", tokenDecimals: 3, entryCostSol: 0.5, peakPnlPct: 0,
+    openedAt: "2026-09-04T12:00:00Z" };
+  const deps = { readSpotPosition: () => position, spotConfig: buildSpotConfig({}),
+    getTokenBalanceByMint: async () => ({ amount: 150, raw_amount: "150000", decimals: 3 }),
+    getActiveBin: async () => assert.fail("non-DLMM must not be decoded with DLMM SDK"),
+    getSpotExitQuote: async ({ rawAmount }) => { assert.equal(rawAmount, "100000"); return { netValueSol: 0.51 }; },
+    updateSpotObservation: (_id, value) => ({ ...position, ...value }),
+    now: () => new Date("2026-09-04T12:01:00Z") };
+  const result = await getSpotPositionSnapshot({}, deps);
+  assert.equal(result.current_value_sol, 0.51);
+  assert.equal(result.price_source, "jupiter_quote");
+  assert.equal(result.exit.action, "TAKE_PROFIT");
+  const failed = await getSpotPositionSnapshot({}, { ...deps, getSpotExitQuote: async () => { throw new Error("HTTP 429"); } });
+  assert.equal(failed.priceable, false);
+  assert.match(failed.reason, /429/);
 });
 
 test("candidate screening rejects a behavioral Token-2022 extension before AI selection", async () => {

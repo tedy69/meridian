@@ -4,6 +4,7 @@ import { appendDecision } from "../decision-log.js";
 import { assertSpotSwapAllowed, isDryRun, SOL_MINT } from "../execution-guard.js";
 import { log } from "../logger.js";
 import { getSpotRealtimeTelemetry } from "../spot-realtime.js";
+import { isSpotEnabled, withHybridEntry } from "../hybrid-risk.js";
 import {
   calculateSpotPnlPct,
   evaluateSpotExit,
@@ -32,13 +33,14 @@ import {
 } from "../spot-risk-budget.js";
 import { confirmIndicatorPreset } from "./chart-indicators.js";
 import { getActiveBin, getMyPositions } from "./dlmm.js";
-import { discoverPools, getPoolDetail } from "./screening.js";
+import { discoverSpotMarkets, getSpotMarket } from "./spot-markets.js";
 import { getTokenInfo } from "./token.js";
 import {
   buySpotToken,
   getFinalizedSlot,
   getJupiterPrices,
   getSpotRoundTripQuote,
+  getSpotExitQuote,
   getTokenBalanceByMint,
   inspectMintSafety,
   sellSpotToken,
@@ -112,6 +114,7 @@ function poolAddress(raw) {
 }
 
 function freshPoolCandidate(raw, indicatorConfirmation = null) {
+  if (raw?.base?.mint) return { ...raw, indicator_confirmation: indicatorConfirmation };
   const createdAt = tokenCreatedAtMs(raw);
   const tvl = safeNumber(raw?.tvl ?? raw?.active_tvl);
   const activeTvl = safeNumber(raw?.active_tvl ?? raw?.tvl);
@@ -164,8 +167,8 @@ function cheapPoolEvaluation(pool, policy) {
 
 function spotDeps(overrides = {}) {
   return {
-    discoverPools,
-    getPoolDetail,
+    discoverPools: discoverSpotMarkets,
+    getPoolDetail: getSpotMarket,
     getTokenInfo,
     confirmIndicatorPreset,
     getActiveBin,
@@ -175,6 +178,7 @@ function spotDeps(overrides = {}) {
     getJupiterPrices,
     getFinalizedSlot,
     getSpotRoundTripQuote,
+    getSpotExitQuote,
     buySpotToken,
     sellSpotToken,
     readSpotPosition,
@@ -207,8 +211,8 @@ function spotDeps(overrides = {}) {
 
 export async function getSpotMomentumCandidates({ limit = 10 } = {}, overrides = {}) {
   const deps = spotDeps(overrides);
-  if (deps.tradingMode !== "spot_momentum") {
-    return { candidates: [], blocked: true, reason: "tradingMode is not spot_momentum" };
+  if (!isSpotEnabled(deps.tradingMode)) {
+    return { candidates: [], blocked: true, reason: "tradingMode does not enable spot" };
   }
   const active = deps.readSpotPosition();
   if (active) return { candidates: [], blocked: true, reason: `spot position ${active.id} is ${active.status}` };
@@ -217,6 +221,7 @@ export async function getSpotMomentumCandidates({ limit = 10 } = {}, overrides =
   const entryPolicy = spotScreeningPolicy(deps.spotConfig);
   const discovery = await deps.discoverPools({ page_size: 50, profile: "spot_momentum" });
   const broadFiltered = [];
+  const seenMints = new Set();
   const pools = (discovery?.pools || [])
     .filter((pool) => {
       const evaluation = cheapPoolEvaluation(pool, discoveryPolicy);
@@ -224,12 +229,26 @@ export async function getSpotMomentumCandidates({ limit = 10 } = {}, overrides =
       return evaluation.pass;
     })
     .sort((a, b) => safeNumber(b.volume_active_tvl_ratio, 0) - safeNumber(a.volume_active_tvl_ratio, 0))
+    .filter((pool) => {
+      const mint = pool.base?.mint;
+      if (!mint || seenMints.has(mint)) return false;
+      seenMints.add(mint);
+      return true;
+    })
     .slice(0, 15);
   const candidates = [];
   const filtered = [];
 
   for (const pool of pools) {
     try {
+      const cheapEntry = cheapPoolEvaluation(pool, entryPolicy);
+      if (!cheapEntry.pass) { filtered.push({ name: pool.name, reason: cheapEntry.reason }); continue; }
+      const price = safeNumber(pool.price_change_pct);
+      const volumeChange = safeNumber(pool.volume_change_pct);
+      if (price == null || price < entryPolicy.minPriceChange5mPct || price > entryPolicy.maxPriceChange5mPct
+        || volumeChange == null || volumeChange < entryPolicy.minVolumeChangePct) {
+        filtered.push({ name: pool.name, reason: "5-minute spike is absent or above the anti-chase limit." }); continue;
+      }
       const mint = pool.base?.mint;
       const [tokenResult, momentum, mintSafety] = await Promise.all([
         deps.getTokenInfo({ query: mint }),
@@ -287,7 +306,9 @@ export async function getSpotMomentumCandidates({ limit = 10 } = {}, overrides =
     shortlist_size: pools.length,
     discovery_rejected: broadFiltered.length,
     fresh_rejected: filtered.length,
-    filtered_examples: [...filtered, ...broadFiltered].slice(0, 5),
+    source_errors: discovery?.source_errors || [],
+    coverage: discovery?.coverage || null,
+    filtered_examples: [...filtered, ...broadFiltered, ...(discovery?.filtered_examples || [])].slice(0, 5),
   };
 }
 
@@ -315,7 +336,9 @@ export async function validateSpotEntry(poolAddressValue, overrides = {}) {
     return { pass: false, reason: "Fresh pool snapshot shows unsafe token ownership concentration." };
   }
 
-  const baseMint = raw?.token_x?.address ?? raw?.base_token_address ?? null;
+  const baseMint = raw?.base?.mint ?? raw?.token_x?.address ?? raw?.base_token_address ?? null;
+  const cheapEntry = cheapPoolEvaluation(freshPoolCandidate(raw), spotScreeningPolicy(deps.spotConfig));
+  if (!cheapEntry.pass) return cheapEntry;
   try {
     const [tokenResult, momentum, mintSafety, roundTripQuote] = await Promise.all([
       deps.getTokenInfo({ query: baseMint }),
@@ -375,7 +398,7 @@ export async function validateSpotEntry(poolAddressValue, overrides = {}) {
 export function validateSpotOpenRequest(args = {}, overrides = {}) {
   const tradingMode = overrides.tradingMode ?? config.trading.mode;
   const spotConfig = overrides.spotConfig ?? config.spot;
-  if (tradingMode !== "spot_momentum") return { pass: false, reason: "tradingMode is not spot_momentum" };
+  if (!isSpotEnabled(tradingMode)) return { pass: false, reason: "tradingMode does not enable spot" };
   if (!args.pool_address) return { pass: false, reason: "pool_address is required" };
   try {
     new PublicKey(args.pool_address);
@@ -399,6 +422,11 @@ export function validateSpotOpenRequest(args = {}, overrides = {}) {
 }
 
 export async function openSpotPosition({ pool_address } = {}, overrides = {}) {
+  return withHybridEntry({ strategy: "spot", amountSol: (overrides.spotConfig ?? config.spot).tradeAmountSol },
+    () => openSpotPositionImpl({ pool_address }, overrides));
+}
+
+async function openSpotPositionImpl({ pool_address }, overrides = {}) {
   const deps = spotDeps(overrides);
   const request = validateSpotOpenRequest({ pool_address }, overrides);
   if (!request.pass) return { success: false, blocked: true, reason: request.reason };
@@ -408,7 +436,11 @@ export async function openSpotPosition({ pool_address } = {}, overrides = {}) {
     deps.getMyPositions({ force: true, silent: true }),
     validateSpotEntry(pool_address, overrides),
   ]);
-  if ((lpPositions?.total_positions ?? lpPositions?.positions?.length ?? 0) > 0) {
+  if (!lpPositions || !Array.isArray(lpPositions.positions) || !Number.isInteger(lpPositions.total_positions)
+    || lpPositions.total_positions !== lpPositions.positions.length) {
+    return { success: false, blocked: true, reason: "Fresh LP position snapshot is unavailable or inconsistent." };
+  }
+  if (lpPositions.total_positions > 0) {
     return { success: false, blocked: true, reason: "An LP position is still open; mixed LP and spot exposure is blocked." };
   }
   if (!preflight.pass) return { success: false, blocked: true, reason: preflight.reason, risk_metrics: preflight.metrics ?? null };
@@ -450,6 +482,9 @@ export async function openSpotPosition({ pool_address } = {}, overrides = {}) {
     pending = deps.beginSpotOpen({
       pool: preflight.pool.pool,
       poolName: preflight.pool.name,
+      venue: preflight.pool.venue,
+      marketSource: preflight.pool.market_source,
+      priceSource: preflight.pool.price_source,
       mint: preflight.pool.base.mint,
       symbol: preflight.pool.base.symbol,
       entryCostSol: amountSol,
@@ -595,7 +630,7 @@ export async function getSpotPositionSnapshot(_args = {}, overrides = {}) {
 
   const [balance, activeBinResult] = await Promise.all([
     deps.getTokenBalanceByMint(position.mint),
-    deps.getActiveBin({ pool_address: position.pool })
+    (position.priceSource === "jupiter_quote" ? Promise.resolve(null) : deps.getActiveBin({ pool_address: position.pool }))
       .then((value) => ({ value, error: null }))
       .catch((error) => ({ value: null, error })),
   ]);
@@ -614,7 +649,16 @@ export async function getSpotPositionSnapshot(_args = {}, overrides = {}) {
   let activeBinId = null;
   let poolPriceSolPerToken = null;
 
-  if (activeBinPrice != null && activeBinPrice > 0) {
+  if (position.priceSource === "jupiter_quote") {
+    try {
+      const quote = await deps.getSpotExitQuote({ mint: position.mint, rawAmount: trackedRaw.toString() });
+      currentValueSol = quote.netValueSol;
+      if (!Number.isFinite(currentValueSol) || currentValueSol < 0) throw new Error("Net exit quote is invalid");
+      priceSource = "jupiter_quote";
+    } catch (error) {
+      return { position, status: "open", priceable: false, reason: `Executable exit quote unavailable: ${error.message}` };
+    }
+  } else if (activeBinPrice != null && activeBinPrice > 0) {
     currentValueSol = trackedTokenAmount * activeBinPrice;
     priceSource = "meteora_active_bin_confirmed";
     activeBinId = safeNumber(activeBinResult.value?.binId);
