@@ -1,10 +1,14 @@
 import { config } from "../config.js";
 import { log } from "../logger.js";
-import { agentMeridianJson, getAgentMeridianHeaders } from "./agent-meridian.js";
+import { agentMeridianJson, getAgentMeridianBase, getAgentMeridianHeaders } from "./agent-meridian.js";
 import { safeNumber } from "../utils/number.js";
+import { createMarketDataCache } from "../market-data-cache.js";
 
 const DEFAULT_INTERVALS = ["5_MINUTE"];
 const DEFAULT_CANDLES = 298;
+const INDICATOR_SNAPSHOT_TTL_MS = 5_000;
+const INDICATOR_REQUEST_TIMEOUT_MS = 4_000;
+const indicatorCache = createMarketDataCache();
 
 function normalizeIntervals(intervals) {
   const list = Array.isArray(intervals) ? intervals : DEFAULT_INTERVALS;
@@ -294,9 +298,20 @@ async function fetchChartIndicatorsForMint(
   });
   if (refresh) search.set("refresh", "1");
 
-  return agentMeridianJson(`/chart-indicators/${mint}?${search.toString()}`, {
-    headers: getAgentMeridianHeaders(),
-  });
+  // An explicit refresh still shares a very recent snapshot/in-flight request.
+  // Only an actual miss asks upstream to refresh; old data is never a fallback.
+  return indicatorCache.get(
+    JSON.stringify([mint, normalizedInterval, candles, rsiLength]),
+    async () => {
+      const requestedAt = Date.now();
+      const payload = await agentMeridianJson(`/chart-indicators/${mint}?${search.toString()}`, {
+        headers: getAgentMeridianHeaders(),
+        signal: AbortSignal.timeout(INDICATOR_REQUEST_TIMEOUT_MS),
+      });
+      return { payload, requestedAt };
+    },
+    { ttlMs: INDICATOR_SNAPSHOT_TTL_MS, rateLimitKey: `${getAgentMeridianBase()}:chart-indicators` },
+  );
 }
 
 export async function confirmIndicatorPreset({
@@ -327,7 +342,7 @@ export async function confirmIndicatorPreset({
   const results = [];
   for (const interval of targets) {
     try {
-      const payload = await fetchChartIndicatorsForMint(mint, { interval, refresh });
+      const { payload, requestedAt } = await fetchChartIndicatorsForMint(mint, { interval, refresh });
       const evaluation = evaluateIndicatorPreset(side, preset, payload, config.indicators);
       results.push({
         interval,
@@ -336,6 +351,7 @@ export async function confirmIndicatorPreset({
         reason: evaluation.reason,
         signal: evaluation.signal,
         latest: payload?.latest || null,
+        snapshotRequestedAt: requestedAt,
       });
     } catch (error) {
       log("indicators_warn", `Indicator fetch failed for ${mint.slice(0, 8)} ${interval}: ${error.message}`);
@@ -344,6 +360,20 @@ export async function confirmIndicatorPreset({
         ok: false,
         confirmed: null,
         reason: error.message,
+        signal: null,
+        latest: null,
+      });
+    }
+  }
+
+  // A fast first interval can expire while a later interval is fetched.
+  const confirmedAt = Date.now();
+  for (const result of results) {
+    if (result.ok && (confirmedAt < result.snapshotRequestedAt || confirmedAt - result.snapshotRequestedAt >= INDICATOR_SNAPSHOT_TTL_MS)) {
+      Object.assign(result, {
+        ok: false,
+        confirmed: null,
+        reason: "Indicator snapshot expired before multi-interval confirmation; refusing stale data.",
         signal: null,
         latest: null,
       });
