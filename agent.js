@@ -70,6 +70,11 @@ const INTENT_PATTERNS = [
 ];
 
 function getToolsForRole(agentType, goal = "") {
+  if (config.trading.mode === "hybrid" && ["MANAGER", "SCREENER"].includes(agentType)) {
+    const allowed = agentType === "MANAGER" ? new Set([...MANAGER_TOOLS, ...SPOT_MANAGER_TOOLS, "get_trading_status"])
+      : new Set([...SCREENER_TOOLS, ...SPOT_SCREENER_TOOLS, "get_trading_status"]);
+    return tools.filter((t) => allowed.has(t.function.name));
+  }
   if (config.trading.mode === "spot_momentum" && agentType === "MANAGER") {
     return tools.filter(t => SPOT_MANAGER_TOOLS.has(t.function.name));
   }
@@ -91,6 +96,7 @@ function getToolsForRole(agentType, goal = "") {
   const selected = matched.size === 0
     ? tools.filter(t => !GENERAL_INTENT_ONLY_TOOLS.has(t.function.name))
     : tools.filter(t => matched.has(t.function.name));
+  if (config.trading.mode === "hybrid") return [...new Map([...selected, ...tools.filter((t) => t.function.name === "get_trading_status")].map((t) => [t.function.name, t])).values()];
   return config.trading.mode === "spot_momentum"
     ? selected.filter(t => t.function.name !== "deploy_position")
     : selected.filter(t => t.function.name !== "open_spot_position");

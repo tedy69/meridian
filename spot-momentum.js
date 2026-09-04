@@ -62,6 +62,7 @@ export function calculateSpotSpikeScore({
 export function evaluateSpotMomentumCandidate({ pool, tokenInfo, policy = {} } = {}) {
   const p = spotScreeningPolicy(policy);
   const baseMint = pool?.base?.mint ?? null;
+  if (tokenInfo?.audit?.is_sus === true) return reject("Token audit flags suspicious activity.");
   const quoteMint = pool?.quote?.mint ?? null;
   const liquidity = finite(pool?.active_tvl ?? pool?.tvl);
   const volume = finite(pool?.volume_window);

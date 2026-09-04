@@ -6,7 +6,7 @@
   "llmModel": "minimax/minimax-m2.7",
   "dryRun": true,
 
-  "tradingMode": "dlmm_lp",
+  "tradingMode": "hybrid",
   "spotTradeAmountSol": 0.5,
   "spotMaxTradeAmountSol": 0.5,
   "spotGasReserveSol": 0.1,
@@ -64,7 +64,7 @@
   "maxPositions": 1,
   "minSolToOpen": 0.55,
   "maxDeployAmount": 0.3,
-  "maxDailyDeploySol": 0.5,
+  "maxDailyDeploySol": null,
   "lossCircuitBreakerEnabled": true,
   "lossCircuitWindowPositions": 5,
   "maxConsecutiveLosses": 3,

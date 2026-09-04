@@ -1,5 +1,7 @@
 import { config } from "../config.js";
 import { getGmgnTokenFees, hasGmgnApiKey } from "./gmgn.js";
+import { createMarketDataCache } from "../market-data-cache.js";
+const tokenInfoCache = createMarketDataCache();
 
 const DATAPI_BASE = "https://datapi.jup.ag/v1";
 
@@ -34,9 +36,13 @@ export async function getTokenNarrative({ mint }) {
  * Returns condensed token info useful for confidence scoring.
  */
 export async function getTokenInfo({ query }) {
+  return tokenInfoCache.get(query, () => fetchTokenInfo(query), { ttlMs: 5000, rateLimitKey: "jupiter-token-audit" });
+}
+
+async function fetchTokenInfo(query) {
   const url = `${DATAPI_BASE}/assets/search?query=${encodeURIComponent(query)}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Token search API error: ${res.status}`);
+  const res = await fetch(url, { signal: AbortSignal.timeout(4000) });
+  if (!res.ok) throw Object.assign(new Error(`Token search API error: ${res.status}`), { status: res.status, retryAfter: res.headers.get("retry-after") });
   const data = await res.json();
   const tokens = Array.isArray(data) ? data : [data];
   if (!tokens.length) return { found: false, query };
@@ -56,6 +62,7 @@ export async function getTokenInfo({ query }) {
     global_fees_sol: t.fees != null ? parseFloat(t.fees.toFixed(2)) : null, // refined to GMGN below
 
     audit: t.audit ? {
+      is_sus: t.audit.isSus === true,
       mint_disabled: t.audit.mintAuthorityDisabled,
       freeze_disabled: t.audit.freezeAuthorityDisabled,
       top_holders_pct: t.audit.topHoldersPercentage?.toFixed(2),

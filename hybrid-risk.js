@@ -28,6 +28,10 @@ export function assertHybridSimulationBalance(postBalanceSol) {
   if (held.walletSol - postBalanceSol > held.maximumDebitSol + 1e-9) throw new Error("Hybrid simulation exceeds reserved total SOL debit");
 }
 export const isHybridEntryExecuting = () => Boolean(execution.getStore());
+export function markHybridSubmissionAttempted() {
+  const held = execution.getStore();
+  if (held) held.submissionAttempted = true;
+}
 
 function loadLedger(file, date, walletSol, priorLossSol) {
   const initial = { date, lastFlatBalanceSol: walletSol, lossSol: priorLossSol };
@@ -80,9 +84,13 @@ export function createHybridEntryGuard({ directory, policy, getSpotPosition, get
         // From this point an exception could mean a submitted/partially landed
         // transaction. Keep the cross-process lock until operator reconciliation.
         retainLock = true;
-        const result = await execution.run({ walletSol, reserveSol: policy.reserveSol,
-          maximumDebitSol: amountSol + budget.costBufferSol }, execute);
-        const unresolved = result?.pending === true || (result?.submission_attempted === true && result?.success !== true)
+        const scope = { walletSol, reserveSol: policy.reserveSol, maximumDebitSol: amountSol + budget.costBufferSol, submissionAttempted: false };
+        let result = await execution.run(scope, execute);
+        if (scope.submissionAttempted && (result?.success !== true || !result?.position)) {
+          result = { ...result, pending: true, submission_attempted: true };
+        }
+        const unresolved = !result || (result.success !== true && result.success !== false && result.blocked !== true)
+          || result?.pending === true || (result?.submission_attempted === true && result?.success !== true)
           || (result?.success === true && !result?.position);
         retainLock = unresolved;
         return result;
@@ -91,6 +99,15 @@ export function createHybridEntryGuard({ directory, policy, getSpotPosition, get
       }
     },
   };
+}
+
+export function getHybridRiskStatus() {
+  const ledger = repoPath("hybrid-risk-budget.json");
+  const lock = repoPath("hybrid-entry-lock.json");
+  return { mode: config.trading.mode, policy: config.hybrid,
+    entry_pending: fs.existsSync(lock),
+    ledger: fs.existsSync(ledger) ? JSON.parse(fs.readFileSync(ledger, "utf8")) : null,
+    accounting_basis: "Flat-wallet SOL drawdown; cumulative observed losses do not reset on a gain or deposit. External transfers can affect this measure." };
 }
 
 let runtimeGuard;
@@ -112,7 +129,8 @@ export async function withHybridEntry({ strategy, amountSol }, execute) {
         // use actual flat-wallet SOL drawdown, not LP fees or indicative USD value.
         const lpLoss = lessons.getAllPerformanceRecords().filter((p) => String(p.recorded_at || "").slice(0, 10) === date)
           .reduce((sum, p) => {
-            if (!Number.isFinite(Number(p.pnl_pct)) || !Number.isFinite(Number(p.amount_sol))) throw new Error("LP loss history lacks cost evidence");
+            if (p.pnl_pct == null || p.amount_sol == null || !Number.isFinite(Number(p.pnl_pct))
+              || !Number.isFinite(Number(p.amount_sol)) || Number(p.amount_sol) <= 0) throw new Error("LP loss history lacks cost evidence");
             return sum + Math.max(0, -Number(p.pnl_pct)) * Number(p.amount_sol) / 100;
           }, 0);
         return spotLoss + lpLoss;

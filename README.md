@@ -4,7 +4,7 @@
 
 **Links:** [Website](https://agentmeridian.xyz) | [Telegram](https://t.me/agentmeridian) | [X](https://x.com/meridian_agent)
 
-Meridian can run either the original Meteora DLMM strategy or a fast spot-momentum strategy. Spot mode targets early momentum spikes and uses deterministic token, liquidity, momentum, quote, and transaction gates around an AI candidate-ranking step.
+Meridian supports `dlmm_lp`, `spot_momentum`, and opt-in `hybrid` mode. Spot discovery scans cross-DEX SOL pairs using Jupiter token feeds and DEX Screener; execution uses validated Jupiter routes. Hybrid scans both strategies and alternates between spot and LP with at most one combined position. Automatic spot/hybrid entry selection and spot exits are deterministic, without an LLM in the transaction hot path.
 
 ---
 
@@ -26,8 +26,8 @@ Meridian runs a **ReAct agent loop** for candidate judgment, while the backend o
 
 | Agent | Default interval | Role |
 |---|---|---|
-| **Spot Screening Agent** | Every 30 sec | Ranks only candidates that passed deterministic gates; the backend repeats every check before a buy |
-| **Spot Manager** | Every 5 sec | Reads finalized balance and fresh price, then applies mechanical exits without waiting for the LLM |
+| **Spot / hybrid scanner** | Every 5 sec when idle | Independent entry gates; hybrid prioritizes eligible spot, otherwise independently eligible LP |
+| **Spot Manager** | Account-change events + 1 sec fallback | Finalized tracked balance and bounded-fresh exit valuation; actual RPC/API and settlement latency vary |
 | **DLMM Screening Agent** | Every 30 min | Pool screening — finds and deploys into the best LP candidate |
 | **DLMM Management Agent** | Every 10 min | Position management — evaluates each open LP position and acts |
 
@@ -143,6 +143,21 @@ LIVE_TRADING_ENABLED=true
 Existing installs remain in `dlmm_lp` mode until `tradingMode` is explicitly changed. Its default limits are one position, 0.3 SOL maximum per position, and 0.5 SOL maximum deploy attempts per UTC day.
 
 In `spot_momentum` mode, the default entry is exactly 0.5 SOL with one open position, a 0.1 SOL gas reserve, no daily turnover ceiling, and a 0.05 SOL realized-loss circuit breaker. This requires at least 0.6 SOL in the execution wallet. The LLM cannot change these execution limits. Spot mode has no timed re-entry cooldown, but every new entry must pass a completely fresh backend preflight.
+
+### Hybrid and cross-DEX spot
+
+The example configuration opts into `"tradingMode": "hybrid"` with `dryRun: true`; an existing `user-config.json` is **not** changed automatically. Review it before enabling live execution. The example has no daily SOL-turnover cap (`maxDailyDeploySol` and `spotMaxDailyBuySol` are `null`); daily loss controls remain active.
+
+- Spot discovery combines Jupiter `toptrending/5m` and `toptraded/5m`, deduplicates by mint, and batch-resolves up to 30 eligible mints via DEX Screener. Raydium, PumpSwap, Orca and other SOL-quoted pairs can qualify. Coverage is bounded, not every token/pair. Pool identity, token audit, authorities, token program, momentum and executable round-trip cost are rechecked at entry.
+- **LP execution still supports Meteora DLMM only.** A Raydium/Orca spot market is not an LP adapter. An unsafe spot token is not automatically a safe LP fallback; hybrid LP requires its own full preflight, clean authorities/program, native simulation, and 1.5% SDK price slippage tolerance. LP fees do not guarantee net profit and impermanent loss remains possible.
+- Shared principal cap: **0.5 SOL**, with **0.1 SOL reserve** plus separate cost funding. Default spot needs **0.605 SOL** in hybrid (0.5 principal + 0.1 reserve + 0.005 maximum fee buffer). With only 0.5 SOL total, this fixed-size spot entry is skipped; LP can size down after reserving another 0.06 SOL for bounded fees/recoverable rent. Neither strategy may consume the other's budget or overlap exposure.
+- `hybrid-entry-lock.json` is created atomically before admission across processes. Existing/opening/closing positions, unknown LP snapshots, and pending close settlements block entry. Uncertain submissions keep the lock across restarts; **there is no timed unlock**. Before manual recovery, stop all bot/CLI entry processes, verify the recorded strategy plus local state, signatures, finalized accounts/balances and outstanding settlements, then reconcile the lock/state. Never delete a lock just to force another trade. Ordinary pre-submission rejection releases admission.
+- `hybrid-risk-budget.json` tracks cumulative negative SOL balance changes while the wallet is flat. Profits/deposits do not erase already recorded losses; external wallet transfers can distort attribution. Existing same-day spot realized losses and conservative LP cost-basis loss estimates seed/check the limit. The shared 0.05 SOL daily loss admission cap is **not** a guaranteed maximum market loss or audited trade PnL.
+- Non-DLMM spot valuation uses the tracked token amount's Jupiter minimum sell output minus the maximum transaction-fee buffer, cached for at most 3 seconds from request start. Profit exits still demand a fresh executable net-output floor; a displayed quote is not a filled trade. Legacy DLMM spot positions retain their active-bin path. Provider timeouts/429s fail closed with bounded backoff, never stale fallback; indicator snapshots are deduplicated and valid for at most 5 seconds. Account notifications are not guaranteed millisecond execution.
+
+`/status` and `/positions` show **both** spot and LP (failed reads show `unknown`). `/screen` is read-only and labels candidate strategy/venue; `/deploy <n>` reruns the selected strategy's preflight. Use `/close spot` for spot, `/close <n>` for LP, or `/closeall` for both. CLI equivalents include `trading-status`, `spot-status`, `spot-candidates --limit 5`, `spot-open --pool <pair> --dry-run`, and `spot-close --dry-run`.
+
+Provider contracts: [Jupiter Tokens V2](https://developers.jup.ag/docs/tokens/token-information), [DEX Screener API](https://docs.dexscreener.com/api/reference), [Jupiter order and execute](https://developers.jup.ag/docs/swap/order-and-execute). No configuration can guarantee profit, prevent every scam/MEV attack, or eliminate loss. Validate with dry-run before authorizing deployment or live trading.
 
 On startup Meridian fetches your wallet balance, open positions, and top pool candidates, then begins autonomous cycles immediately.
 
@@ -502,7 +517,7 @@ All fields are optional — defaults shown. Edit `user-config.json`.
 
 | Field | Default | Description |
 |---|---|---|
-| `tradingMode` | `dlmm_lp` | Set to `spot_momentum` to enable the fast spot engine; existing installs never switch implicitly |
+| `tradingMode` | `dlmm_lp` | `spot_momentum` for cross-DEX spot only; `hybrid` for alternating spot + DLMM LP. Existing installs never switch implicitly; the example opts into hybrid dry-run |
 | `spotTradeAmountSol` | `0.5` | Exact SOL input for each accepted entry |
 | `spotMaxTradeAmountSol` | `0.5` | Hard backend ceiling; must not be lower than the configured entry |
 | `spotGasReserveSol` | `0.1` | SOL that must remain available beyond the entry capital |

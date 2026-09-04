@@ -26,6 +26,7 @@ import {
 import { normalizeSlippageBps } from "../trailing-safety.js";
 import { evaluateSpotRoundTripQuote } from "../spot-momentum.js";
 import { createMarketDataCache } from "../market-data-cache.js";
+import { isHybridEntryExecuting, markHybridSubmissionAttempted } from "../hybrid-risk.js";
 const exitQuoteCache = createMarketDataCache({ maxEntries: 16 });
 
 let _connection = null;
@@ -797,6 +798,16 @@ export async function getSpotRoundTripQuote({ mint, amountSol }) {
   };
 }
 
+export async function runSubmittedSwapStep(step, expectedSignature) {
+  try { return await step(); }
+  catch (cause) {
+    const error = new Error(cause?.message || "Submitted swap outcome is uncertain", { cause });
+    error.submissionAttempted = true;
+    error.signature = expectedSignature;
+    throw error;
+  }
+}
+
 async function executeJupiterSwap({
   inputMint,
   outputMint,
@@ -901,20 +912,22 @@ async function executeJupiterSwap({
     now: Date.now(),
     ...orderPolicy,
   });
-  const execRes = await fetch(`${JUPITER_SWAP_V2_API}/execute`, {
+  markHybridSubmissionAttempted();
+  const execRes = await runSubmittedSwapStep(() => fetch(`${JUPITER_SWAP_V2_API}/execute`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       "x-api-key": jupiterApiKey,
     },
     body: JSON.stringify({ signedTransaction, requestId: order.requestId, lastValidBlockHeight: order.lastValidBlockHeight }),
-  });
+  }), expectedSignature);
   if (!execRes.ok) {
-    const error = new Error(`Swap V2 execute failed: ${execRes.status} ${await execRes.text()}`);
+    const error = new Error(`Swap V2 execute failed: HTTP ${execRes.status}`);
     error.submissionAttempted = true;
+    error.signature = expectedSignature;
     throw error;
   }
-  const result = await execRes.json();
+  const result = await runSubmittedSwapStep(() => execRes.json(), expectedSignature);
   let executed;
   try {
     executed = validateJupiterExecutionResult(result, {
@@ -925,10 +938,10 @@ async function executeJupiterSwap({
   } catch (cause) {
     const error = new Error(cause.message);
     error.submissionAttempted = true;
-    error.signature = result.signature || null;
+    error.signature = expectedSignature;
     throw error;
   }
-  const confirmation = await connection.confirmTransaction(executed.signature, "finalized");
+  const confirmation = await runSubmittedSwapStep(() => connection.confirmTransaction(executed.signature, "finalized"), expectedSignature);
   if (confirmation.value.err) {
     const error = new Error(`Swap finalized with on-chain error: ${JSON.stringify(confirmation.value.err)}`);
     error.submissionAttempted = true;
@@ -1006,6 +1019,9 @@ export async function swapToken({
 }
 
 export async function buySpotToken({ mint, amountSol }) {
+  if (config.trading.mode === "hybrid" && !isDryRun() && !isHybridEntryExecuting()) {
+    throw new Error("Hybrid spot buy requires shared entry admission");
+  }
   const outputMint = normalizeMint(mint);
   const amount = assertSpotSwapAllowed({
     mode: config.trading.mode,

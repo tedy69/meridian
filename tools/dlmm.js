@@ -38,6 +38,8 @@ import { assertLiveTradingEnabled, assertMainnetRpc, assertOnChainWriteAllowed, 
 import { evaluateCloseProof } from "../close-settlement.js";
 import { normalizeSlippageBps } from "../trailing-safety.js";
 import { isUrgentStopLossClose } from "../stop-loss-safety.js";
+import { isLpEnabled, withHybridEntry, isHybridEntryExecuting, assertHybridSimulationBalance, markHybridSubmissionAttempted } from "../hybrid-risk.js";
+import { getSpotPosition } from "../spot-state.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 // @meteora-ag/dlmm → @coral-xyz/anchor uses CJS directory imports
@@ -109,7 +111,8 @@ function getWallet() {
 export async function simulateThenSendAndConfirmTransaction(connection, transaction, signers) {
   assertOnChainWriteAllowed("DLMM transaction submission");
   await assertMainnetRpc(connection, "DLMM transaction submission");
-  const simulation = await connection.simulateTransaction(transaction, signers);
+  const simulation = await connection.simulateTransaction(transaction, signers,
+    isHybridEntryExecuting() ? [signers[0].publicKey] : undefined);
   if (simulation.value.err) {
     const logs = Array.isArray(simulation.value.logs)
       ? simulation.value.logs.slice(-12).join(" | ")
@@ -118,6 +121,11 @@ export async function simulateThenSendAndConfirmTransaction(connection, transact
       `Local DLMM transaction simulation failed: ${JSON.stringify(simulation.value.err)} (${logs})`,
     );
   }
+  if (isHybridEntryExecuting()) {
+    const lamports = simulation.value.accounts?.[0]?.lamports;
+    assertHybridSimulationBalance(typeof lamports === "number" ? lamports / 1e9 : NaN);
+  }
+  markHybridSubmissionAttempted();
   return sendAndConfirmTransactionRaw(connection, transaction, signers);
 }
 
@@ -617,7 +625,22 @@ export async function getActiveBin({ pool_address }) {
 }
 
 // ─── Deploy Position ───────────────────────────────────────────
-export async function deployPosition({
+export async function deployPosition(args = {}) {
+  if (!isLpEnabled()) return { success: false, blocked: true, reason: "Trading mode does not enable LP" };
+  if (getSpotPosition()) return { success: false, blocked: true, reason: "A spot position is still open or unresolved" };
+  return withHybridEntry({ strategy: "lp", amountSol: Number(args.amount_y ?? args.amount_sol) }, async () => {
+    if (config.trading.mode === "hybrid") {
+      if (shouldUseLpAgentRelayForDeploy()) return { success: false, blocked: true, reason: "Hybrid requires native LP simulation; relay entry is disabled" };
+      // Keep direct CLI callers behind the same fresh backend gates as AI tools.
+      const { runSafetyChecks } = await import("./executor.js");
+      const safety = await runSafetyChecks("deploy_position", args);
+      if (!safety.pass) return { success: false, blocked: true, reason: safety.reason };
+    }
+    return deployPositionImpl(args);
+  });
+}
+
+async function deployPositionImpl({
   pool_address,
   amount_sol, // legacy: will be used as amount_y if amount_y is not provided
   amount_x,
@@ -990,7 +1013,7 @@ export async function deployPosition({
         totalXAmount: totalXLamports,
         totalYAmount: totalYLamports,
         strategy: { minBinId, maxBinId, strategyType },
-        slippage: 10, // 10%
+        slippage: config.trading.mode === "hybrid" ? 1.5 : 10, // SDK percentage, not bps
       });
       const addTxArray = Array.isArray(addTxs) ? addTxs : [addTxs];
       for (let i = 0; i < addTxArray.length; i++) {
@@ -1006,7 +1029,7 @@ export async function deployPosition({
         totalXAmount: totalXLamports,
         totalYAmount: totalYLamports,
         strategy: { maxBinId, minBinId, strategyType },
-        slippage: 1000, // 10% in bps
+        slippage: config.trading.mode === "hybrid" ? 1.5 : 10, // SDK percentage, not bps
       });
       const txHash = await simulateThenSendAndConfirmTransaction(getConnection(), tx, [wallet, newPosition]);
       txHashes.push(txHash);

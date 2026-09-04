@@ -49,6 +49,19 @@ test("feeds deduplicate by mint and select deepest SOL pair across DEXs", async 
   assert.equal(result.unique_mints, 1);
 });
 
+test("pair discovery batches multiple mints into one bounded API request", async () => {
+  const other = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+  let pairCalls = 0;
+  const provider = createSpotMarketProvider({ now: () => now, requestJson: async (url) => {
+    if (url.includes("tokens/v2")) return [token(), { ...token(), id: other }];
+    pairCalls++;
+    return [pair(), { ...pair("orca"), baseToken: { address: other, symbol: "OTHER" } }];
+  } });
+  const result = await provider.discover();
+  assert.equal(pairCalls, 1);
+  assert.equal(result.pools.length, 2);
+});
+
 test("one failed discovery source is visible, not treated as healthy empty discovery", async () => {
   const provider = createSpotMarketProvider({ now: () => now, requestJson: async (url) => {
     if (url.includes("toptrending")) throw new Error("HTTP 429");

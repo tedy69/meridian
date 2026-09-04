@@ -12,6 +12,13 @@ test("syntax test script propagates parse failures", () => {
   assert.match(manifest.scripts?.["test:syntax"] || "", /xargs -0 -n 1 node --check/);
 });
 
+test("Docker builds exclude live spot state and hybrid admission/risk ledgers", () => {
+  const ignored = fs.readFileSync(new URL("../.dockerignore", import.meta.url), "utf8").split(/\r?\n/);
+  for (const file of ["spot-state.json", "spot-risk-budget.json", "hybrid-entry-lock.json", "hybrid-risk-budget.json"]) {
+    assert.ok(ignored.includes(file), `${file} must remain runtime-only`);
+  }
+});
+
 test("the runtime dependency volume is mounted at a node_modules path", () => {
   const compose = fs.readFileSync(new URL("../compose.yaml", import.meta.url), "utf8");
   const dockerfile = fs.readFileSync(new URL("../Dockerfile", import.meta.url), "utf8");

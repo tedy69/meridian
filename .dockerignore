@@ -16,6 +16,13 @@ token-blacklist.json
 strategy-library.json
 decision-log.json
 execution-budget.json
+spot-state.json
+spot-state.json.*.tmp
+spot-risk-budget.json
+spot-risk-budget.json.*.tmp
+hybrid-entry-lock.json
+hybrid-risk-budget.json
+hybrid-risk-budget.json.*.tmp
 hivemind-cache.json
 signal-weights.json
 discord-signals.json

@@ -9,7 +9,10 @@ import {
   closePosition,
   searchPools,
 } from "./dlmm.js";
-import { getTokenBalanceByMint, getWalletBalances, normalizeMint, swapToken } from "./wallet.js";
+import { getTokenBalanceByMint, getWalletBalances, inspectMintSafety, normalizeMint, swapToken } from "./wallet.js";
+import { isLpEnabled } from "../hybrid-risk.js";
+import { getSpotPosition } from "../spot-state.js";
+import { getTradingStatus } from "./trading-status.js";
 import { studyTopLPers } from "./study.js";
 import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getAllPerformanceRecords, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
 import {
@@ -205,8 +208,21 @@ export async function validateDeployPoolThresholds(args, {
   }
   const tokenAudit = evaluateTokenAuditRisk(tokenInfo, screening, { expectedMint: poolRisk.baseMint });
   if (!tokenAudit.pass) return tokenAudit;
+  if (config.trading.mode === "hybrid") {
+    if (tokenInfo?.audit?.mint_disabled !== true || tokenInfo?.audit?.freeze_disabled !== true
+      || tokenInfo?.audit?.is_sus === true) {
+      return { pass: false, reason: "Hybrid LP requires disabled mint/freeze authorities and a clean token audit" };
+    }
+    try {
+      await inspectMintSafety(poolRisk.baseMint, { requireLegacyTokenProgram: config.spot.requireLegacyTokenProgram,
+        allowMetadataOnlyToken2022: config.spot.allowMetadataOnlyToken2022 });
+    } catch (error) { return { pass: false, reason: `Hybrid LP mint verification failed: ${error.message}` }; }
+  }
 
   let momentum = null;
+  if (config.trading.mode === "hybrid" && !indicators.enabled) {
+    return { pass: false, reason: "Hybrid LP entry requires enabled momentum confirmation" };
+  }
   if (indicators.enabled) {
     if (!poolRisk.baseMint) {
       return { pass: false, reason: "Could not identify the base mint for fresh entry-momentum confirmation." };
@@ -226,7 +242,8 @@ export async function validateDeployPoolThresholds(args, {
       };
     }
     const failClosed = indicators.entryFailClosed ?? true;
-    if (momentum?.confirmed !== true || (failClosed && momentum?.skipped === true)) {
+    if (momentum?.confirmed !== true || (failClosed && momentum?.skipped === true)
+      || (config.trading.mode === "hybrid" && (momentum?.enabled !== true || !momentum?.intervals?.some((i) => i.ok && i.confirmed)))) {
       return {
         pass: false,
         reason: `Entry momentum is not confirmed: ${momentum?.reason || "fresh indicator evidence is unavailable"}.`,
@@ -359,6 +376,7 @@ const toolMap = {
   get_spot_momentum_candidates: getSpotMomentumCandidates,
   get_spot_position: getSpotPositionSnapshot,
   get_spot_status: getSpotStatus,
+  get_trading_status: getTradingStatus,
   open_spot_position: openSpotPosition,
   close_spot_position: closeSpotPosition,
   add_smart_wallet: addSmartWallet,
@@ -1201,9 +1219,10 @@ export async function runSafetyChecks(name, args) {
           reason: error.message,
         };
       }
-      if (config.trading.mode !== "dlmm_lp") {
-        return { pass: false, reason: "deploy_position is blocked unless tradingMode=dlmm_lp" };
+      if (!isLpEnabled()) {
+        return { pass: false, reason: "deploy_position is blocked unless tradingMode=dlmm_lp or hybrid" };
       }
+      if (getSpotPosition()) return { pass: false, reason: "Spot exposure must be closed and settled before LP entry" };
       let lossCircuit;
       try {
         lossCircuit = evaluateLossCircuitBreaker({
@@ -1376,7 +1395,8 @@ export async function runSafetyChecks(name, args) {
 
       // Check SOL balance
       if (!isDryRun()) {
-        const gasReserve = config.management.gasReserve;
+        const gasReserve = config.trading.mode === "hybrid"
+          ? config.hybrid.reserveSol + config.hybrid.lpCostBufferSol : config.management.gasReserve;
         const minRequired = amountY + gasReserve;
         if (balance.sol < minRequired) {
           return {

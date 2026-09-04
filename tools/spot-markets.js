@@ -88,10 +88,20 @@ export function createSpotMarketProvider({ requestJson: request = requestJson, n
         && Number(token.mcap) >= policy.minMarketCapUsd && Number(token.mcap) <= policy.maxMarketCapUsd);
       const pools = [];
       const rejected = [];
-      for (const token of eligible.slice(0, Math.min(30, Math.max(1, Number(page_size) || 30)))) {
+      const selected = eligible.slice(0, Math.min(30, Math.max(1, Number(page_size) || 30)));
+      let pairs = [];
+      if (selected.length) {
         try {
-          const pairs = await request(`${DEX}/token-pairs/v1/solana/${address(token.id)}`, { ttlMs: 10000 });
+          const mints = selected.map((token) => address(token.id)).sort().join(",");
+          pairs = await request(`${DEX}/tokens/v1/solana/${mints}`, { ttlMs: 10000 });
           if (!Array.isArray(pairs)) throw new Error("Invalid pair feed response");
+        } catch (error) {
+          sourceErrors.push({ source: "dexscreener", reason: error.message });
+          pairs = [];
+        }
+      }
+      for (const token of selected) {
+        try {
           const markets = [];
           for (const pair of pairs) {
             try { markets.push(normalizeSpotMarket(pair, token, now())); } catch { /* unsupported or stale pair */ }
@@ -103,7 +113,7 @@ export function createSpotMarketProvider({ requestJson: request = requestJson, n
           rejected.push({ name: text(token.symbol), reason: error.message });
         }
       }
-      return { pools, unique_mints: tokens.length, pair_lookups: Math.min(30, eligible.length),
+      return { pools, unique_mints: tokens.length, pair_lookups: selected.length,
         source_errors: sourceErrors, filtered_examples: rejected.slice(0, 5),
         coverage: "Jupiter trending/traded tokens + cross-DEX SOL pairs; not every Solana token" };
     },

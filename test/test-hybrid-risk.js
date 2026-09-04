@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { buildTradingConfig } from "../config.js";
-import { createHybridEntryGuard, evaluateHybridBudget, assertHybridSimulationBalance } from "../hybrid-risk.js";
+import { createHybridEntryGuard, evaluateHybridBudget, assertHybridSimulationBalance, markHybridSubmissionAttempted } from "../hybrid-risk.js";
 
 const policy = { maxPositionSol: 0.5, reserveSol: 0.1, maxDailyLossSol: 0.05, lpCostBufferSol: 0.02, spotCostBufferSol: 0.005 };
 test("hybrid is explicit and retains legacy default", () => {
@@ -54,6 +54,15 @@ test("missing LP snapshot, active exposure and pending settlement fail closed", 
 
 test("uncertain execution keeps durable lock; no timed unlock", async () => fixture(async ({ guard }) => {
   await guard.run({ strategy: "lp", amountSol: 0.5 }, async () => ({ success: true, position: null }));
+  await assert.rejects(guard.run({ strategy: "spot", amountSol: 0.5 }, async () => assert.fail()), /entry.*lock|pending.*entry/i);
+}));
+
+test("a swallowed LP submission failure cannot release the entry lock", async () => fixture(async ({ guard }) => {
+  const result = await guard.run({ strategy: "lp", amountSol: 0.5 }, async () => {
+    markHybridSubmissionAttempted();
+    return { success: false, error: "confirmation timeout" };
+  });
+  assert.equal(result.pending, true);
   await assert.rejects(guard.run({ strategy: "spot", amountSol: 0.5 }, async () => assert.fail()), /entry.*lock|pending.*entry/i);
 }));
 

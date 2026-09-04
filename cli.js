@@ -48,7 +48,7 @@ Output: { wallet, sol, sol_usd, usdc, tokens: [{mint, symbol, balance, usd_value
 \`\`\`
 
 ### meridian positions
-Returns all open DLMM positions.
+Returns open LP positions plus a separately labelled spot position and shared risk status.
 \`\`\`
 Output: { positions: [{position, pool, pair, in_range, age_minutes, ...}], total_positions }
 \`\`\`
@@ -58,6 +58,18 @@ Returns PnL for a specific position.
 \`\`\`
 Output: { pnl_pct, pnl_usd, unclaimed_fee_usd, all_time_fees_usd, current_value_usd, lower_bin, upper_bin, active_bin }
 \`\`\`
+
+### meridian trading-status
+Read both spot and LP exposure. Missing provider data is unknown, not zero positions.
+
+### meridian spot-status / spot-candidates [--limit 5]
+Read spot state or discover freshly screened SOL pairs across DEXs.
+
+### meridian spot-open --pool <pair-address> [--dry-run]
+Open the backend-sized spot position after all fresh gates. Only one combined position in hybrid mode.
+
+### meridian spot-close [--dry-run]
+Close the tracked spot position. Use the existing close command for LP positions.
 
 ### meridian screen [--dry-run] [--silent]
 Runs one AI screening cycle to find and deploy new positions.
@@ -271,8 +283,26 @@ switch (subcommand) {
 
   // ── positions ────────────────────────────────────────────────────
   case "positions": {
-    const { getMyPositions } = await import("./tools/dlmm.js");
-    out(await getMyPositions({ force: true }));
+    const { getTradingStatus } = await import("./tools/trading-status.js");
+    const status = await getTradingStatus();
+    out({ ...status.lp, spot: status.spot, mode: status.mode, total_open_positions: status.total_open_positions, risk: status.risk });
+    break;
+  }
+
+  case "trading-status": {
+    const { getTradingStatus } = await import("./tools/trading-status.js");
+    out(await getTradingStatus());
+    break;
+  }
+  case "spot-status":
+  case "spot-candidates":
+  case "spot-open":
+  case "spot-close": {
+    const { executeTool } = await import("./tools/executor.js");
+    const names = { "spot-status": "get_spot_status", "spot-candidates": "get_spot_momentum_candidates",
+      "spot-open": "open_spot_position", "spot-close": "close_spot_position" };
+    if (subcommand === "spot-open" && !flags.pool) die("Usage: meridian spot-open --pool <exact-pair-address> [--dry-run]");
+    out(await executeTool(names[subcommand], { pool_address: flags.pool, limit: Number(flags.limit || 5), reason: "manual CLI spot close" }));
     break;
   }
 

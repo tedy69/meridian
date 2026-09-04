@@ -36,6 +36,7 @@ import {
   validateJupiterQuote,
   validateJupiterTransactionEnvelope,
   validateSimulatedSwapEffects,
+  runSubmittedSwapStep,
 } from "../tools/wallet.js";
 import {
   closeSpotPosition,
@@ -924,6 +925,14 @@ test("simulation effects enforce exact input and bounded minimum output", () => 
     inputTokenRawBefore: "1000000",
     inputTokenRawAfter: "1",
   }), /exact requested token input/i);
+});
+
+test("transport or parse failure after swap submission remains uncertain with local signature", async () => {
+  await assert.rejects(runSubmittedSwapStep(async () => { throw new TypeError("fetch failed"); }, "local-sig"), (error) => {
+    assert.equal(error.submissionAttempted, true);
+    assert.equal(error.signature, "local-sig");
+    return true;
+  });
 });
 
 test("Jupiter execution result is bound to local signature and min output", () => {

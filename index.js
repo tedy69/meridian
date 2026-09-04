@@ -53,6 +53,11 @@ import { buildRiskIntelligenceBrief, evaluateLossCircuitBreaker, evaluateTokenAu
 import { getSpotMomentumCandidates, getSpotPositionSnapshot, getSpotStatus } from "./tools/spot.js";
 import { createSpotRealtimeMonitor } from "./spot-realtime.js";
 import { selectSpotEntryCandidate } from "./spot-momentum.js";
+import { isSpotEnabled, isLpEnabled, getHybridRiskStatus } from "./hybrid-risk.js";
+import { scanHybridCandidates } from "./hybrid-strategy.js";
+import { createMarketDataCache } from "./market-data-cache.js";
+import { getTradingStatus, formatTradingStatus } from "./tools/trading-status.js";
+const hybridLpCache = createMarketDataCache({ maxEntries: 2 });
 import {
   createSpotConfirmationStore,
   formatConfirmedSpotOpenResult,
@@ -69,7 +74,7 @@ const isMain = process.env.pm_id != null
 
 let runtimeRpcVerified = true;
 if (isMain) {
-  log("startup", `Meridian ${config.trading.mode === "spot_momentum" ? "Spot Momentum" : "DLMM LP"} Agent starting...`);
+  log("startup", `Meridian ${config.trading.mode} Agent starting...`);
   log("startup", `Repo: ${REPO_ROOT} | cwd: ${process.cwd()}${process.env.pm_id ? ` | PM2 id: ${process.env.pm_id}` : ""}`);
   if (path.resolve(process.cwd()) !== path.resolve(REPO_ROOT)) {
     log("startup_warn", `process.cwd() differs from repo root — use "npm run pm2:start" (not "pm2 start index.js" from another directory)`);
@@ -123,11 +128,11 @@ function formatPositionNetPnlValue(position, currency) {
 }
 
 function buildPrompt() {
-  if (config.trading.mode === "spot_momentum") {
+  if (isSpotEnabled()) {
     const management = config.spot.realtimeEnabled
       ? `realtime/${config.spot.managementPollIntervalSec}s fallback`
       : `${config.spot.managementPollIntervalSec}s`;
-    return `[spot manage: ${management} | scan: ${config.spot.scanIntervalSec}s]\n> `;
+    return `[${config.trading.mode} | spot manage: ${management} | scan: ${config.spot.scanIntervalSec}s]\n> `;
   }
   const mgmt = formatCountdown(nextRunIn(timers.managementLastRun, config.schedule.managementIntervalMin));
   const scrn = formatCountdown(nextRunIn(timers.screeningLastRun, config.schedule.screeningIntervalMin));
@@ -527,7 +532,76 @@ async function runSpotScreeningCycle({ silent = false } = {}) {
   return report;
 }
 
+async function runHybridScreeningCycle({ silent = false } = {}) {
+  if (_screeningBusy || _managementBusy || _claimAllBusy) return null;
+  _screeningBusy = true;
+  _screeningLastTriggered = Date.now();
+  timers.screeningLastRun = Date.now();
+  let report;
+  try {
+    const shared = getHybridRiskStatus();
+    if (shared.entry_pending) return report = "Hybrid scan blocked — previous entry requires reconciliation; no timed unlock.";
+    if (shared.ledger?.date === new Date().toISOString().slice(0, 10)
+      && Number(shared.ledger.lossSol) >= config.hybrid.maxDailyLossSol) {
+      return report = "Hybrid scan blocked — shared daily loss cap reached.";
+    }
+    if (readSpotPosition() || getTrackedPositions(true).length) return "Hybrid scan skipped — one active or unresolved position already exists.";
+    const positions = await getMyPositions({ force: true, silent: true });
+    if (!positions || !Array.isArray(positions.positions) || positions.total_positions !== 0 || positions.positions.length !== 0) {
+      return "Hybrid scan skipped — LP exposure is present or cannot be verified.";
+    }
+    const budget = getSpotStatus().risk_budget;
+    if (budget?.blocked) return `Hybrid scan skipped — ${budget.reason}`;
+    const wallet = await getTokenBalanceByMint(SOL_MINT);
+    const circuit = evaluateLossCircuitBreaker({ performance: getAllPerformanceRecords(), policy: config.risk });
+    if (!circuit.pass) return `Hybrid scan skipped — ${circuit.reason}`;
+    const sizing = getCircuitAdjustedDeploySizing(wallet.amount, circuit);
+    const spotFunded = wallet.amount >= config.spot.tradeAmountSol + config.hybrid.reserveSol + config.hybrid.spotCostBufferSol;
+    if (!spotFunded && !sizing.funded) return "Hybrid scan skipped — reserve plus entry-cost buffer is not funded.";
+    const screened = await scanHybridCandidates({
+      scanSpot: () => spotFunded ? getSpotMomentumCandidates({ limit: 5 }) : Promise.resolve({ candidates: [], reason: "Spot capital plus reserve/cost buffer is not funded" }),
+      scanLp: () => sizing.funded
+        ? hybridLpCache.get("lp-candidates", () => getTopCandidates({ limit: 3 }), { ttlMs: 30000, rateLimitKey: "lp-screener" })
+        : Promise.resolve({ candidates: [], reason: "LP reserve/rent buffer is not funded" }),
+    });
+    const selection = screened.selected;
+    if (!selection) {
+      const describe = (result) => result?.error || result?.reason
+        || result?.source_errors?.map((e) => e.reason).join("; ")
+        || result?.filtered_examples?.slice(0, 2).map((e) => e.reason).join("; ") || "no eligible candidates";
+      report = `NO TRADE\nSpot: ${describe(screened.spot)}\nLP: ${describe(screened.lp)}`;
+      appendDecision({ type: "hybrid_no_trade", actor: "SCREENER", summary: "Neither strategy qualified", reason: report });
+      return report;
+    }
+    const candidate = selection.candidate;
+    if (selection.strategy === "spot") {
+      const result = await executeTool("open_spot_position", { pool_address: candidate.pool });
+      report = formatConfirmedSpotOpenResult(result, config.spot.tradeAmountSol).text;
+    } else {
+      const result = await executeTool("deploy_position", {
+        pool_address: candidate.pool, amount_y: sizing.amount, amount_x: 0,
+        strategy: config.strategy.strategy, bins_below: computeBinsBelow(candidate.volatility), bins_above: 0,
+        pool_name: candidate.name, bin_step: candidate.bin_step, volatility: candidate.volatility,
+      });
+      report = result?.dry_run ? "DRY RUN — hybrid LP candidate passed; no transaction sent."
+        : result?.success === true && result?.position ? `LP entry confirmed: ${result.position} (${sizing.amount} SOL).`
+        : `LP entry not confirmed: ${result?.reason || result?.error || "unresolved result"}`;
+    }
+    appendDecision({ type: "hybrid_selection", actor: "SCREENER", pool: candidate.pool,
+      summary: `${selection.strategy} selected after independent screening`, reason: report });
+    return report;
+  } catch (error) {
+    report = `Hybrid scan blocked: ${error.message}`;
+    log("hybrid_error", report);
+    return report;
+  } finally {
+    _screeningBusy = false;
+    if (!silent && telegramEnabled() && report) sendMessage(report).catch(() => {});
+  }
+}
+
 export async function runManagementCycle({ silent = false } = {}) {
+  if (isSpotEnabled() && readSpotPosition()) return runSpotManagementCycle({ silent });
   if (config.trading.mode === "spot_momentum") return runSpotManagementCycle({ silent });
   if (_managementBusy || _claimAllBusy) return null;
   _managementBusy = true;
@@ -688,6 +762,7 @@ export async function runManagementCycle({ silent = false } = {}) {
 }
 
 export async function runScreeningCycle({ silent = false } = {}) {
+  if (config.trading.mode === "hybrid") return runHybridScreeningCycle({ silent });
   if (config.trading.mode === "spot_momentum") return runSpotScreeningCycle({ silent });
   if (_screeningBusy || _claimAllBusy) {
     log("cron", "Screening skipped — previous cycle still running");
@@ -1124,7 +1199,7 @@ Summarize the current portfolio health, total fees earned, and performance of al
   const confirmTicks = Math.max(1, Number(config.pnl.confirmTicks ?? 2));
   let _pnlPollBusy = false;
   let pnlPollInterval = null;
-  if (config.trading.mode === "dlmm_lp") pnlPollInterval = setInterval(async () => {
+  if (isLpEnabled()) pnlPollInterval = setInterval(async () => {
     const pollGate = getPnlWatchdogGate({
       pnlPollBusy: _pnlPollBusy,
       managementBusy: _managementBusy,
@@ -1269,13 +1344,13 @@ Summarize the current portfolio health, total fees earned, and performance of al
 
   let spotManagementPollInterval = null;
   let spotScanInterval = null;
-  if (config.trading.mode === "spot_momentum") {
+  if (isSpotEnabled()) {
     const managementMs = Math.max(1, Number(config.spot.managementPollIntervalSec ?? 1)) * 1000;
     const scanMs = Math.max(5, Number(config.spot.scanIntervalSec ?? 30)) * 1000;
     if (config.spot.realtimeEnabled) {
       _spotRealtimeMonitor = createSpotRealtimeMonitor({
         getPosition: readSpotPosition,
-        onRefresh: () => runManagementCycle({ silent: true }),
+        onRefresh: () => runSpotManagementCycle({ silent: true }),
         commitment: config.spot.realtimeCommitment,
         eventDebounceMs: config.spot.realtimeEventDebounceMs,
         minRefreshMs: config.spot.realtimeMinRefreshMs,
@@ -1284,9 +1359,9 @@ Summarize the current portfolio health, total fees earned, and performance of al
       _spotRealtimeMonitor.start().catch((error) => log("spot_realtime_error", `Start failed: ${error.message}`));
     } else {
       spotManagementPollInterval = setInterval(() => {
-        runManagementCycle({ silent: true }).catch((error) => log("cron_error", `Spot poll failed: ${error.message}`));
+        runSpotManagementCycle({ silent: true }).catch((error) => log("cron_error", `Spot poll failed: ${error.message}`));
       }, managementMs);
-      runManagementCycle({ silent: true }).catch((error) => log("cron_error", `Initial spot status failed: ${error.message}`));
+      runSpotManagementCycle({ silent: true }).catch((error) => log("cron_error", `Initial spot status failed: ${error.message}`));
     }
     spotScanInterval = setInterval(() => {
       runScreeningCycle({ silent: true }).catch((error) => log("cron_error", `Spot scan failed: ${error.message}`));
@@ -1300,7 +1375,7 @@ Summarize the current portfolio health, total fees earned, and performance of al
   _cronTasks._spotManagementPollInterval = spotManagementPollInterval;
   _cronTasks._spotScanInterval = spotScanInterval;
   drainPendingAutoSwaps().catch((error) => log("cron_error", `Startup settlement retry failed: ${error.message}`));
-  const strategySchedule = config.trading.mode === "spot_momentum"
+  const strategySchedule = isSpotEnabled()
     ? `${config.spot.realtimeEnabled ? `spot management via ${config.spot.realtimeCommitment} WebSocket with ${config.spot.managementPollIntervalSec}s fallback` : `spot management every ${config.spot.managementPollIntervalSec}s`}, momentum scan every ${config.spot.scanIntervalSec}s`
     : `management every ${config.schedule.managementIntervalMin}m, screening every ${config.schedule.screeningIntervalMin}m${config.opportunity.enabled ? `, opportunity poll every ${config.opportunity.pollIntervalSec}s` : ""}`;
   log("cron", `Cycles started — ${strategySchedule}, settlement retry every 1m`);
@@ -1454,11 +1529,14 @@ function getLatestCandidatesMeta() {
 function describeLatestCandidates(limit = 5) {
   if (!_latestCandidates.length) return "No cached candidates yet. Run /screen first.";
   const lines = _latestCandidates.slice(0, limit).map((pool, i) => {
+    if (pool.trading_strategy === "spot") {
+      return `${i + 1}. [SPOT/${pool.venue || "cross-DEX"}] ${sanitizeUntrustedPromptText(pool.name, 80)} | expected round-trip cost ${Number(pool.round_trip_quote?.expectedLossPct).toFixed(2)}% | score ${pool.spot_score}`;
+    }
     const feeTvl = pool.fee_active_tvl_ratio ?? pool.fee_tvl_ratio ?? "?";
     const vol = pool.volume_window ?? pool.volume_24h ?? "?";
     const active = pool.active_pct ?? "?";
     const organic = pool.organic_score ?? "?";
-    return `${i + 1}. ${pool.name} | fee/aTVL ${feeTvl}% | vol $${vol} | in-range ${active}% | organic ${organic}`;
+    return `${i + 1}. [LP/Meteora] ${sanitizeUntrustedPromptText(pool.name, 80)} | fee/aTVL ${feeTvl}% | vol $${vol} | in-range ${active}% | organic ${organic}`;
   });
   const age = _latestCandidatesAt ? new Date(_latestCandidatesAt).toLocaleString("en-US", { hour12: false }) : "unknown";
   return `Latest candidates (${_latestCandidates.length}) — updated ${age}\n\n${lines.join("\n")}`;
@@ -1470,7 +1548,7 @@ function formatWalletStatus(wallet, positions) {
   return [
     `Wallet: ${wallet.sol} SOL ($${wallet.sol_usd})`,
     `SOL price: $${wallet.sol_price}`,
-    `Open positions: ${positions.total_positions}/${config.risk.maxPositions}`,
+    `Open LP positions: ${positions.total_positions}/${config.risk.maxPositions} | spot: ${readSpotPosition()?.status || "none"}`,
     `Next deploy amount: ${formatSolAmount(deployAmount)} SOL`,
     `Dry run: ${process.env.DRY_RUN === "true" ? "yes" : "no"}`,
     `Mainnet execution: ${process.env.DRY_RUN !== "true" && process.env.LIVE_TRADING_ENABLED === "true" ? "enabled" : "locked"}`,
@@ -1492,6 +1570,9 @@ function formatConfigSnapshot() {
   return [
     "Config snapshot",
     "",
+    `Trading mode: ${config.trading.mode} | spot discovery: cross-DEX SOL pairs | LP execution: Meteora DLMM`,
+    ...(config.trading.mode === "hybrid" ? [`Shared max capital: ${config.hybrid.maxPositionSol} SOL | reserve: ${config.hybrid.reserveSol} SOL | max one combined position`,
+      `Cost buffers: spot ${config.hybrid.spotCostBufferSol} SOL; LP ${config.hybrid.lpCostBufferSol} SOL (rent included)`] : []),
     `Strategy: ${config.strategy.strategy} | binsBelow: ${config.strategy.minBinsBelow}-${config.strategy.maxBinsBelow} | default ${config.strategy.defaultBinsBelow}`,
     `Deploy target: ${config.management.deployAmountSol} SOL | max: ${config.risk.maxDeployAmount ?? "uncapped"} SOL | gasReserve: ${config.management.gasReserve} | maxPositions: ${config.risk.maxPositions}`,
     `Stop loss: trigger ${config.management.stopLossTriggerPct}% → target max ${config.management.stopLossPct}% | confirmation ${config.management.stopLossConfirmTicks} tick | re-entry cooldown ${config.management.stopLossCooldownHours}h`,
@@ -1789,6 +1870,7 @@ function formatHelpText() {
     "/positions — list open positions",
     "/pool <n> — detailed info for one open position",
     "/close <n> — close one position by index",
+    "/close spot — close the tracked spot position",
     "/closeall — close all open positions",
     "/claimall — preview all reported unclaimed fees",
     "/claimall confirm — claim every eligible position",
@@ -1931,7 +2013,7 @@ async function telegramHandler(msg) {
     return;
   }
 
-  if (config.trading.mode === "spot_momentum") {
+  if (isSpotEnabled()) {
     const confirmationReply = spotConfirmationStore.resolveReply(text);
     if (confirmationReply.handled) {
       if (confirmationReply.status !== "confirmed") {
@@ -2000,7 +2082,21 @@ async function telegramHandler(msg) {
     return;
   }
 
-  if (text === "/wallet" || text === "/status") {
+  if (text === "/status" || text === "/positions") {
+    await sendMessage(formatTradingStatus(await getTradingStatus())).catch(() => {});
+    return;
+  }
+
+  if (text === "/close spot") {
+    try {
+      const result = await executeTool("close_spot_position", { reason: "manual Telegram spot close" });
+      await sendMessage(result?.trade_status === "closed" ? `Spot closed. Realized PnL: ${result.pnl_sol} SOL.`
+        : result?.dry_run ? "DRY RUN — no spot sell sent." : `Spot close not confirmed: ${result?.reason || result?.error || "unknown"}`).catch(() => {});
+    } catch (error) { await sendMessage(`Spot close not confirmed: ${error.message}`).catch(() => {}); }
+    return;
+  }
+
+  if (text === "/wallet") {
     try {
       const [wallet, positions] = await Promise.all([getWalletBalances(), getMyPositions({ force: true })]);
       const suffix = text === "/status" && positions.total_positions
@@ -2015,22 +2111,6 @@ async function telegramHandler(msg) {
 
   if (text === "/config") {
     await sendMessage(formatConfigSnapshot()).catch(() => {});
-    return;
-  }
-
-  if (text === "/positions") {
-    try {
-      const { positions, total_positions } = await getMyPositions({ force: true });
-      if (total_positions === 0) { await sendMessage("No open positions."); return; }
-      const cur = config.management.solMode ? "◎" : "$";
-      const lines = positions.map((p, i) => {
-        const pnl = formatPositionNetPnlValue(p, cur);
-        const age = p.age_minutes != null ? `${p.age_minutes}m` : "?";
-        const oor = !p.in_range ? " ⚠️OOR" : "";
-        return `${i + 1}. ${p.pair} | ${cur}${p.total_value_usd} | Net PnL: ${pnl} (${formatNetPnlPercent(p)}; ${p.net_pnl_status ?? "UNKNOWN"}) | fees: ${cur}${p.unclaimed_fees_usd} | ${age}${oor}`;
-      });
-      await sendMessage(`📊 Open Positions (${total_positions}):\n\n${lines.join("\n")}\n\n/close <n> to close | /claimall to review fees | /set <n> <note> to set instruction`);
-    } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
     return;
   }
 
@@ -2093,8 +2173,14 @@ async function telegramHandler(msg) {
 
   if (text === "/closeall") {
     try {
+      if (readSpotPosition()) {
+        const spotResult = await executeTool("close_spot_position", { reason: "manual Telegram close-all" });
+        await sendMessage(spotResult?.trade_status === "closed" ? "Spot close confirmed."
+          : spotResult?.dry_run ? "DRY RUN — spot close not submitted." : `Spot close unresolved: ${spotResult?.reason || spotResult?.error || "unknown"}`);
+        if (spotResult?.trade_status !== "closed" && !spotResult?.dry_run) return;
+      }
       const { positions } = await getMyPositions({ force: true });
-      if (!positions.length) { await sendMessage("No open positions."); return; }
+      if (!positions.length) { await sendMessage("No open LP positions."); return; }
       await sendMessage(`Closing ${positions.length} position(s)...`);
       const results = [];
       for (const pos of positions) {
@@ -2205,6 +2291,18 @@ async function telegramHandler(msg) {
 
   if (text === "/screen") {
     try {
+      if (isSpotEnabled()) {
+        const scanned = config.trading.mode === "hybrid"
+          ? await scanHybridCandidates({ scanSpot: () => getSpotMomentumCandidates({ limit: 5 }), scanLp: () => getTopCandidates({ limit: 5 }) })
+          : { spot: await getSpotMomentumCandidates({ limit: 5 }), lp: { candidates: [] } };
+        setLatestCandidates([...(scanned.spot?.candidates || []).map((p) => ({ ...p, trading_strategy: "spot" })),
+          ...(scanned.lp?.candidates || []).map((p) => ({ ...p, trading_strategy: "lp" }))]);
+        const details = [scanned.spot?.error, scanned.spot?.reason, ...(scanned.spot?.source_errors || []).map((e) => e.reason),
+          scanned.lp?.pending ? "LP scanner still running; run /screen again for its completed shortlist." : scanned.lp?.error,
+          ...(scanned.spot?.filtered_examples || []).slice(0, 2).map((e) => e.reason)].filter(Boolean).join("\n");
+        await sendMessage(`${describeLatestCandidates(10)}${details ? `\n${details}` : ""}\nScreening only; no trade submitted.`).catch(() => {});
+        return;
+      }
       await sendMessage(await runDeterministicScreen(5)).catch(() => {});
     } catch (e) {
       await sendMessage(`Error: ${e.message}`).catch(() => {});
@@ -2221,6 +2319,11 @@ async function telegramHandler(msg) {
   if (deployMatch) {
     try {
       const idx = parseInt(deployMatch[1]) - 1;
+      if (_latestCandidates[idx]?.trading_strategy === "spot") {
+        const result = await executeTool("open_spot_position", { pool_address: _latestCandidates[idx].pool });
+        await sendMessage(formatConfirmedSpotOpenResult(result, config.spot.tradeAmountSol).text).catch(() => {});
+        return;
+      }
       const { candidate, result, deployAmount, binsBelow } = await deployLatestCandidate(idx);
       const coverage = result.range_coverage
         ? `Range: ${fmtPct(result.range_coverage.downside_pct)} downside | ${fmtPct(result.range_coverage.upside_pct)} upside`
@@ -2315,7 +2418,7 @@ async function telegramHandler(msg) {
       },
     });
     const strippedContent = stripThink(content);
-    const grounded = config.trading.mode === "spot_momentum"
+    const grounded = isSpotEnabled() && (config.trading.mode === "spot_momentum" || spotCandidateResult != null || spotOpenResult != null)
       ? groundSpotAgentOutcome({
           assistantText: strippedContent,
           candidateResult: spotCandidateResult,

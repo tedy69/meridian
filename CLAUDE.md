@@ -36,6 +36,19 @@ Autonomous DLMM liquidity provider agent for Meteora pools on Solana.
 
 ## Architecture
 
+### Hybrid and cross-DEX additions (2026-09)
+
+- `tradingMode` accepts `hybrid` in addition to the two single-strategy modes. Missing mode still defaults to `dlmm_lp`; the example opts into hybrid **dry-run**, never change live flags implicitly.
+- `hybrid-strategy.js` starts both screeners, prioritizes eligible spot without waiting for LP, otherwise considers independently screened LP. `index.js` routes both monitors; automatic spot/hybrid entry has no LLM round trip.
+- `tools/spot-markets.js` combines Jupiter Tokens V2 categories and one DEX Screener batch (up to 30 mints). Normalize mint-bound SOL pairs, label venue, reject missing/stale token timestamps. LP discovery/execution is still DLMM-only.
+- `spot-state.js` persists `venue`, `marketSource`, `priceSource`. Non-DLMM positions use `getSpotExitQuote` with tracked atomic amount, minimum output minus fee buffer. Never call `getActiveBin` for those positions. Old state defaults to the legacy active-bin path.
+- `market-data-cache.js` is read-only: cloned results, request-start freshness, in-flight dedup, bounded cache/backoff, no stale fallback. Chart snapshots expire after 5s, exit quotes after configured quoteMaxAgeMs (3s default). Never cache signing/submission.
+- `hybrid-risk.js` owns an atomic cross-process admission lock and flat-wallet drawdown ledger. Both direct spot and LP entry use it; LP simulation checks reserve and total debit. Mark the submission boundary BEFORE network submission; errors after it remain uncertain even if a lower layer swallows the exception. Do not auto-expire an uncertain lock or use absence from an indexer as settlement proof.
+- Runtime files `hybrid-entry-lock.json` / `hybrid-risk-budget.json` are private, gitignored, and must survive deployments along with spot/LP state. See README for conservative SOL drawdown accounting, wallet transfer caveats, and manual reconciliation procedure.
+- Meteora SDK liquidity entry `slippage` is **percentage**, not bps. Hybrid uses 1.5; legacy intended 10% is represented as 10, not 1000. Keep lazy SDK import, bin-array rent prohibition, mainnet verification and simulation.
+- `tools/trading-status.js` / `get_trading_status`, Telegram `/status` and `/positions`, and CLI `trading-status` show spot and LP separately; missing reads mean unknown. `/close spot` closes spot; numbered `/close` remains LP. Read-only `/screen` must never submit.
+- New mocked regression suites are explicitly included in `npm test`. A passing suite or read-only discovery probe is not live-execution/profitability evidence. Never execute a financial write as a smoke test.
+
 ```
                 ┌──────────────────────────────────────────────┐
                 │              index.js  (daemon)              │

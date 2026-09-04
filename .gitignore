@@ -29,6 +29,7 @@ spot-state.json
 spot-risk-budget.json
 hybrid-risk-budget.json
 hybrid-entry-lock.json
+hybrid-risk-budget.json.*.tmp
 hivemind-cache.json
 signal-weights.json
 
