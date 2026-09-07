@@ -1,0 +1,8 @@
+{
+  "entryCostSol": 0.501,
+  "openedAt": "2026-09-07T00:00:00Z",
+  "quotes": [
+    { "at": "2026-09-07T00:00:01Z", "minimumOutSol": 0.502, "exitFeeSol": 0.003 },
+    { "at": "2026-09-07T00:00:02Z", "minimumOutSol": 0.508, "exitFeeSol": 0.001 }
+  ]
+}

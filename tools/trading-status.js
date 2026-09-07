@@ -2,24 +2,29 @@ import { config } from "../config.js";
 import { getHybridRiskStatus } from "../hybrid-risk.js";
 import { getMyPositions } from "./dlmm.js";
 import { getSpotPositionSnapshot } from "./spot.js";
+import { readRuntimeHealth } from "../runtime-health.js";
+import { repoPath } from "../repo-root.js";
+import { withReadDeadline } from "../read-deadline.js";
 
 export async function getTradingStatus(_args = {}, { getLp = () => getMyPositions({ force: true, silent: true }),
-  getSpot = getSpotPositionSnapshot, getRisk = getHybridRiskStatus } = {}) {
-  const safe = async (read) => { try { return await read(); } catch (error) { return { error: error.message }; } };
-  const [lp, spot, risk] = await Promise.all([safe(getLp), safe(getSpot), safe(getRisk)]);
-  const lpKnown = Array.isArray(lp?.positions) && Number.isInteger(lp.total_positions) && lp.total_positions === lp.positions.length;
+  getSpot = getSpotPositionSnapshot, getRisk = getHybridRiskStatus,
+  getHealth = () => readRuntimeHealth(repoPath("runtime-health.json")) } = {}) {
+  const safe = async (read) => { try { return await withReadDeadline(read, { timeoutMs: 10_000, label: "Trading status read" }); } catch (error) { return { error: error.message }; } };
+  const [lp, spot, risk, health] = await Promise.all([safe(getLp), safe(getSpot), safe(getRisk), safe(getHealth)]);
+  const lpKnown = !lp?.error && Array.isArray(lp?.positions) && Number.isInteger(lp.total_positions) && lp.total_positions === lp.positions.length;
   const spotKnown = !spot?.error && (spot?.position != null || spot?.status === "none");
-  return { mode: risk?.mode || config.trading.mode, lp, spot, risk,
+  return { mode: risk?.mode || config.trading.mode, lp, spot, risk, health,
     total_open_positions: lpKnown && spotKnown ? lp.total_positions + (spot.position ? 1 : 0) : null };
 }
 
-export function formatTradingStatus({ mode, lp, spot, risk }) {
+export function formatTradingStatus({ mode, lp, spot, risk, health }) {
   const clean = (v) => String(v || "").replace(/[<>`\r\n]/g, " ").slice(0, 140);
   const position = spot?.position;
   const pnl = spot?.priceable && Number.isFinite(spot.pnl_pct) ? `${spot.pnl_pct.toFixed(2)}%` : "unknown";
-  const lpKnown = Array.isArray(lp?.positions) && lp.total_positions === lp.positions.length;
+  const lpKnown = !lp?.error && Array.isArray(lp?.positions) && lp.total_positions === lp.positions.length;
   return [
     `Mode: ${mode}`,
+    health ? `Scanner: ${health.healthy === true ? "healthy" : "unhealthy"} — ${clean(health.reason || health.error)}` : null,
     position ? `Spot: ${clean(position.symbol || position.mint)} (${clean(position.venue || "meteora")}) | ${position.status} | estimated net exit PnL: ${pnl}`
       : `Spot: ${spot?.error ? `unknown (${clean(spot.error)})` : "none"}`,
     position && !spot.priceable ? `Spot price: unavailable (${clean(spot.reason || spot.status)})` : null,

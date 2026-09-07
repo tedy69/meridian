@@ -3,6 +3,8 @@ import { config } from "../config.js";
 import { appendDecision } from "../decision-log.js";
 import { assertSpotSwapAllowed, isDryRun, SOL_MINT } from "../execution-guard.js";
 import { log } from "../logger.js";
+import { assertReadActive, withReadDeadline } from "../read-deadline.js";
+import { summarizeSpotPerformance } from "../spot-performance.js";
 import { getSpotRealtimeTelemetry } from "../spot-realtime.js";
 import { isSpotEnabled, withHybridEntry } from "../hybrid-risk.js";
 import {
@@ -209,7 +211,13 @@ function spotDeps(overrides = {}) {
   };
 }
 
-export async function getSpotMomentumCandidates({ limit = 10 } = {}, overrides = {}) {
+export function getSpotMomentumCandidates(args = {}, overrides = {}) {
+  return withReadDeadline(() => readSpotMomentumCandidates(args, overrides), {
+    timeoutMs: 20_000, label: "Spot candidate screening",
+  });
+}
+
+async function readSpotMomentumCandidates({ limit = 10 } = {}, overrides = {}) {
   const deps = spotDeps(overrides);
   if (!isSpotEnabled(deps.tradingMode)) {
     return { candidates: [], blocked: true, reason: "tradingMode does not enable spot" };
@@ -240,6 +248,7 @@ export async function getSpotMomentumCandidates({ limit = 10 } = {}, overrides =
   const filtered = [];
 
   for (const pool of pools) {
+    assertReadActive();
     try {
       const cheapEntry = cheapPoolEvaluation(pool, entryPolicy);
       if (!cheapEntry.pass) { filtered.push({ name: pool.name, reason: cheapEntry.reason }); continue; }
@@ -290,7 +299,7 @@ export async function getSpotMomentumCandidates({ limit = 10 } = {}, overrides =
           round_trip_quote: roundTripQuote,
           mint_safety: mintSafety,
           token_audit: tokenInfo?.audit ?? null,
-          token_stats_1h: tokenInfo?.stats_1h ?? null,
+          token_stats_5m: pool.stats_5m ?? tokenInfo?.stats_5m ?? null,
         });
       }
     } catch (error) {
@@ -313,6 +322,14 @@ export async function getSpotMomentumCandidates({ limit = 10 } = {}, overrides =
 }
 
 export async function validateSpotEntry(poolAddressValue, overrides = {}) {
+  try {
+    return await withReadDeadline(() => readSpotEntry(poolAddressValue, overrides), {
+      timeoutMs: 12_000, label: "Fresh spot preflight",
+    });
+  } catch (error) { return { pass: false, reason: `Fresh spot preflight unavailable: ${error.message}` }; }
+}
+
+async function readSpotEntry(poolAddressValue, overrides = {}) {
   const deps = spotDeps(overrides);
   let address;
   try {
@@ -436,7 +453,7 @@ async function openSpotPositionImpl({ pool_address }, overrides = {}) {
     deps.getMyPositions({ force: true, silent: true }),
     validateSpotEntry(pool_address, overrides),
   ]);
-  if (!lpPositions || !Array.isArray(lpPositions.positions) || !Number.isInteger(lpPositions.total_positions)
+  if (!lpPositions || lpPositions.error || !Array.isArray(lpPositions.positions) || !Number.isInteger(lpPositions.total_positions)
     || lpPositions.total_positions !== lpPositions.positions.length) {
     return { success: false, blocked: true, reason: "Fresh LP position snapshot is unavailable or inconsistent." };
   }
@@ -843,6 +860,7 @@ export function getSpotStatus(_args = {}, overrides = {}) {
     position: deps.readSpotPosition(),
     realtime: getSpotRealtimeTelemetry(),
     recent_trades: deps.getSpotHistory(10),
+    performance: summarizeSpotPerformance(deps.getSpotHistory(100)),
     risk_budget: {
       ...riskBudget,
       usedBuySol,

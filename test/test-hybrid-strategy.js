@@ -7,6 +7,82 @@ const spot = { pool: "spot", spot_score: 80, round_trip_quote: { expectedLossPct
 const lp = { pool: "lp", score: 90, indicator_confirmation: { enabled: true, confirmed: true,
   intervals: [{ ok: true, confirmed: true }] } };
 
+async function settleWithin(promise, ms = 300) {
+  let watchdog;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        watchdog = setTimeout(() => reject(new Error("Regression probe did not settle")), ms);
+      }),
+    ]);
+  } finally {
+    clearTimeout(watchdog);
+  }
+}
+
+test("a hung spot source times out without discarding an independently qualified LP", { timeout: 1_000 }, async () => {
+  let spotSignal;
+  let lpSignal;
+  const result = await settleWithin(scanHybridCandidates({
+    timeoutMs: 20,
+    scanSpot: (options) => {
+      spotSignal = options?.signal;
+      return new Promise(() => {});
+    },
+    scanLp: async (options) => {
+      lpSignal = options?.signal;
+      return { candidates: [lp] };
+    },
+  }));
+
+  assert.equal(result.selected.strategy, "lp");
+  assert.deepEqual(result.lp.candidates, [lp]);
+  assert.deepEqual(result.spot.candidates, []);
+  assert.match(result.spot.error, /timeout|timed out|deadline/i);
+  assert.ok(spotSignal instanceof AbortSignal);
+  assert.equal(spotSignal.aborted, true);
+  assert.ok(lpSignal instanceof AbortSignal);
+});
+
+test("an empty spot scan and hung LP source finish with an explicit error and no entry", { timeout: 1_000 }, async () => {
+  let lpSignal;
+  const result = await settleWithin(scanHybridCandidates({
+    timeoutMs: 20,
+    scanSpot: async () => ({ candidates: [] }),
+    scanLp: (options) => {
+      lpSignal = options?.signal;
+      return new Promise(() => {});
+    },
+  }));
+
+  assert.equal(result.selected, null);
+  assert.deepEqual(result.spot.candidates, []);
+  assert.deepEqual(result.lp.candidates, []);
+  assert.match(result.lp.error, /timeout|timed out|deadline/i);
+  assert.ok(lpSignal instanceof AbortSignal);
+  assert.equal(lpSignal.aborted, true);
+});
+
+test("a fast spot result returns without waiting for LP and its abandoned source remains bounded", { timeout: 1_000 }, async () => {
+  let lpSignal;
+  const result = await settleWithin(scanHybridCandidates({
+    timeoutMs: 20,
+    scanSpot: async () => ({ candidates: [spot] }),
+    scanLp: (options) => {
+      lpSignal = options?.signal;
+      return new Promise(() => {});
+    },
+  }));
+
+  assert.equal(result.selected.strategy, "spot");
+  assert.equal(result.lp.pending, true, "spot need not wait for LP's deadline");
+  assert.ok(lpSignal instanceof AbortSignal);
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.equal(lpSignal.aborted, true, "an unused LP read cannot remain in flight forever");
+  assert.equal(result.selected.strategy, "spot");
+});
+
 test("hybrid prefers validated fast momentum, otherwise an independently qualified LP", () => {
   assert.equal(selectHybridCandidate({ spot: [spot], lp: [lp] }).strategy, "spot");
   assert.equal(selectHybridCandidate({ spot: [], lp: [lp] }).strategy, "lp");

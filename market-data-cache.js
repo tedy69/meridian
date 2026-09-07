@@ -1,3 +1,5 @@
+import { withReadDeadline } from "./read-deadline.js";
+
 const DEFAULT_BACKOFF_MS = 5_000;
 const MAX_BACKOFF_MS = 60_000;
 
@@ -32,8 +34,9 @@ export function createMarketDataCache({ now = Date.now, maxEntries = 256 } = {})
     return structuredClone(snapshot.value);
   }
 
-  async function get(key, loader, { ttlMs = 10_000, rateLimitKey = "default" } = {}) {
+  async function get(key, loader, { ttlMs = 10_000, rateLimitKey = "default", requestTimeoutMs = 10_000, signal } = {}) {
     if (!Number.isFinite(ttlMs) || ttlMs < 0) throw new RangeError("ttlMs must be finite and nonnegative");
+    if (!Number.isFinite(requestTimeoutMs) || requestTimeoutMs <= 0) throw new RangeError("requestTimeoutMs must be positive and finite");
     const provider = String(rateLimitKey);
     const identity = JSON.stringify([provider, String(key)]);
     const startedAt = now();
@@ -57,7 +60,9 @@ export function createMarketDataCache({ now = Date.now, maxEntries = 256 } = {})
     }
 
     const requestGeneration = generation;
-    const pending = Promise.resolve().then(loader).then((value) => {
+    const pending = Promise.resolve().then(() => withReadDeadline(loader, {
+      timeoutMs: requestTimeoutMs, signal, label: "Market cache request",
+    })).then((value) => {
       assertFresh(startedAt, now(), ttlMs);
       const snapshot = { value: structuredClone(value), startedAt, expiresAt: startedAt + ttlMs };
       if (ttlMs > 0 && generation === requestGeneration) {

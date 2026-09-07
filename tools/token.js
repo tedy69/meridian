@@ -1,6 +1,8 @@
 import { config } from "../config.js";
 import { getGmgnTokenFees, hasGmgnApiKey } from "./gmgn.js";
 import { createMarketDataCache } from "../market-data-cache.js";
+import { readJson } from "../read-deadline.js";
+import { normalizeTokenActivity } from "../token-activity.js";
 const tokenInfoCache = createMarketDataCache();
 
 const DATAPI_BASE = "https://datapi.jup.ag/v1";
@@ -41,9 +43,7 @@ export async function getTokenInfo({ query }) {
 
 async function fetchTokenInfo(query) {
   const url = `${DATAPI_BASE}/assets/search?query=${encodeURIComponent(query)}`;
-  const res = await fetch(url, { signal: AbortSignal.timeout(4000) });
-  if (!res.ok) throw Object.assign(new Error(`Token search API error: ${res.status}`), { status: res.status, retryAfter: res.headers.get("retry-after") });
-  const data = await res.json();
+  const data = await readJson(url, {}, { label: "Token search API" });
   const tokens = Array.isArray(data) ? data : [data];
   if (!tokens.length) return { found: false, query };
 
@@ -69,6 +69,7 @@ async function fetchTokenInfo(query) {
       bot_holders_pct: t.audit.botHoldersPercentage?.toFixed(2),
       dev_migrations: t.audit.devMigrations,
     } : null,
+    stats_5m: normalizeTokenActivity(t.stats5m),
     stats_1h: t.stats1h ? {
       price_change: t.stats1h.priceChange?.toFixed(2),
       buy_vol: t.stats1h.buyVolume?.toFixed(0),

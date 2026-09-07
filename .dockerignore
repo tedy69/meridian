@@ -15,6 +15,8 @@ pool-memory.json
 token-blacklist.json
 strategy-library.json
 decision-log.json
+runtime-health.json
+runtime-health.json.*.tmp
 execution-budget.json
 spot-state.json
 spot-state.json.*.tmp

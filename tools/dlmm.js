@@ -12,6 +12,7 @@ import {
 import BN from "bn.js";
 import bs58 from "bs58";
 import { config, computeDeployAmount, MIN_SAFE_BINS_BELOW } from "../config.js";
+import { assertReadActive, boundedRpcFetch, readJson, withReadDeadline } from "../read-deadline.js";
 import { log } from "../logger.js";
 import {
   trackPosition,
@@ -92,7 +93,7 @@ let _wallet = null;
 
 function getConnection() {
   if (!_connection) {
-    _connection = new Connection(process.env.RPC_URL, "confirmed");
+    _connection = new Connection(process.env.RPC_URL, { commitment: "confirmed", fetch: boundedRpcFetch });
   }
   return _connection;
 }
@@ -1385,11 +1386,13 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
     // fully public resources. Falls through to the Meteora-API path on any error.
     if (config.pnl.source === "rpc") {
       try {
-        if (!silent) log("positions", `Computing PnL from RPC (${config.pnl.rpcUrl})...`);
+        if (!silent) log("positions", "Computing PnL from RPC...");
         const rpcResult = await computePositions(walletAddress);
+        assertReadActive();
         if (useLocalWallet) {
           syncOpenPositions(rpcResult.positions.map((p) => p.position));
           await restoreHistoricallyFalseClosedPositions(rpcResult.positions);
+          assertReadActive();
           _positionsCache = rpcResult;
           _positionsCacheAt = Date.now();
         }
@@ -1402,9 +1405,7 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
     // ── Fallback path: Meteora portfolio + /pnl APIs (no LPAgent) ──
     if (!silent) log("positions", "Fetching portfolio via Meteora portfolio API...");
     const portfolioUrl = `https://dlmm.datapi.meteora.ag/portfolio/open?user=${walletAddress}`;
-    const res = await fetch(portfolioUrl);
-    if (!res.ok) throw new Error(`Portfolio API ${res.status}: ${await res.text().catch(() => "")}`);
-    const portfolio = await res.json();
+    const portfolio = await readJson(portfolioUrl, {}, { label: "Meteora portfolio API" });
 
     const pools = portfolio.pools || [];
     log("positions", `Found ${pools.length} pool(s) with open positions`);
@@ -1418,6 +1419,7 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
 
     const positions = [];
     for (const pool of pools) {
+      assertReadActive();
       for (const positionAddress of (pool.listPositions || [])) {
         const tracked = getTrackedPosition(positionAddress);
         const isOOR = pool.outOfRange || pool.positionsOutOfRange?.includes(positionAddress);
@@ -1569,8 +1571,10 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
       source: "meteora",
     };
     if (useLocalWallet) {
+      assertReadActive();
       syncOpenPositions(positions.map(p => p.position));
       await restoreHistoricallyFalseClosedPositions(positions);
+      assertReadActive();
       _positionsCache = result;
       _positionsCacheAt = Date.now();
     }
@@ -1578,17 +1582,17 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
   } catch (error) {
     log("positions_error", `Portfolio fetch failed: ${error.stack || error.message}`);
     return { wallet: walletAddress, total_positions: 0, positions: [], error: error.message };
-  } finally {
-    if (useLocalWallet) _positionsInflight = null;
   }
   };
 
   if (useLocalWallet) {
-    _positionsInflight = loadPositions();
-    return _positionsInflight;
+    const pending = withReadDeadline(loadPositions, { timeoutMs: 20_000, label: "LP position snapshot" })
+      .finally(() => { if (_positionsInflight === pending) _positionsInflight = null; });
+    _positionsInflight = pending;
+    return pending;
   }
 
-  return loadPositions();
+  return withReadDeadline(loadPositions, { timeoutMs: 20_000, label: "LP position snapshot" });
 }
 
 // ─── Get Positions for Any Wallet ─────────────────────────────

@@ -52,6 +52,11 @@ test("missing LP snapshot, active exposure and pending settlement fail closed", 
   await assert.rejects(guard.run({ strategy: "spot", amountSol: 0.5 }, async () => assert.fail()), /settlement/i);
 }));
 
+test("an API error shaped like zero LP positions cannot authorize a hybrid entry", async () => fixture(async ({ guard, setLp }) => {
+  setLp({ total_positions: 0, positions: [], error: "RPC unavailable" });
+  await assert.rejects(guard.run({ strategy: "spot", amountSol: 0.5 }, async () => assert.fail("unknown exposure must not execute")), /snapshot/i);
+}));
+
 test("uncertain execution keeps durable lock; no timed unlock", async () => fixture(async ({ guard }) => {
   await guard.run({ strategy: "lp", amountSol: 0.5 }, async () => ({ success: true, position: null }));
   await assert.rejects(guard.run({ strategy: "spot", amountSol: 0.5 }, async () => assert.fail()), /entry.*lock|pending.*entry/i);

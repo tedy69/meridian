@@ -29,7 +29,7 @@ services:
     cap_drop:
       - ALL
     healthcheck:
-      test: ["CMD", "node", "-e", "process.kill(1, 0)"]
+      test: ["CMD", "node", "scripts/healthcheck.js"]
       interval: 30s
       timeout: 5s
       retries: 3

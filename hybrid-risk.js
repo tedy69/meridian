@@ -65,7 +65,7 @@ export function createHybridEntryGuard({ directory, policy, getSpotPosition, get
         if (getSpotPosition() || getTrackedPositions().length) throw new Error("Existing or unresolved position exposure blocks hybrid entry");
         if (getPendingSettlements().length) throw new Error("Pending LP settlement blocks hybrid entry");
         const lp = await getLpPositions();
-        if (!lp || !Array.isArray(lp.positions) || !Number.isInteger(lp.total_positions)
+        if (!lp || lp.error || !Array.isArray(lp.positions) || !Number.isInteger(lp.total_positions)
           || lp.total_positions !== lp.positions.length) throw new Error("Fresh LP snapshot is unavailable or inconsistent");
         if (lp.total_positions > 0) throw new Error("Existing LP position blocks hybrid entry");
         const walletSol = await getWalletSol();

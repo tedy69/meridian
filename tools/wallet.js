@@ -26,6 +26,7 @@ import {
 import { normalizeSlippageBps } from "../trailing-safety.js";
 import { evaluateSpotRoundTripQuote } from "../spot-momentum.js";
 import { createMarketDataCache } from "../market-data-cache.js";
+import { boundedRpcFetch, readJson, withReadDeadline } from "../read-deadline.js";
 import { isHybridEntryExecuting, markHybridSubmissionAttempted } from "../hybrid-risk.js";
 const exitQuoteCache = createMarketDataCache({ maxEntries: 16 });
 
@@ -33,7 +34,7 @@ let _connection = null;
 let _wallet = null;
 
 function getConnection() {
-  if (!_connection) _connection = new Connection(process.env.RPC_URL, "confirmed");
+  if (!_connection) _connection = new Connection(process.env.RPC_URL, { commitment: "confirmed", fetch: boundedRpcFetch });
   return _connection;
 }
 
@@ -238,13 +239,7 @@ export async function getWalletBalances() {
 
   try {
     const url = `https://api.helius.xyz/v1/wallet/${walletAddress}/balances?api-key=${HELIUS_KEY}`;
-    const res = await fetch(url);
-    
-    if (!res.ok) {
-      throw new Error(`Helius API error: ${res.status} ${res.statusText}`);
-    }
-
-    const data = await res.json();
+    const data = await readJson(url, {}, { label: "Helius wallet API" });
     const balances = data.balances || [];
 
     // ─── Find SOL and USDC ────────────────────────────────────
@@ -286,6 +281,16 @@ export async function getWalletBalances() {
       error: error.message,
     };
   }
+}
+
+/** Admission must not use an indexed portfolio API or mistake an API error for zero SOL. */
+export async function getEntrySolBalance({ readBalance = () => getTokenBalanceByMint(SOL_MINT), timeoutMs = 5_000 } = {}) {
+  const balance = await withReadDeadline(readBalance, { timeoutMs, label: "Finalized SOL balance" });
+  const raw = String(balance?.raw_amount ?? "");
+  if (balance?.source !== "rpc-finalized" || !/^\d+$/.test(raw) || !Number.isSafeInteger(Number(raw))) {
+    throw new Error("Cannot verify entry balance: invalid finalized SOL response");
+  }
+  return { sol: Number(raw) / LAMPORTS_PER_SOL, raw_amount: raw, source: "rpc-finalized" };
 }
 
 /**
@@ -724,14 +729,9 @@ async function fetchJupiterQuoteOnly({
     search.set("referralAccount", referralParams.referralAccount);
     search.set("referralFee", String(referralParams.referralFee));
   }
-  const response = await fetch(`${JUPITER_SWAP_V2_API}/order?${search.toString()}`, {
+  const order = await readJson(`${JUPITER_SWAP_V2_API}/order?${search.toString()}`, {
     headers: { "x-api-key": apiKey },
-    signal: AbortSignal.timeout(config.spot.quoteMaxAgeMs),
-  });
-  if (!response.ok) throw Object.assign(new Error(`Swap V2 quote HTTP ${response.status}`), {
-    status: response.status, retryAfter: response.headers.get("retry-after"),
-  });
-  const order = await response.json();
+  }, { timeoutMs: config.spot.quoteMaxAgeMs, label: "Swap V2 quote" });
   return validateJupiterQuote(order, {
     inputMint,
     outputMint,
@@ -754,7 +754,13 @@ export async function getSpotExitQuote({ mint, rawAmount }) {
   }, { ttlMs: config.spot.quoteMaxAgeMs, rateLimitKey: "jupiter-exit-quotes" });
 }
 
-export async function getSpotRoundTripQuote({ mint, amountSol }) {
+export function getSpotRoundTripQuote(args) {
+  return withReadDeadline(() => readSpotRoundTripQuote(args), {
+    timeoutMs: config.spot.quoteMaxAgeMs, label: "Round-trip quote freshness",
+  });
+}
+
+async function readSpotRoundTripQuote({ mint, amountSol }) {
   const outputMint = normalizeMint(mint);
   const amount = assertSpotSwapAllowed({
     mode: config.trading.mode,

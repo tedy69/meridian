@@ -3,7 +3,7 @@ import { log } from "./logger.js";
 import { repoPath } from "./repo-root.js";
 
 const DECISION_LOG_FILE = repoPath("decision-log.json");
-const MAX_DECISIONS = 100;
+const MAX_DECISIONS = 2_000;
 
 function load() {
   if (!fs.existsSync(DECISION_LOG_FILE)) {

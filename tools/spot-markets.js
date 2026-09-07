@@ -2,6 +2,8 @@ import { PublicKey } from "@solana/web3.js";
 import { config } from "../config.js";
 import { SOL_MINT } from "../execution-guard.js";
 import { createMarketDataCache } from "../market-data-cache.js";
+import { readJson } from "../read-deadline.js";
+import { normalizeTokenActivity } from "../token-activity.js";
 
 const JUPITER = "https://api.jup.ag/tokens/v2";
 const DEX = "https://api.dexscreener.com";
@@ -13,17 +15,9 @@ const address = (value) => new PublicKey(value).toBase58();
 async function requestJson(url, { ttlMs = 10000 } = {}) {
   const provider = url.startsWith(JUPITER) ? "jupiter-tokens" : "dexscreener";
   return cache.get(url, async () => {
-    const response = await fetch(url, {
+    return readJson(url, {
       headers: provider === "jupiter-tokens" ? { "x-api-key": config.jupiter.apiKey } : {},
-      signal: AbortSignal.timeout(4000),
-    });
-    if (!response.ok) {
-      const error = new Error(`${provider} HTTP ${response.status}`);
-      error.status = response.status;
-      error.retryAfter = response.headers.get("retry-after");
-      throw error;
-    }
-    return response.json();
+    }, { label: provider });
   }, { ttlMs, rateLimitKey: provider });
 }
 
@@ -61,6 +55,7 @@ export function normalizeSpotMarket(pair, token, now = Date.now()) {
     token_age_hours: Number.isFinite(created) && created <= now ? (now - created) / 3600000 : null,
     price_change_pct: numeric(pair?.priceChange?.m5),
     volume_change_pct: numeric(token?.stats5m?.volumeChange),
+    stats_5m: normalizeTokenActivity(token?.stats5m),
     token_snapshot_at: token.updatedAt,
     checked_at: new Date(now).toISOString(),
   };

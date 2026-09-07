@@ -1,4 +1,5 @@
 import { selectSpotEntryCandidate } from "./spot-momentum.js";
+import { withReadDeadline } from "./read-deadline.js";
 
 // Scores between spot momentum and fee-generating LP are not comparable.
 // Prefer the requested fast-momentum strategy. LP is an independent candidate,
@@ -13,13 +14,13 @@ export function selectHybridCandidate({ spot = [], lp = [] } = {}) {
   return selectedLp ? { strategy: "lp", candidate: selectedLp } : null;
 }
 
-export async function scanHybridCandidates({ scanSpot, scanLp }) {
-  const safeScan = async (scan) => {
-    try { return await scan(); }
+export async function scanHybridCandidates({ scanSpot, scanLp, timeoutMs = 20_000, signal }) {
+  const safeScan = async (scan, label) => {
+    try { return await withReadDeadline(scan, { timeoutMs, signal, label }); }
     catch (error) { return { candidates: [], error: error.message }; }
   };
-  const lpPending = safeScan(scanLp);
-  const spot = await safeScan(scanSpot);
+  const lpPending = safeScan(scanLp, "LP screening");
+  const spot = await safeScan(scanSpot, "Spot screening");
   const fastSpot = selectHybridCandidate({ spot: spot?.candidates });
   if (fastSpot) return { spot, lp: { candidates: [], pending: true }, selected: fastSpot };
   const lp = await lpPending;

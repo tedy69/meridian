@@ -7,7 +7,7 @@ import { Connection } from "@solana/web3.js";
 import { agentLoop } from "./agent.js";
 import { log } from "./logger.js";
 import { getMyPositions, getActiveBin } from "./tools/dlmm.js";
-import { getTokenBalanceByMint, getWalletBalances } from "./tools/wallet.js";
+import { getTokenBalanceByMint, getWalletBalances, getEntrySolBalance } from "./tools/wallet.js";
 import { getTopCandidates, degenScore } from "./tools/screening.js";
 import {
   config,
@@ -56,6 +56,9 @@ import { selectSpotEntryCandidate } from "./spot-momentum.js";
 import { isSpotEnabled, isLpEnabled, getHybridRiskStatus } from "./hybrid-risk.js";
 import { scanHybridCandidates } from "./hybrid-strategy.js";
 import { createMarketDataCache } from "./market-data-cache.js";
+import { withReadDeadline } from "./read-deadline.js";
+import { runScreeningPipeline, queueScreeningAfterManagement } from "./screening-pipeline.js";
+import { createRuntimeHealth, evaluateRuntimeHealth, persistRuntimeHealth } from "./runtime-health.js";
 import { getTradingStatus, formatTradingStatus } from "./tools/trading-status.js";
 const hybridLpCache = createMarketDataCache({ maxEntries: 2 });
 import {
@@ -71,6 +74,13 @@ const entrypointPath = process.env.pm_exec_path || process.argv[1];
 const indexPath = fileURLToPath(import.meta.url);
 const isMain = process.env.pm_id != null
   || (entrypointPath ? path.resolve(entrypointPath) === indexPath : false);
+const runtimeHealth = createRuntimeHealth({ write: (snapshot) => {
+  if (!isMain) return;
+  try { persistRuntimeHealth(repoPath("runtime-health.json"), snapshot); }
+  catch { log("health_error", "Cannot persist runtime health snapshot"); }
+} });
+let runtimeHealthTimer = null;
+let lastHealthAlarm = null;
 
 let runtimeRpcVerified = true;
 if (isMain) {
@@ -205,6 +215,7 @@ async function maybeRunMissedBriefing() {
 }
 
 function stopCronJobs() {
+  runtimeHealth.pause();
   for (const task of _cronTasks) task.stop();
   if (_cronTasks._pnlPollInterval) clearInterval(_cronTasks._pnlPollInterval);
   if (_cronTasks._opportunityPollInterval) clearInterval(_cronTasks._opportunityPollInterval);
@@ -429,6 +440,7 @@ async function runSpotManagementCycle({ silent = false } = {}) {
 
 async function runSpotScreeningCycle({ silent = false } = {}) {
   if (_screeningBusy || _claimAllBusy || _managementBusy) {
+    runtimeHealth.skipped("transaction lane is busy");
     log("cron", "Spot screening skipped — transaction lane is busy");
     return null;
   }
@@ -437,6 +449,8 @@ async function runSpotScreeningCycle({ silent = false } = {}) {
   timers.screeningLastRun = Date.now();
   let report = null;
   let liveMessage = null;
+  let healthStatus = "no_trade";
+  runtimeHealth.stage("reading", "spot preflight");
   try {
     if (!silent && telegramEnabled()) {
       liveMessage = await createLiveMessage("🔎 Spot Momentum Scan", "Applying deterministic momentum and token-safety gates...");
@@ -452,12 +466,14 @@ async function runSpotScreeningCycle({ silent = false } = {}) {
       return report;
     }
 
-    const [legacyPositions, balance] = await Promise.all([
+    const [legacyPositions, balance] = await withReadDeadline(() => Promise.all([
       getMyPositions({ force: true, silent: true }),
       process.env.DRY_RUN === "true"
         ? Promise.resolve(null)
         : getTokenBalanceByMint(SOL_MINT),
-    ]);
+    ]), { timeoutMs: 5_000, label: "Spot exposure and balance" });
+    if (!legacyPositions || legacyPositions.error || !Array.isArray(legacyPositions.positions)
+      || legacyPositions.total_positions !== legacyPositions.positions.length) throw new Error("LP exposure cannot be verified");
     if ((legacyPositions?.total_positions ?? legacyPositions?.positions?.length ?? 0) > 0) {
       report = "Spot scan skipped — an LP position is still open; mixed exposure is blocked.";
       return report;
@@ -503,6 +519,8 @@ async function runSpotScreeningCycle({ silent = false } = {}) {
       `Selected ${selected.name || selected.pool} deterministically at expected round-trip cost ${Number(selected.round_trip_quote.expectedLossPct).toFixed(2)}%`,
     );
     await liveMessage?.toolStart("open_spot_position");
+    runtimeHealth.stage("executing", "spot entry");
+    healthStatus = "selection";
     const spotOpenResult = await executeTool("open_spot_position", {
       pool_address: selected.pool,
     }).catch((error) => ({ success: false, error: error.message }));
@@ -520,10 +538,12 @@ async function runSpotScreeningCycle({ silent = false } = {}) {
       });
     }
   } catch (error) {
+    healthStatus = "error";
     log("cron_error", `Spot screening failed: ${error.message}`);
     report = `Spot screening failed: ${error.message}`;
   } finally {
     _screeningBusy = false;
+    runtimeHealth.complete(healthStatus, report);
     if (!silent && telegramEnabled() && report) {
       if (liveMessage) await liveMessage.finalize(stripThink(report)).catch(() => {});
       else sendMessage(`🔎 Spot Momentum Scan\n\n${stripThink(report)}`).catch(() => {});
@@ -533,69 +553,106 @@ async function runSpotScreeningCycle({ silent = false } = {}) {
 }
 
 async function runHybridScreeningCycle({ silent = false } = {}) {
-  if (_screeningBusy || _managementBusy || _claimAllBusy) return null;
+  if (_screeningBusy || _managementBusy || _claimAllBusy) {
+    runtimeHealth.skipped(_screeningBusy ? "previous screening is busy" : "management/claim lane is busy");
+    return null;
+  }
   _screeningBusy = true;
   _screeningLastTriggered = Date.now();
   timers.screeningLastRun = Date.now();
   let report;
+  let healthStatus = "no_trade";
+  const startedAt = Date.now();
   try {
-    const shared = getHybridRiskStatus();
-    if (shared.entry_pending) return report = "Hybrid scan blocked — previous entry requires reconciliation; no timed unlock.";
-    if (shared.ledger?.date === new Date().toISOString().slice(0, 10)
-      && Number(shared.ledger.lossSol) >= config.hybrid.maxDailyLossSol) {
-      return report = "Hybrid scan blocked — shared daily loss cap reached.";
-    }
-    if (readSpotPosition() || getTrackedPositions(true).length) return "Hybrid scan skipped — one active or unresolved position already exists.";
-    const positions = await getMyPositions({ force: true, silent: true });
-    if (!positions || !Array.isArray(positions.positions) || positions.total_positions !== 0 || positions.positions.length !== 0) {
-      return "Hybrid scan skipped — LP exposure is present or cannot be verified.";
-    }
-    const budget = getSpotStatus().risk_budget;
-    if (budget?.blocked) return `Hybrid scan skipped — ${budget.reason}`;
-    const wallet = await getTokenBalanceByMint(SOL_MINT);
-    const circuit = evaluateLossCircuitBreaker({ performance: getAllPerformanceRecords(), policy: config.risk });
-    if (!circuit.pass) return `Hybrid scan skipped — ${circuit.reason}`;
-    const sizing = getCircuitAdjustedDeploySizing(wallet.amount, circuit);
-    const spotFunded = wallet.amount >= config.spot.tradeAmountSol + config.hybrid.reserveSol + config.hybrid.spotCostBufferSol;
-    if (!spotFunded && !sizing.funded) return "Hybrid scan skipped — reserve plus entry-cost buffer is not funded.";
-    const screened = await scanHybridCandidates({
-      scanSpot: () => spotFunded ? getSpotMomentumCandidates({ limit: 5 }) : Promise.resolve({ candidates: [], reason: "Spot capital plus reserve/cost buffer is not funded" }),
-      scanLp: () => sizing.funded
-        ? hybridLpCache.get("lp-candidates", () => getTopCandidates({ limit: 3 }), { ttlMs: 30000, rateLimitKey: "lp-screener" })
-        : Promise.resolve({ candidates: [], reason: "LP reserve/rent buffer is not funded" }),
+    const screened = await runScreeningPipeline({
+      onStage: (stage) => {
+        runtimeHealth.stage(stage, "hybrid");
+        log("screening_cycle", `Hybrid ${stage}`);
+      },
+      read: async () => {
+        const blocked = (reason) => ({ selected: null, reason });
+        const shared = getHybridRiskStatus();
+        if (shared.entry_pending) return blocked("Previous entry requires reconciliation; no timed unlock.");
+        if (shared.ledger?.date === new Date().toISOString().slice(0, 10)
+          && Number(shared.ledger.lossSol) >= config.hybrid.maxDailyLossSol) return blocked("Shared daily loss cap reached.");
+        if (readSpotPosition() || getTrackedPositions(true).length) return blocked("An active or unresolved position already exists.");
+        runtimeHealth.stage("reading", "finalized exposure and balance");
+        const [positions, wallet] = await withReadDeadline(() => Promise.all([
+          getMyPositions({ force: true, silent: true }), getEntrySolBalance(),
+        ]), { timeoutMs: 5_000, label: "Hybrid exposure and balance" });
+        if (!positions || positions.error || !Array.isArray(positions.positions)
+          || !Number.isInteger(positions.total_positions) || positions.total_positions !== positions.positions.length) {
+          throw new Error("LP exposure cannot be verified.");
+        }
+        if (positions.total_positions > 0) return blocked("LP exposure is present.");
+        const budget = getSpotStatus().risk_budget;
+        if (budget?.blocked) return blocked(budget.reason);
+        const circuit = evaluateLossCircuitBreaker({ performance: getAllPerformanceRecords(), policy: config.risk });
+        if (!circuit.pass) return blocked(circuit.reason);
+        const sizing = getCircuitAdjustedDeploySizing(wallet.sol, circuit);
+        const spotFunded = wallet.sol >= config.spot.tradeAmountSol + config.hybrid.reserveSol + config.hybrid.spotCostBufferSol;
+        if (!spotFunded && !sizing.funded) return blocked("Reserve plus entry-cost buffer is not funded.");
+        runtimeHealth.stage("reading", "independent spot and LP candidates");
+        const candidates = await scanHybridCandidates({
+          scanSpot: () => spotFunded ? getSpotMomentumCandidates({ limit: 5 }) : Promise.resolve({ candidates: [], reason: "Spot capital plus reserve/cost buffer is not funded" }),
+          scanLp: () => sizing.funded
+            ? hybridLpCache.get("lp-candidates", () => getTopCandidates({ limit: 1 }), {
+              ttlMs: 30_000, requestTimeoutMs: 20_000, rateLimitKey: "lp-screener",
+            }) : Promise.resolve({ candidates: [], reason: "LP reserve/rent buffer is not funded" }),
+        });
+        return { ...candidates, sizing };
+      },
+      // Deliberately OUTSIDE the read deadline. Never auto-unlock an uncertain write.
+      execute: async ({ selected, sizing }) => {
+        const candidate = selected.candidate;
+        if (selected.strategy === "spot") return executeTool("open_spot_position", { pool_address: candidate.pool });
+        return executeTool("deploy_position", {
+          pool_address: candidate.pool, amount_y: sizing.amount, amount_x: 0,
+          strategy: config.strategy.strategy, bins_below: computeBinsBelow(candidate.volatility), bins_above: 0,
+          pool_name: candidate.name, bin_step: candidate.bin_step, volatility: candidate.volatility,
+        });
+      },
     });
     const selection = screened.selected;
     if (!selection) {
       const describe = (result) => result?.error || result?.reason
         || result?.source_errors?.map((e) => e.reason).join("; ")
         || result?.filtered_examples?.slice(0, 2).map((e) => e.reason).join("; ") || "no eligible candidates";
-      report = `NO TRADE\nSpot: ${describe(screened.spot)}\nLP: ${describe(screened.lp)}`;
-      appendDecision({ type: "hybrid_no_trade", actor: "SCREENER", summary: "Neither strategy qualified", reason: report });
+      report = screened.reason ? `Hybrid scan blocked: ${screened.reason}`
+        : `NO TRADE\nSpot: ${describe(screened.spot)}\nLP: ${describe(screened.lp)}`;
+      if ((screened.spot?.error || screened.spot?.source_errors?.length) && screened.lp?.error) healthStatus = "error";
+      appendDecision({ type: "hybrid_no_trade", actor: "SCREENER", summary: "Neither strategy qualified", reason: report,
+        metrics: { duration_ms: Date.now() - startedAt, spot_screened: screened.spot?.total_screened,
+          spot_rejected: screened.spot?.fresh_rejected, lp_checked: screened.lp?.fresh_checked,
+          lp_rejected: screened.lp?.fresh_rejected },
+        rejected: [...(screened.spot?.filtered_examples || []), ...(screened.lp?.filtered_examples || [])].map((r) => `${r.name}: ${r.reason}`),
+      });
       return report;
     }
     const candidate = selection.candidate;
+    const result = screened.execution;
+    healthStatus = "selection";
     if (selection.strategy === "spot") {
-      const result = await executeTool("open_spot_position", { pool_address: candidate.pool });
       report = formatConfirmedSpotOpenResult(result, config.spot.tradeAmountSol).text;
     } else {
-      const result = await executeTool("deploy_position", {
-        pool_address: candidate.pool, amount_y: sizing.amount, amount_x: 0,
-        strategy: config.strategy.strategy, bins_below: computeBinsBelow(candidate.volatility), bins_above: 0,
-        pool_name: candidate.name, bin_step: candidate.bin_step, volatility: candidate.volatility,
-      });
       report = result?.dry_run ? "DRY RUN — hybrid LP candidate passed; no transaction sent."
-        : result?.success === true && result?.position ? `LP entry confirmed: ${result.position} (${sizing.amount} SOL).`
+        : result?.success === true && result?.position ? `LP entry confirmed: ${result.position} (${screened.sizing.amount} SOL).`
         : `LP entry not confirmed: ${result?.reason || result?.error || "unresolved result"}`;
     }
     appendDecision({ type: "hybrid_selection", actor: "SCREENER", pool: candidate.pool,
       summary: `${selection.strategy} selected after independent screening`, reason: report });
     return report;
   } catch (error) {
+    healthStatus = "error";
     report = `Hybrid scan blocked: ${error.message}`;
     log("hybrid_error", report);
+    appendDecision({ type: "hybrid_error", actor: "SCREENER", summary: "Hybrid scan failed", reason: report,
+      metrics: { duration_ms: Date.now() - startedAt } });
     return report;
   } finally {
     _screeningBusy = false;
+    runtimeHealth.complete(healthStatus, report);
+    log("screening_cycle", `Hybrid ${healthStatus} after ${Date.now() - startedAt}ms`);
     if (!silent && telegramEnabled() && report) sendMessage(report).catch(() => {});
   }
 }
@@ -633,7 +690,7 @@ export async function runManagementCycle({ silent = false } = {}) {
     if (positions.length === 0) {
       log("cron", "No open positions — triggering screening cycle");
       mgmtReport = "No open positions. Triggering screening cycle.";
-      runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
+      queueScreeningAfterManagement(() => runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`)));
       return mgmtReport;
     }
 
@@ -813,7 +870,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
   let liveMessage = null;
   let screenReport = null;
   try {
-    [prePositions, preBalance] = await Promise.all([getMyPositions({ force: true }), getWalletBalances()]);
+    [prePositions, preBalance] = await Promise.all([getMyPositions({ force: true }), getEntrySolBalance()]);
     if (prePositions.total_positions >= config.risk.maxPositions) {
       log("cron", `Screening skipped — max positions reached (${prePositions.total_positions}/${config.risk.maxPositions})`);
       screenReport = `Screening skipped — max positions reached (${prePositions.total_positions}/${config.risk.maxPositions}).`;
@@ -1139,6 +1196,23 @@ IMPORTANT:
 
 export function startCronJobs() {
   stopCronJobs(); // stop any running tasks before (re)starting
+  runtimeHealth.start({ monitorScanner: isSpotEnabled() });
+  if (isMain && !runtimeHealthTimer) {
+    runtimeHealthTimer = setInterval(() => {
+      runtimeHealth.heartbeat();
+      const health = evaluateRuntimeHealth(runtimeHealth.snapshot());
+      if (!health.healthy && health.reason !== lastHealthAlarm) {
+        lastHealthAlarm = health.reason;
+        log("health_error", health.reason);
+        if (telegramEnabled()) sendMessage(`⚠️ Bot health: ${health.reason}`).catch(() => {});
+      } else if (health.healthy && lastHealthAlarm) {
+        lastHealthAlarm = null;
+        log("health", "Scanner recovered");
+        if (telegramEnabled()) sendMessage("✅ Bot health: scanner kembali berjalan.").catch(() => {});
+      }
+    }, 10_000);
+    runtimeHealthTimer.unref();
+  }
 
   const mgmtTask = cron.schedule(`*/${Math.max(1, config.schedule.managementIntervalMin)} * * * *`, async () => {
     if (_managementBusy || _claimAllBusy) return;
@@ -1300,7 +1374,7 @@ Summarize the current portfolio health, total fees earned, and performance of al
       try {
         const [positions, balance] = await Promise.all([
           getMyPositions({ force: true, silent: true }).catch(() => null),
-          getWalletBalances().catch(() => null),
+          getEntrySolBalance().catch(() => null),
         ]);
         if (!positions || (positions.total_positions ?? 0) >= config.risk.maxPositions) return;
         const sizing = balance ? getAutoDeploySizing(balance.sol) : null;
@@ -1943,7 +2017,7 @@ async function deployLatestCandidate(index) {
       throw new Error(`NO DEPLOY: only cached candidate ${candidate.name} is not worth deploying — ${skipReason}`);
     }
   }
-  const deployAmount = computeDeployAmount((await getWalletBalances()).sol);
+  const deployAmount = computeDeployAmount((await getEntrySolBalance()).sol);
   const binsBelow = computeBinsBelow(candidate.volatility);
   const result = await executeTool("deploy_position", {
     pool_address: candidate.pool,

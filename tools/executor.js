@@ -9,7 +9,8 @@ import {
   closePosition,
   searchPools,
 } from "./dlmm.js";
-import { getTokenBalanceByMint, getWalletBalances, inspectMintSafety, normalizeMint, swapToken } from "./wallet.js";
+import { getTokenBalanceByMint, getWalletBalances, getEntrySolBalance, inspectMintSafety, normalizeMint, swapToken } from "./wallet.js";
+import { readJson, withReadDeadline } from "../read-deadline.js";
 import { isLpEnabled } from "../hybrid-risk.js";
 import { getSpotPosition } from "../spot-state.js";
 import { getTradingStatus } from "./trading-status.js";
@@ -88,9 +89,7 @@ async function fetchFreshPoolDetail(poolAddress, timeframe = config.screening.ti
   const encodedTimeframe = encodeURIComponent(timeframe);
   const filter = encodeURIComponent(`pool_address=${poolAddress}`);
   const url = `${POOL_DISCOVERY_BASE}/pools?page_size=1&filter_by=${filter}&timeframe=${encodedTimeframe}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Pool Discovery API error: ${res.status} ${res.statusText}`);
-  const data = await res.json();
+  const data = await readJson(url, {}, { label: "Pool Discovery API" });
   return (data?.data || [])[0] ?? null;
 }
 
@@ -149,7 +148,17 @@ function buildEntrySignalSnapshot({ poolRisk, tokenAudit, momentum, momentumPres
   return snapshot;
 }
 
-export async function validateDeployPoolThresholds(args, {
+export async function validateDeployPoolThresholds(args, options = {}) {
+  try {
+    return await withReadDeadline(() => readDeployPoolThresholds(args, options), {
+      timeoutMs: options.timeoutMs ?? 12_000, label: "LP entry preflight",
+    });
+  } catch (error) {
+    return { pass: false, reason: `Could not verify LP entry: ${error.message}` };
+  }
+}
+
+async function readDeployPoolThresholds(args, {
   screening = config.screening,
   indicators = config.indicators,
   fetchPoolDetail = fetchFreshPoolDetail,
@@ -1320,6 +1329,10 @@ export async function runSafetyChecks(name, args) {
 
       // Check position count limit + duplicate pool guard — force fresh scan to avoid stale cache
       const positions = await getMyPositions({ force: true });
+      if (!positions || positions.error || !Array.isArray(positions.positions)
+        || positions.total_positions !== positions.positions.length) {
+        return { pass: false, reason: "Fresh LP position snapshot is unavailable or inconsistent." };
+      }
       if (positions.total_positions >= config.risk.maxPositions) {
         return {
           pass: false,
@@ -1362,7 +1375,8 @@ export async function runSafetyChecks(name, args) {
       let balance = null;
       let allowedSizing = null;
       if (!isDryRun()) {
-        balance = await getWalletBalances();
+        try { balance = await getEntrySolBalance(); }
+        catch (error) { return { pass: false, reason: `Cannot verify finalized SOL balance: ${error.message}` }; }
         allowedSizing = getCircuitAdjustedDeploySizing(balance.sol, lossCircuit);
         if (!allowedSizing.funded) {
           return {

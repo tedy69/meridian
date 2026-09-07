@@ -1,4 +1,5 @@
 import { config } from "../config.js";
+import { withReadDeadline } from "../read-deadline.js";
 
 export function getAgentMeridianBase() {
   return String(config.api.url || "https://api.agentmeridian.xyz/api").replace(/\/+$/, "");
@@ -72,7 +73,14 @@ async function agentMeridianJsonOnce(pathname, options = {}, timeoutMs = null) {
   return payload;
 }
 
-export async function agentMeridianJson(pathname, options = {}) {
+export function agentMeridianJson(pathname, options = {}) {
+  if ((options.method || "GET").toUpperCase() !== "GET") return requestAgentMeridianJson(pathname, options);
+  return withReadDeadline(({ signal }) => requestAgentMeridianJson(pathname, { ...options, signal }), {
+    timeoutMs: Number(options.retry?.maxElapsedMs || 4_000), signal: options.signal, label: "Meridian API read",
+  });
+}
+
+async function requestAgentMeridianJson(pathname, options = {}) {
   const { retry, ...fetchOptions } = options;
   if (!retry) {
     return agentMeridianJsonOnce(pathname, fetchOptions);

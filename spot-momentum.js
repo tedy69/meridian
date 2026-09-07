@@ -1,6 +1,7 @@
 import { SOL_MINT } from "./execution-guard.js";
 
 function finite(value) {
+  if (value == null || value === "") return null;
   const numeric = Number(value);
   return Number.isFinite(numeric) ? numeric : null;
 }
@@ -78,9 +79,12 @@ export function evaluateSpotMomentumCandidate({ pool, tokenInfo, policy = {} } =
   const volumeChangePct = finite(pool?.volume_change_pct);
   const top10Pct = finite(tokenInfo?.audit?.top_holders_pct);
   const botHoldersPct = finite(tokenInfo?.audit?.bot_holders_pct);
-  const buyVolume = finite(tokenInfo?.stats_1h?.buy_vol);
-  const sellVolume = finite(tokenInfo?.stats_1h?.sell_vol);
-  const netBuyers = finite(tokenInfo?.stats_1h?.net_buyers);
+  // The public pair snapshot binds activity to the same mint and five-minute
+  // window. A bullish hour must not disguise selling during the entry window.
+  const activity = pool?.stats_5m ?? tokenInfo?.stats_5m;
+  const buyVolume = finite(activity?.buy_vol);
+  const sellVolume = finite(activity?.sell_vol);
+  const netBuyers = finite(activity?.net_buyers);
   const buySellVolumeRatio = buyVolume != null && sellVolume != null
     ? buyVolume / Math.max(sellVolume, 1)
     : null;
@@ -113,6 +117,7 @@ export function evaluateSpotMomentumCandidate({ pool, tokenInfo, policy = {} } =
     sellVolume,
     buySellVolumeRatio,
     netBuyers,
+    activityWindow: "5m",
     momentumEvidenceAvailable,
     momentumConfirmed,
     spikeScore,
@@ -152,10 +157,10 @@ export function evaluateSpotMomentumCandidate({ pool, tokenInfo, policy = {} } =
     return reject(`Volume acceleration is below ${p.minVolumeChangePct}%.`, metrics);
   }
   if (buySellVolumeRatio == null || buySellVolumeRatio < p.minBuySellVolumeRatio) {
-    return reject(`Buy/sell volume ratio is below ${p.minBuySellVolumeRatio}.`, metrics);
+    return reject(`5-minute buy/sell volume ratio is below ${p.minBuySellVolumeRatio} or activity is unavailable.`, metrics);
   }
   if (p.requirePositiveNetBuyers && (netBuyers == null || netBuyers <= 0)) {
-    return reject("Net organic buyers are not positive.", metrics);
+    return reject("5-minute net buyers are not positive.", metrics);
   }
   if (spikeScore == null || spikeScore < p.minSpikeScore) {
     return reject(`Composite spike strength is below ${p.minSpikeScore}.`, metrics);

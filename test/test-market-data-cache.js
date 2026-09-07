@@ -3,6 +3,77 @@ import test from "node:test";
 import { config } from "../config.js";
 import { createMarketDataCache } from "../market-data-cache.js";
 
+async function settleWithin(promise, ms = 300) {
+  let watchdog;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        watchdog = setTimeout(() => reject(new Error("Regression probe did not settle")), ms);
+      }),
+    ]);
+  } finally {
+    clearTimeout(watchdog);
+  }
+}
+
+test("a never-resolving market request aborts at its deadline and permits a fresh retry", { timeout: 1_000 }, async () => {
+  const cache = createMarketDataCache({ maxEntries: 1 });
+  let firstSignal;
+  const first = cache.get("mint", (options) => {
+    firstSignal = options?.signal;
+    return new Promise(() => {});
+  }, { ttlMs: 1_000, requestTimeoutMs: 20 });
+
+  await assert.rejects(settleWithin(first), /timeout|timed out|deadline/i);
+  assert.ok(firstSignal instanceof AbortSignal, "the read-only loader receives its cancellation signal");
+  assert.equal(firstSignal.aborted, true);
+
+  const fresh = await settleWithin(cache.get("mint", async ({ signal }) => {
+    assert.equal(signal.aborted, false, "the retry must not reuse an aborted request");
+    return { price: 42 };
+  }, { ttlMs: 1_000, requestTimeoutMs: 20 }));
+  assert.deepEqual(fresh, { price: 42 });
+});
+
+test("deduplicated callers all leave a timed-out market request and a later request recovers", { timeout: 1_000 }, async () => {
+  const cache = createMarketDataCache();
+  let requests = 0;
+  const loader = () => {
+    requests += 1;
+    return new Promise(() => {});
+  };
+  const options = { ttlMs: 1_000, requestTimeoutMs: 20 };
+  const outcomes = await settleWithin(Promise.allSettled([
+    cache.get("mint", loader, options),
+    cache.get("mint", loader, options),
+  ]));
+
+  assert.equal(requests, 1);
+  for (const outcome of outcomes) {
+    assert.equal(outcome.status, "rejected");
+    assert.match(outcome.reason.message, /timeout|timed out|deadline/i);
+  }
+  assert.equal(await settleWithin(cache.get("mint", async () => "recovered", options)), "recovered");
+});
+
+test("a late result from a timed-out request cannot replace a recovered cache snapshot", { timeout: 1_000 }, async () => {
+  const cache = createMarketDataCache();
+  let finishOldRequest;
+  const options = { ttlMs: 1_000, requestTimeoutMs: 20 };
+  const first = cache.get("mint", () => new Promise((resolve) => {
+    finishOldRequest = resolve;
+  }), options);
+  await assert.rejects(settleWithin(first), /timeout|timed out|deadline/i);
+
+  assert.equal(await settleWithin(cache.get("mint", async () => "new", options)), "new");
+  finishOldRequest("old");
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const cached = await cache.get("mint", () => assert.fail("the recovered snapshot should remain cached"), options);
+  assert.equal(cached, "new");
+});
+
 test("in-flight market requests deduplicate even when completed caching is disabled", async () => {
   const cache = createMarketDataCache();
   let finish;
@@ -192,6 +263,22 @@ test("concurrent and immediately repeated refreshes reuse each mint/interval sna
   assert.equal(requests.every((url) => url.searchParams.get("refresh") === "1"), true);
 });
 
+test("required indicator windows start together rather than aging while queued", async (t) => {
+  const pendingResponses = [];
+  let released = false;
+  const { confirmIndicatorPreset } = await indicatorHarness(t, () => {
+    if (released) return Promise.resolve(new Response(JSON.stringify(bullishPayload())));
+    return new Promise((resolve) => pendingResponses.push(resolve));
+  });
+  const pending = confirmIndicatorPreset({ mint: "ConcurrentWindows", side: "entry", refresh: true });
+  await new Promise((resolve) => setImmediate(resolve));
+  const startedTogether = pendingResponses.length;
+  released = true;
+  for (const resolve of pendingResponses) resolve(new Response(JSON.stringify(bullishPayload())));
+  assert.equal((await pending).confirmed, true);
+  assert.equal(startedTogether, 2);
+});
+
 test("an indicator 429 blocks further provider requests while entry stays fail-closed", async (t) => {
   let requests = 0;
   const { confirmIndicatorPreset } = await indicatorHarness(t, async () => {
@@ -207,7 +294,7 @@ test("an indicator 429 blocks further provider requests while entry stays fail-c
 
   assert.equal(first.confirmed, false);
   assert.equal(second.confirmed, false);
-  assert.equal(requests, 1, "other intervals and mints must observe the provider cooldown");
+  assert.equal(requests, 2, "the two initial concurrent windows may start; later mints must observe the provider cooldown");
 });
 
 test("all required indicator intervals must still be fresh when final confirmation is returned", async (t) => {

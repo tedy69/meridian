@@ -95,6 +95,9 @@ function passingCandidate() {
         top_holders_pct: "22.4",
         bot_holders_pct: "8.1",
       },
+      stats_5m: {
+        buy_vol: "45000", sell_vol: "25000", net_buyers: 37,
+      },
       stats_1h: {
         buy_vol: "45000",
         sell_vol: "25000",
@@ -103,6 +106,29 @@ function passingCandidate() {
     },
   };
 }
+
+test("five-minute entries reject selling pressure even when the one-hour trend is bullish", () => {
+  const candidate = passingCandidate();
+  candidate.tokenInfo.stats_5m = { buy_vol: 100, sell_vol: 500, net_buyers: -5 };
+  const result = evaluateSpotMomentumCandidate(candidate);
+  assert.equal(result.pass, false);
+  assert.match(result.reason, /buy\/sell|buyers/i);
+});
+
+test("a one-hour buyer statistic cannot substitute for missing five-minute activity", () => {
+  const candidate = passingCandidate();
+  delete candidate.tokenInfo.stats_5m;
+  const result = evaluateSpotMomentumCandidate(candidate);
+  assert.equal(result.pass, false);
+  assert.match(result.reason, /5-minute.*activity|buy\/sell/i);
+});
+
+test("missing holder concentration is unknown, not a safe zero", () => {
+  const candidate = passingCandidate();
+  candidate.tokenInfo.stats_5m = candidate.tokenInfo.stats_1h;
+  candidate.tokenInfo.audit.bot_holders_pct = null;
+  assert.equal(evaluateSpotMomentumCandidate(candidate).pass, false);
+});
 
 test("spot momentum explicitly enables a backend-capped 0.5 SOL trade", () => {
   const trading = buildTradingConfig({ tradingMode: "spot_momentum" });
@@ -404,8 +430,8 @@ test("candidate gate requires safe audit, SOL quote, and confirmed momentum", ()
   const weakSpike = structuredClone(candidate);
   weakSpike.pool.price_change_pct = 1.5;
   weakSpike.pool.volume_change_pct = 20;
-  weakSpike.tokenInfo.stats_1h.buy_vol = "28750";
-  weakSpike.tokenInfo.stats_1h.sell_vol = "25000";
+  weakSpike.tokenInfo.stats_5m.buy_vol = "28750";
+  weakSpike.tokenInfo.stats_5m.sell_vol = "25000";
   assert.match(evaluateSpotMomentumCandidate(weakSpike).reason, /spike strength/i);
 
   const staleMomentum = structuredClone(candidate);

@@ -339,12 +339,11 @@ export async function confirmIndicatorPreset({
     };
   }
 
-  const results = [];
-  for (const interval of targets) {
+  const results = await Promise.all(targets.map(async (interval) => {
     try {
       const { payload, requestedAt } = await fetchChartIndicatorsForMint(mint, { interval, refresh });
       const evaluation = evaluateIndicatorPreset(side, preset, payload, config.indicators);
-      results.push({
+      return {
         interval,
         ok: true,
         confirmed: !!evaluation.confirmed,
@@ -352,19 +351,19 @@ export async function confirmIndicatorPreset({
         signal: evaluation.signal,
         latest: payload?.latest || null,
         snapshotRequestedAt: requestedAt,
-      });
+      };
     } catch (error) {
       log("indicators_warn", `Indicator fetch failed for ${mint.slice(0, 8)} ${interval}: ${error.message}`);
-      results.push({
+      return {
         interval,
         ok: false,
         confirmed: null,
         reason: error.message,
         signal: null,
         latest: null,
-      });
+      };
     }
-  }
+  }));
 
   // A fast first interval can expire while a later interval is fetched.
   const confirmedAt = Date.now();

@@ -816,3 +816,77 @@ docker compose up -d --build
 ```
 
 The process verifies the Solana mainnet genesis hash before it starts cron cycles or Telegram long polling. It repeats that check immediately before every simulation, signing, relay submission, or Jupiter execution. A non-mainnet or unverifiable endpoint leaves the process fail-closed.
+
+### Screening reliability and diagnostics
+
+Hybrid screening has a 30-second **read-only** deadline, independent 20-second
+spot/LP scanners, bounded HTTP bodies/RPC reads, and expiring in-flight market
+requests. A timed-out or late market result cannot initiate an entry. Financial
+execution is outside that timeout: uncertain submissions keep their durable
+entry lock until reconciliation, never a timed unlock or blind retry.
+
+LP candidates pass the same fresh pool, token audit, mint safety, and indicator
+gate used immediately before execution. Screening checks successive batches of
+three (up to 12 per scan), instead of stopping after the first rejected leaders.
+Execution still revalidates every selected candidate. Entry sizing uses finalized
+RPC SOL; an API error is unknown balance/exposure, not a verified zero.
+
+Spot buyer activity uses `stats5m`, not `stats1h`. The public
+[Jupiter token schema](https://developers.jup.ag/docs/tokens/token-information)
+defines these as separate windows. Activity is mint-wide; pool price/volume is
+venue-specific. Both use the five-minute window. Required 5m/15m indicators are
+fetched concurrently and must remain fresh; their acceptance rules are unchanged.
+
+`runtime-health.json` records scanner phase, completed scans, errors, and a
+10-second process heartbeat. Docker checks that snapshot and the actual daemon
+PID. Trading status includes scanner health; Telegram reports failure/recovery
+transitions. Three failed scans or stale progress are unhealthy. An empty but
+successful scan is healthy; an explicitly paused scanner is reported separately.
+Scanner progress monitoring covers spot/hybrid modes; legacy LP mode currently
+has process-heartbeat monitoring. Docker's restart policy alone does **not**
+restart an unhealthy-but-running container. No transaction is unlocked by health
+checks. For diagnosis:
+
+```sh
+docker compose exec -T meridian node scripts/healthcheck.js
+docker compose logs --since 30m meridian
+```
+
+Look for `SCREENING_CYCLE` durations/stages and `hybrid_error` decisions. The
+structured decision log retains the newest 2,000 records, including gate reasons
+and rejection counts; it is a bounded recent history, not an all-time ledger.
+
+### Offline profitability evaluation
+
+These commands only read files: no wallet loading, network, trading, or automatic
+risk adjustment. Closed-trade `pnlSol` is already measured net wallet PnL; fees are
+not subtracted twice. Spot status includes the latest 100 recorded trades' summary.
+
+```sh
+npm run evaluate:spot
+npm run evaluate:spot -- --state /absolute/path/to/spot-state.json
+npm run evaluate:spot -- --replay /absolute/path/to/quotes.json
+npm run evaluate:spot -- --replay test/fixtures/spot-replay.json
+```
+
+A replay file supplies measured entry cost (including entry fees), timestamped
+tracked-size minimum exit outputs (already accounting for slippage), and explicit
+exit fees:
+
+```json
+{
+  "entryCostSol": 0.501,
+  "openedAt": "2026-09-07T00:00:00Z",
+  "quotes": [
+    { "at": "2026-09-07T00:00:01Z", "minimumOutSol": 0.508, "exitFeeSol": 0.001 }
+  ]
+}
+```
+
+The evaluator reports net expectancy, average wins/losses and the historical
+break-even win rate, or replays the mechanical exit rule. Replays are not proof
+of transaction landing, latency, MEV protection, or future profits. The entry
+round-trip quote gate remains a quoted spread/impact check, **not** a guarantee
+of all-in profitability. Reserve, position size, profit floor, stop-loss and
+daily-loss limits are unchanged by these reliability fixes. Validate strategy
+changes with recorded quotes/paper runs before changing live risk settings.

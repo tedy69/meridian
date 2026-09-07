@@ -1,5 +1,6 @@
 import { Connection, PublicKey } from "@solana/web3.js";
 import { config } from "../config.js";
+import { boundedRpcFetch, readJson } from "../read-deadline.js";
 import { log } from "../logger.js";
 import { calculateOpenPositionPerformance } from "../position-performance.js";
 import {
@@ -33,7 +34,7 @@ async function loadDlmmSdk() {
 let _pnlConnection = null;
 export function getPnlConnection() {
   if (!_pnlConnection) {
-    _pnlConnection = new Connection(config.pnl.rpcUrl, "confirmed");
+    _pnlConnection = new Connection(config.pnl.rpcUrl, { commitment: "confirmed", fetch: boundedRpcFetch });
   }
   return _pnlConnection;
 }
@@ -63,13 +64,7 @@ function unique(arr) {
 export async function fetchDlmmPnlForPool(poolAddress, walletAddress) {
   const url = `${METEORA_PNL}/${poolAddress}/pnl?user=${walletAddress}&status=open&pageSize=100&page=1`;
   try {
-    const res = await fetch(url);
-    if (!res.ok) {
-      const body = await res.text().catch(() => "");
-      log("pnl_api", `HTTP ${res.status} for pool ${poolAddress.slice(0, 8)}: ${body.slice(0, 120)}`);
-      return {};
-    }
-    const data = await res.json();
+    const data = await readJson(url, {}, { label: "Meteora PnL API" });
     const positions = data.positions || data.data || [];
     const byAddress = {};
     for (const p of positions) {
@@ -88,9 +83,7 @@ async function getJupiterPrices(mints) {
   const list = unique(mints.map((m) => String(m).trim()));
   if (!list.length) return {};
   try {
-    const res = await fetch(`${JUP_SEARCH}?query=${list.join(",")}`, { headers: { accept: "application/json" } });
-    if (!res.ok) throw new Error(`Jupiter ${res.status}`);
-    const assets = await res.json();
+    const assets = await readJson(`${JUP_SEARCH}?query=${list.join(",")}`, { headers: { accept: "application/json" } }, { label: "Jupiter prices" });
     const out = {};
     for (const a of assets) out[a.id] = maybeNum(a.usdPrice);
     return out;

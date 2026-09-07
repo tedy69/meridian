@@ -3,9 +3,9 @@ import { isBlacklisted } from "../token-blacklist.js";
 import { isDevBlocked, getBlockedDevs } from "../dev-blocklist.js";
 import { log } from "../logger.js";
 import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
-import { confirmIndicatorPreset } from "./chart-indicators.js";
 import { getAgentMeridianBase, getAgentMeridianHeaders } from "./agent-meridian.js";
 import { evaluateFreshPoolRisk } from "../risk-intelligence.js";
+import { assertReadActive, readJson, withReadDeadline } from "../read-deadline.js";
 
 const DATAPI_JUP = "https://datapi.jup.ag/v1";
 
@@ -157,11 +157,9 @@ function getRawPoolScreeningRejectReason(pool, s) {
 }
 
 async function fetchDiscordSignalCandidates() {
-  const res = await fetch(`${getAgentMeridianBase()}/signals/discord/candidates`, {
+  const data = await readJson(`${getAgentMeridianBase()}/signals/discord/candidates`, {
     headers: getAgentMeridianHeaders(),
   });
-  if (!res.ok) throw new Error(`discord signal candidates ${res.status}`);
-  const data = await res.json();
   return Array.isArray(data?.candidates) ? data.candidates : [];
 }
 
@@ -172,13 +170,7 @@ async function fetchPoolDiscoveryPage({ page_size, filters, timeframe, category 
     `&timeframe=${timeframe}` +
     `&category=${category}`;
 
-  const res = await fetch(url);
-
-  if (!res.ok) {
-    throw new Error(`Pool Discovery API error: ${res.status} ${res.statusText}`);
-  }
-
-  return res.json();
+  return readJson(url, {}, { label: "Pool Discovery API" });
 }
 
 async function fetchPoolDiscoveryDetail({ poolAddress, timeframe }) {
@@ -187,13 +179,7 @@ async function fetchPoolDiscoveryDetail({ poolAddress, timeframe }) {
     `&filter_by=${encodeURIComponent(`pool_address=${poolAddress}`)}` +
     `&timeframe=${timeframe}`;
 
-  const res = await fetch(url);
-
-  if (!res.ok) {
-    throw new Error(`Pool detail API error: ${res.status} ${res.statusText}`);
-  }
-
-  const data = await res.json();
+  const data = await readJson(url, {}, { label: "Pool detail API" });
   return (data.data || [])[0] ?? null;
 }
 
@@ -246,9 +232,7 @@ async function applyVolatilityTimeframe(rawPools, sourceTimeframe) {
 }
 
 async function searchAssetsBySymbol(symbol) {
-  const res = await fetch(`${DATAPI_JUP}/assets/search?query=${encodeURIComponent(symbol)}`);
-  if (!res.ok) throw new Error(`assets/search ${res.status}`);
-  const data = await res.json();
+  const data = await readJson(`${DATAPI_JUP}/assets/search?query=${encodeURIComponent(symbol)}`, {}, { label: "Jupiter assets" });
   return Array.isArray(data) ? data : [data];
 }
 
@@ -302,9 +286,7 @@ async function enrichDiscordSignalLaunchpads(rawPools) {
 
 async function findRivalPool(mint) {
   const url = `https://dlmm.datapi.meteora.ag/pools?query=${encodeURIComponent(mint)}&sort_by=${encodeURIComponent("tvl:desc")}&filter_by=${encodeURIComponent(`tvl>${PVP_MIN_ACTIVE_TVL}`)}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`rival pool search ${res.status}`);
-  const data = await res.json();
+  const data = await readJson(url, {}, { label: "Rival pool search" });
   const pools = Array.isArray(data?.data) ? data.data : [];
   return pools.find((pool) => pool?.token_x?.address === mint || pool?.token_y?.address === mint) || null;
 }
@@ -541,8 +523,7 @@ export async function discoverPools({
     if (missingDev.length > 0) {
       const devResults = await Promise.allSettled(
         missingDev.map((p) =>
-          fetch(`${DATAPI_JUP}/assets/search?query=${p.base.mint}`)
-            .then((r) => r.ok ? r.json() : null)
+          readJson(`${DATAPI_JUP}/assets/search?query=${p.base.mint}`)
             .then((d) => {
               const t = Array.isArray(d) ? d[0] : d;
               return { pool: p.pool, dev: t?.dev || null };
@@ -577,20 +558,28 @@ export async function discoverPools({
  * Returns eligible pools for the agent to evaluate and pick from.
  * Hard filters applied in code, agent decides which to deploy into.
  */
-export async function getTopCandidates({ limit = 10 } = {}) {
-  const { config } = await import("../config.js");
-  const discovery = await discoverPools({ page_size: 50 });
+export function getTopCandidates(args = {}, overrides = {}) {
+  return withReadDeadline(() => readTopCandidates(args, overrides), {
+    timeoutMs: 20_000, label: "LP candidate screening",
+  });
+}
+
+async function readTopCandidates({ limit = 10 } = {}, overrides = {}) {
+  const s = overrides.screening ?? config.screening;
+  const discovery = await (overrides.discoverPools ?? discoverPools)({ page_size: 50 });
   const { pools } = discovery;
   const filteredOut = Array.isArray(discovery.filtered_examples) ? [...discovery.filtered_examples] : [];
 
   // Exclude pools where the wallet already has an open position
-  const { getMyPositions } = await import("./dlmm.js");
-  const { positions } = await getMyPositions();
+  const getMyPositions = overrides.getMyPositions ?? (await import("./dlmm.js")).getMyPositions;
+  const snapshot = await getMyPositions();
+  if (!snapshot || snapshot.error || !Array.isArray(snapshot.positions)) throw new Error("LP exposure snapshot is unavailable");
+  const { positions } = snapshot;
   const occupiedPools = new Set(positions.map((p) => p.pool));
   const occupiedMints = new Set(positions.map((p) => p.base_mint).filter(Boolean));
-  const minTvl = Number(config.screening.minTvl ?? 0);
-  const maxTvl = config.screening.maxTvl == null ? null : Number(config.screening.maxTvl);
-  const minFeeActiveTvlRatio = Number(config.screening.minFeeActiveTvlRatio ?? 0);
+  const minTvl = Number(s.minTvl ?? 0);
+  const maxTvl = s.maxTvl == null ? null : Number(s.maxTvl);
+  const minFeeActiveTvlRatio = Number(s.minFeeActiveTvlRatio ?? 0);
 
   const eligible = pools
     .filter((p) => {
@@ -620,24 +609,23 @@ export async function getTopCandidates({ limit = 10 } = {}) {
         pushFilteredReason(filteredOut, p, "already holding this base token in another pool");
         return false;
       }
-      if (isPoolOnCooldown(p.pool)) {
+      if ((overrides.isPoolOnCooldown ?? isPoolOnCooldown)(p.pool)) {
         log("screening", `Filtered cooldown pool ${p.name} (${p.pool.slice(0, 8)})`);
         pushFilteredReason(filteredOut, p, "pool cooldown active");
         return false;
       }
-      if (isBaseMintOnCooldown(p.base?.mint)) {
+      if ((overrides.isBaseMintOnCooldown ?? isBaseMintOnCooldown)(p.base?.mint)) {
         log("screening", `Filtered cooldown token ${p.base?.symbol} (${p.base?.mint?.slice(0, 8)})`);
         pushFilteredReason(filteredOut, p, "token cooldown active");
         return false;
       }
       return true;
     })
-    .sort((a, b) => scoreCandidate(b) - scoreCandidate(a))
-    .slice(0, limit);
+    .sort((a, b) => scoreCandidate(b) - scoreCandidate(a));
 
-  if (config.screening.avoidPvpSymbols && eligible.length > 0) {
+  if (s.avoidPvpSymbols && eligible.length > 0) {
     await enrichPvpRisk(eligible);
-    if (config.screening.blockPvpSymbols) {
+    if (s.blockPvpSymbols) {
       const before = eligible.length;
       const pvpRemoved = eligible.filter((p) => p.is_pvp);
       pvpRemoved.forEach((p) => pushFilteredReason(filteredOut, p, "PVP hard filter"));
@@ -652,7 +640,7 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   if (eligible.length > 0) {
     const before = eligible.length;
     const filtered = eligible.filter((p) => {
-      if (p.dev && isDevBlocked(p.dev)) {
+      if (p.dev && (overrides.isDevBlocked ?? isDevBlocked)(p.dev)) {
         log("dev_blocklist", `Filtered blocked deployer ${p.dev.slice(0, 8)} token ${p.base?.symbol}`);
         pushFilteredReason(filteredOut, p, "blocked deployer");
         return false;
@@ -663,54 +651,45 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     if (eligible.length < before) log("dev_blocklist", `Filtered ${before - eligible.length} pool(s) via dev blocklist`);
   }
 
-  if (config.indicators.enabled && eligible.length > 0) {
-    const confirmations = await Promise.all(
-      eligible.map(async (pool) => {
-        try {
-          const confirmation = await confirmIndicatorPreset({
-            mint: pool.base?.mint,
-            side: "entry",
-          });
-          return { pool: pool.pool, confirmation };
-        } catch (error) {
-          return {
-            pool: pool.pool,
-            confirmation: {
-              enabled: true,
-              confirmed: config.indicators.entryFailClosed === false,
-              skipped: true,
-              reason: config.indicators.entryFailClosed === false
-                ? `Indicator confirmation unavailable; optional fallback: ${error.message}`
-                : `Indicator confirmation unavailable; refusing entry: ${error.message}`,
-              intervals: [],
-            },
-          };
-        }
-      }),
-    );
-    const confirmationByPool = new Map(confirmations.map((entry) => [entry.pool, entry.confirmation]));
-    const before = eligible.length;
-    const confirmedEligible = eligible.filter((pool) => {
-      const confirmation = confirmationByPool.get(pool.pool);
-      pool.indicator_confirmation = confirmation || null;
-      if (
-        confirmation?.confirmed === true &&
-        !(config.indicators.entryFailClosed !== false && confirmation.skipped === true)
-      ) return true;
-      pushFilteredReason(filteredOut, pool, `indicator reject: ${confirmation.reason}`);
-      log("screening", `Indicator rejected ${pool.name} (${pool.pool.slice(0, 8)}): ${confirmation.reason}`);
-      return false;
-    });
-    eligible.splice(0, eligible.length, ...confirmedEligible);
-    if (eligible.length < before) {
-      log("screening", `Indicator confirmation removed ${before - eligible.length} candidate(s)`);
+  // Use the SAME read-only gate as execution (including token audit/mint safety),
+  // then keep looking after rejected leaders. Execution still revalidates afresh.
+  const validateCandidate = overrides.validateCandidate ?? (async (pool) => {
+    const { validateDeployPoolThresholds } = await import("./executor.js");
+    return validateDeployPoolThresholds({ pool_address: pool.pool }, { screening: s });
+  });
+  const candidates = [];
+  const target = Math.max(1, Math.min(10, Number(limit) || 10));
+  let checked = 0;
+  let rejected = 0;
+  for (let offset = 0; offset < Math.min(eligible.length, 12) && candidates.length < target; offset += 3) {
+    assertReadActive();
+    const batch = eligible.slice(offset, Math.min(offset + 3, 12));
+    const results = await Promise.all(batch.map(async (pool) => {
+      try { return await validateCandidate(pool); }
+      catch (error) { return { pass: false, reason: error.message }; }
+    }));
+    assertReadActive();
+    for (let i = 0; i < batch.length; i++) {
+      checked++;
+      const pool = batch[i];
+      const result = results[i];
+      if (result?.pass !== true) {
+        rejected++;
+        pushFilteredReason(filteredOut, pool, result?.reason || "Fresh LP preflight unavailable");
+        continue;
+      }
+      candidates.push({ ...pool, score: scoreCandidate(pool),
+        indicator_confirmation: result.riskMetrics?.momentum ?? null });
     }
   }
 
   return {
-    candidates: eligible,
+    candidates: candidates.slice(0, target),
     total_screened: pools.length,
-    filtered_examples: filteredOut.slice(0, 3),
+    fresh_checked: checked,
+    fresh_rejected: rejected,
+    remaining_unchecked: Math.max(0, eligible.length - checked),
+    filtered_examples: filteredOut.slice(0, 8),
   };
 }
 
