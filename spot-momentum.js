@@ -185,34 +185,59 @@ export function evaluateSpotMomentumCandidate({ pool, tokenInfo, policy = {} } =
 export function evaluateSpotRoundTripQuote({
   inputLamports,
   expectedReturnLamports,
+  minimumReturnLamports = expectedReturnLamports,
   maxLossPct,
+  maxWorstCaseLossPct = Infinity,
 } = {}) {
   const input = positiveAtomicAmount(inputLamports);
   const expectedReturn = positiveAtomicAmount(expectedReturnLamports);
+  const minimumReturn = positiveAtomicAmount(minimumReturnLamports);
   const maximumLoss = finite(maxLossPct);
-  if (input == null || expectedReturn == null || maximumLoss == null || maximumLoss <= 0) {
+  const maximumWorstCaseLoss = maxWorstCaseLossPct === Infinity
+    ? Infinity
+    : finite(maxWorstCaseLossPct);
+  if (input == null || expectedReturn == null || minimumReturn == null
+      || minimumReturn > expectedReturn || maximumLoss == null || maximumLoss <= 0
+      || maximumWorstCaseLoss == null || maximumWorstCaseLoss <= 0) {
     return {
       pass: false,
       reason: "A trustworthy round-trip execution quote is unavailable.",
       expectedLossPct: null,
+      worstCaseLossPct: null,
     };
   }
 
   const expectedLossPct = (Number(input - expectedReturn) / Number(input)) * 100;
-  if (!Number.isFinite(expectedLossPct)) {
-    return { pass: false, reason: "Round-trip execution cost is not finite.", expectedLossPct: null };
+  const worstCaseLossPct = (Number(input - minimumReturn) / Number(input)) * 100;
+  if (!Number.isFinite(expectedLossPct) || !Number.isFinite(worstCaseLossPct)) {
+    return {
+      pass: false,
+      reason: "Round-trip execution cost is not finite.",
+      expectedLossPct: null,
+      worstCaseLossPct: null,
+    };
   }
   if (expectedLossPct > maximumLoss + Number.EPSILON) {
     return {
       pass: false,
       reason: `Expected round-trip execution loss ${expectedLossPct.toFixed(2)}% exceeds ${maximumLoss.toFixed(2)}%.`,
       expectedLossPct,
+      worstCaseLossPct,
+    };
+  }
+  if (worstCaseLossPct > maximumWorstCaseLoss + Number.EPSILON) {
+    return {
+      pass: false,
+      reason: `Worst-case round-trip execution loss ${worstCaseLossPct.toFixed(2)}% exceeds ${maximumWorstCaseLoss.toFixed(2)}%.`,
+      expectedLossPct,
+      worstCaseLossPct,
     };
   }
   return {
     pass: true,
-    reason: `Expected round-trip execution loss ${expectedLossPct.toFixed(2)}% is within ${maximumLoss.toFixed(2)}%.`,
+    reason: `Expected/worst-case round-trip losses ${expectedLossPct.toFixed(2)}%/${worstCaseLossPct.toFixed(2)}% are within policy.`,
     expectedLossPct,
+    worstCaseLossPct,
   };
 }
 
@@ -240,16 +265,36 @@ export function calculateSpotPnlPct(entryCostSol, currentValueSol) {
  * introduced here; a later entry still needs a completely fresh signal.
  */
 export function evaluateSpotExit({ position, currentValueSol, now = new Date(), policy = {} } = {}) {
+  const maxHoldMinutes = finite(policy.maxHoldMinutes) ?? 5;
+  const openedAtMs = Date.parse(position?.openedAt || "");
+  const nowMs = now instanceof Date ? now.getTime() : Date.parse(now);
+  const ageMinutes = Number.isFinite(openedAtMs) && Number.isFinite(nowMs)
+    ? (nowMs - openedAtMs) / 60_000
+    : null;
   const pnlPct = calculateSpotPnlPct(position?.entryCostSol, currentValueSol);
   if (pnlPct == null) {
-    return { action: "HOLD", reason: "Spot position is not currently priceable.", pnlPct: null, peakPnlPct: finite(position?.peakPnlPct) ?? 0 };
+    if (ageMinutes != null && ageMinutes >= maxHoldMinutes) {
+      return {
+        action: "MAX_HOLD",
+        reason: `Position age ${ageMinutes.toFixed(1)}m >= ${maxHoldMinutes}m while executable value is unavailable`,
+        pnlPct: null,
+        peakPnlPct: finite(position?.peakPnlPct) ?? 0,
+        ageMinutes,
+      };
+    }
+    return {
+      action: "HOLD",
+      reason: "Spot position is not currently priceable.",
+      pnlPct: null,
+      peakPnlPct: finite(position?.peakPnlPct) ?? 0,
+      ageMinutes,
+    };
   }
 
-  const stopLossTriggerPct = finite(policy.stopLossTriggerPct) ?? -3;
-  const takeProfitPct = finite(policy.takeProfitPct) ?? 1;
-  const trailingTriggerPct = finite(policy.trailingTriggerPct) ?? 1.5;
-  const trailingDropPct = finite(policy.trailingDropPct) ?? 0.5;
-  const maxHoldMinutes = finite(policy.maxHoldMinutes) ?? 5;
+  const stopLossTriggerPct = finite(policy.stopLossTriggerPct) ?? -1.25;
+  const takeProfitPct = finite(policy.takeProfitPct) ?? 2.5;
+  const trailingTriggerPct = finite(policy.trailingTriggerPct) ?? 2;
+  const trailingDropPct = finite(policy.trailingDropPct) ?? 0.75;
   const previousPeak = finite(position?.peakPnlPct) ?? 0;
   const peakPnlPct = Math.max(previousPeak, pnlPct);
 
@@ -263,11 +308,6 @@ export function evaluateSpotExit({ position, currentValueSol, now = new Date(), 
     return { action: "TRAILING_TAKE_PROFIT", reason: `PnL retraced ${trailingDropPct}% from ${peakPnlPct.toFixed(2)}% peak`, pnlPct, peakPnlPct };
   }
 
-  const openedAtMs = Date.parse(position?.openedAt || "");
-  const nowMs = now instanceof Date ? now.getTime() : Date.parse(now);
-  const ageMinutes = Number.isFinite(openedAtMs) && Number.isFinite(nowMs)
-    ? (nowMs - openedAtMs) / 60_000
-    : null;
   if (ageMinutes != null && ageMinutes >= maxHoldMinutes) {
     return { action: "MAX_HOLD", reason: `Position age ${ageMinutes.toFixed(1)}m >= ${maxHoldMinutes}m`, pnlPct, peakPnlPct, ageMinutes };
   }

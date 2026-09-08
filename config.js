@@ -239,16 +239,30 @@ export function buildSpotConfig(userConfig = {}) {
     throw new Error("Spot trade amount and maximum must not exceed 0.5 SOL");
   }
   const gasReserveSol = positiveNumberConfig(userConfig.spotGasReserveSol, 0.1);
-  const stopLossPct = numericConfig(userConfig.spotStopLossPct) ?? -5;
-  const configuredStopTrigger = numericConfig(userConfig.spotStopLossTriggerPct) ?? -3;
-  const stopLossTriggerPct = stopLossPct < 0 && configuredStopTrigger < 0 && configuredStopTrigger > stopLossPct
-    ? configuredStopTrigger
-    : -3;
-  const takeProfitPct = positiveNumberConfig(userConfig.spotTakeProfitPct, 1);
-  const minProfitExitPct = positiveNumberConfig(userConfig.spotMinProfitExitPct, 0.1);
+  const stopLossPct = numericConfig(userConfig.spotStopLossPct) ?? -2.5;
+  const stopLossTriggerPct = numericConfig(userConfig.spotStopLossTriggerPct) ?? -1.25;
+  if (!(stopLossPct < 0) || !(stopLossTriggerPct < 0) || stopLossTriggerPct <= stopLossPct) {
+    throw new Error("spotStopLossTriggerPct must be negative and stay above spotStopLossPct");
+  }
+  const takeProfitPct = positiveNumberConfig(userConfig.spotTakeProfitPct, 2.5);
+  const minProfitExitPct = positiveNumberConfig(userConfig.spotMinProfitExitPct, 1.25);
   const maxEntryRoundTripLossPct = positiveNumberConfig(userConfig.spotMaxEntryRoundTripLossPct, 0.75);
+  const maxEntryWorstCaseLossPct = positiveNumberConfig(userConfig.spotMaxEntryWorstCaseLossPct, 2.5);
+  const minRewardRiskRatio = positiveNumberConfig(userConfig.spotMinRewardRiskRatio, 1);
   if (maxEntryRoundTripLossPct + minProfitExitPct >= takeProfitPct) {
     throw new Error("spotMaxEntryRoundTripLossPct plus spotMinProfitExitPct must stay below spotTakeProfitPct");
+  }
+  if (maxEntryWorstCaseLossPct < maxEntryRoundTripLossPct) {
+    throw new Error("spotMaxEntryWorstCaseLossPct must not be below spotMaxEntryRoundTripLossPct");
+  }
+  if (maxEntryWorstCaseLossPct > Math.abs(stopLossPct)) {
+    throw new Error("spotMaxEntryWorstCaseLossPct must not exceed the intended spotStopLossPct magnitude");
+  }
+  const minimumRewardRiskRatio = minProfitExitPct / Math.abs(stopLossTriggerPct);
+  if (minimumRewardRiskRatio + Number.EPSILON < minRewardRiskRatio) {
+    throw new Error(
+      `Spot executable reward/risk ${minimumRewardRiskRatio.toFixed(2)} is below spotMinRewardRiskRatio ${minRewardRiskRatio.toFixed(2)}`,
+    );
   }
 
   const realtimeCommitment = String(userConfig.spotRealtimeCommitment ?? "processed").trim().toLowerCase();
@@ -263,6 +277,12 @@ export function buildSpotConfig(userConfig = {}) {
   }
   if (userConfig.spotAllowMetadataOnlyToken2022 != null && typeof userConfig.spotAllowMetadataOnlyToken2022 !== "boolean") {
     throw new Error("spotAllowMetadataOnlyToken2022 must be true or false");
+  }
+  const entrySlippageBps = boundedPositiveIntegerConfig(userConfig.spotEntrySlippageBps, 100, 500, "spotEntrySlippageBps");
+  const exitSlippageBps = boundedPositiveIntegerConfig(userConfig.spotExitSlippageBps, 100, 1_000, "spotExitSlippageBps");
+  const stopExecutionRoomBps = Math.floor((stopLossTriggerPct - stopLossPct) * 100);
+  if (exitSlippageBps > stopExecutionRoomBps) {
+    throw new Error(`spotExitSlippageBps must not exceed the ${stopExecutionRoomBps} bps room between the stop trigger and intended maximum loss`);
   }
 
   return {
@@ -297,12 +317,14 @@ export function buildSpotConfig(userConfig = {}) {
     allowMetadataOnlyToken2022: userConfig.spotAllowMetadataOnlyToken2022 ?? true,
     requireMomentumConfirmation: userConfig.spotRequireMomentumConfirmation ?? true,
 
-    entrySlippageBps: boundedPositiveIntegerConfig(userConfig.spotEntrySlippageBps, 150, 500, "spotEntrySlippageBps"),
-    exitSlippageBps: boundedPositiveIntegerConfig(userConfig.spotExitSlippageBps, 300, 1_000, "spotExitSlippageBps"),
+    entrySlippageBps,
+    exitSlippageBps,
     profitExitSlippageBps: boundedPositiveIntegerConfig(userConfig.spotProfitExitSlippageBps, 50, 300, "spotProfitExitSlippageBps"),
     maxEntryPriceImpactPct: positiveNumberConfig(userConfig.spotMaxEntryPriceImpactPct, 1),
     maxExitPriceImpactPct: positiveNumberConfig(userConfig.spotMaxExitPriceImpactPct, 3),
     maxEntryRoundTripLossPct,
+    maxEntryWorstCaseLossPct,
+    minRewardRiskRatio,
     maxFeeBps: positiveIntegerConfig(userConfig.spotMaxFeeBps, 60),
     maxPriorityFeeLamports: positiveIntegerConfig(userConfig.spotMaxPriorityFeeLamports, 2_000_000),
     maxTotalFeeLamports: positiveIntegerConfig(userConfig.spotMaxTotalFeeLamports, 5_000_000),
@@ -311,11 +333,12 @@ export function buildSpotConfig(userConfig = {}) {
 
     takeProfitPct,
     minProfitExitPct,
-    stopLossPct: stopLossPct < 0 ? stopLossPct : -5,
+    stopLossPct,
     stopLossTriggerPct,
-    trailingTriggerPct: positiveNumberConfig(userConfig.spotTrailingTriggerPct, 1.5),
-    trailingDropPct: positiveNumberConfig(userConfig.spotTrailingDropPct, 0.5),
+    trailingTriggerPct: positiveNumberConfig(userConfig.spotTrailingTriggerPct, 2),
+    trailingDropPct: positiveNumberConfig(userConfig.spotTrailingDropPct, 0.75),
     maxHoldMinutes: positiveNumberConfig(userConfig.spotMaxHoldMinutes, 5),
+    maxQuoteOutageSec: positiveNumberConfig(userConfig.spotMaxQuoteOutageSec, 15),
     exitConfirmTicks: positiveIntegerConfig(userConfig.spotExitConfirmTicks, 1),
     scanIntervalSec: positiveIntegerConfig(userConfig.spotScanIntervalSec, 5),
     managementPollIntervalSec: positiveIntegerConfig(userConfig.spotManagementPollIntervalSec, 1),

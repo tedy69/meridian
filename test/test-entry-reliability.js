@@ -17,6 +17,7 @@ test("round-trip buy and sell quotes share one freshness deadline", async (t) =>
       swapMode: "ExactIn", inputMint: params.get("inputMint"), outputMint: params.get("outputMint"),
       inAmount: params.get("amount"), outAmount: "499000000", otherAmountThreshold: "498000000",
       slippageBps: Number(params.get("slippageBps")), priceImpact: 0.1, feeBps: 0,
+      signatureFeeLamports: 5000, prioritizationFeeLamports: 100000, rentFeeLamports: 0,
     }));
   });
   await assert.rejects(wallet.getSpotRoundTripQuote({ mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", amountSol: 0.5 }), /timed out|freshness/i);

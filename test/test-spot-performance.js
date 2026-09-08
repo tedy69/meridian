@@ -34,10 +34,10 @@ test("a gross green quote is not profit after exit fees and minimum output", () 
 
 test("replay selects a net-profitable exit and uses full measured entry cost", () => {
   const result = replaySpotExits({ entryCostSol: 0.501, openedAt: "2026-09-07T00:00:00Z", quotes: [
-    { at: "2026-09-07T00:00:01Z", minimumOutSol: 0.508, exitFeeSol: 0.001 },
+    { at: "2026-09-07T00:00:01Z", minimumOutSol: 0.515, exitFeeSol: 0.001 },
   ] });
   assert.equal(result.action, "TAKE_PROFIT");
-  assert.ok(Math.abs(result.netPnlSol - 0.006) < 1e-10);
+  assert.ok(Math.abs(result.netPnlSol - 0.013) < 1e-10);
   assert.equal(result.executed, false, "a replay must never claim a real fill");
 });
 

@@ -356,7 +356,7 @@ function confirmSpotExit(positionId, action) {
     _spotExitKey = key;
     _spotExitCount = 1;
   }
-  const required = action === "STOP_LOSS"
+  const required = ["STOP_LOSS", "MAX_HOLD", "QUOTE_OUTAGE"].includes(action)
     ? 1
     : Math.max(1, Number(config.spot.exitConfirmTicks ?? 2));
   return { count: _spotExitCount, required, fire: _spotExitCount >= required };
@@ -383,19 +383,22 @@ async function runSpotManagementCycle({ silent = false } = {}) {
       report = `Spot position ${snapshot.position.symbol || snapshot.position.mint} is ${snapshot.status}; new actions are blocked pending reconciliation.`;
       return report;
     }
-    if (!snapshot.priceable) {
+    const exit = snapshot.exit || { action: "HOLD", reason: "No exit signal." };
+    if (!snapshot.priceable && exit.action === "HOLD") {
       resetSpotExitConfirmation();
       report = `Spot position ${snapshot.position.symbol || snapshot.position.mint} is unpriceable — HOLD (${snapshot.reason}).`;
       return report;
     }
 
-    const exit = snapshot.exit || { action: "HOLD", reason: "No exit signal." };
     const pnlText = Number.isFinite(snapshot.pnl_pct)
       ? `${snapshot.pnl_pct >= 0 ? "+" : ""}${snapshot.pnl_pct.toFixed(2)}%`
       : "N/A";
     if (exit.action === "HOLD") {
       resetSpotExitConfirmation();
-      report = `${snapshot.position.symbol || snapshot.position.mint}: HOLD | PnL ${pnlText} | value ${snapshot.current_value_sol.toFixed(6)} SOL.`;
+      const valueText = Number.isFinite(snapshot.current_value_sol)
+        ? `${snapshot.current_value_sol.toFixed(6)} SOL`
+        : "N/A";
+      report = `${snapshot.position.symbol || snapshot.position.mint}: HOLD | PnL ${pnlText} | value ${valueText}.`;
       return report;
     }
 

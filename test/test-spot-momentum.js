@@ -16,6 +16,7 @@ import {
   completeSpotClose,
   confirmSpotOpen,
   getSpotPosition,
+  markSpotQuoteUnavailable,
   markSpotOpeningSubmitted,
   markSpotClosing,
   updateSpotObservation,
@@ -146,13 +147,18 @@ test("spot momentum explicitly enables a backend-capped 0.5 SOL trade", () => {
   assert.equal(spot.maxDailyBuySol, null);
   assert.equal(buildSpotConfig({ spotMaxDailyBuySol: 2 }).maxDailyBuySol, 2);
   assert.throws(() => buildSpotConfig({ spotMaxDailyBuySol: "unlimited" }), /spotMaxDailyBuySol/i);
-  assert.equal(spot.stopLossTriggerPct, -3);
-  assert.equal(spot.stopLossPct, -5);
-  assert.equal(spot.takeProfitPct, 1);
-  assert.equal(spot.minProfitExitPct, 0.1);
+  assert.equal(spot.stopLossTriggerPct, -1.25);
+  assert.equal(spot.stopLossPct, -2.5);
+  assert.equal(spot.takeProfitPct, 2.5);
+  assert.equal(spot.minProfitExitPct, 1.25);
   assert.equal(spot.profitExitSlippageBps, 50);
-  assert.equal(spot.trailingTriggerPct, 1.5);
-  assert.equal(spot.trailingDropPct, 0.5);
+  assert.equal(spot.entrySlippageBps, 100);
+  assert.equal(spot.exitSlippageBps, 100);
+  assert.equal(spot.maxEntryWorstCaseLossPct, 2.5);
+  assert.equal(spot.minRewardRiskRatio, 1);
+  assert.equal(spot.maxQuoteOutageSec, 15);
+  assert.equal(spot.trailingTriggerPct, 2);
+  assert.equal(spot.trailingDropPct, 0.75);
   assert.equal(spot.maxHoldMinutes, 5);
   assert.equal(spot.exitConfirmTicks, 1);
   assert.equal(spot.scanIntervalSec, 5);
@@ -168,9 +174,18 @@ test("spot momentum explicitly enables a backend-capped 0.5 SOL trade", () => {
   assert.equal(spot.minSpikeScore, 40);
   assert.equal(spot.maxEntryRoundTripLossPct, 0.75);
   assert.throws(
-    () => buildSpotConfig({ spotMaxEntryRoundTripLossPct: 0.9 }),
+    () => buildSpotConfig({ spotMaxEntryRoundTripLossPct: 1.25 }),
     /roundtriplosspct.*below.*takeprofitpct/i,
   );
+  assert.throws(() => buildSpotConfig({
+    spotTakeProfitPct: 2,
+    spotMinProfitExitPct: 0.5,
+    spotStopLossTriggerPct: -1,
+    spotStopLossPct: -2.5,
+    spotMinRewardRiskRatio: 1,
+  }), /reward.risk/i);
+  assert.throws(() => buildSpotConfig({ spotExitSlippageBps: 126 }), /room between the stop trigger/i);
+  assert.throws(() => buildSpotConfig({ spotMaxEntryWorstCaseLossPct: 2.6 }), /intended.*stoplosspct/i);
   assert.equal(buildSpotConfig({ spotRealtimeMinRefreshMs: 200 }).realtimeMinRefreshMs, 200);
   assert.throws(() => buildSpotConfig({ spotRealtimeEnabled: "false" }), /spotRealtimeEnabled/i);
   assert.throws(() => buildSpotConfig({ spotRealtimeCommitment: "fastest" }), /spotRealtimeCommitment/i);
@@ -368,16 +383,46 @@ test("cross-DEX positions use tracked-size net exit quotes and never decode DLMM
   const deps = { readSpotPosition: () => position, spotConfig: buildSpotConfig({}),
     getTokenBalanceByMint: async () => ({ amount: 150, raw_amount: "150000", decimals: 3 }),
     getActiveBin: async () => assert.fail("non-DLMM must not be decoded with DLMM SDK"),
-    getSpotExitQuote: async ({ rawAmount }) => { assert.equal(rawAmount, "100000"); return { netValueSol: 0.51 }; },
+    getSpotExitQuote: async ({ rawAmount }) => { assert.equal(rawAmount, "100000"); return { netValueSol: 0.513 }; },
+    markSpotQuoteUnavailable: (_id, observation) => ({ ...position, quoteUnavailableSince: observation.observedAt }),
     updateSpotObservation: (_id, value) => ({ ...position, ...value }),
     now: () => new Date("2026-09-04T12:01:00Z") };
   const result = await getSpotPositionSnapshot({}, deps);
-  assert.equal(result.current_value_sol, 0.51);
+  assert.equal(result.current_value_sol, 0.513);
   assert.equal(result.price_source, "jupiter_quote");
   assert.equal(result.exit.action, "TAKE_PROFIT");
   const failed = await getSpotPositionSnapshot({}, { ...deps, getSpotExitQuote: async () => { throw new Error("HTTP 429"); } });
   assert.equal(failed.priceable, false);
   assert.match(failed.reason, /429/);
+});
+
+test("a persistent executable-quote outage forces a close attempt instead of an indefinite hold", async () => {
+  const now = new Date("2026-09-04T12:01:00Z");
+  const position = {
+    id: "spot-outage",
+    status: "open",
+    mint: "mint",
+    pool: "pool",
+    priceSource: "jupiter_quote",
+    tokenRawAmount: "100000",
+    tokenDecimals: 3,
+    entryCostSol: 0.5,
+    peakPnlPct: 0,
+    openedAt: "2026-09-04T12:00:00Z",
+    quoteUnavailableSince: "2026-09-04T12:00:40Z",
+  };
+  const result = await getSpotPositionSnapshot({}, {
+    readSpotPosition: () => position,
+    spotConfig: buildSpotConfig({ spotMaxQuoteOutageSec: 15 }),
+    getTokenBalanceByMint: async () => ({ amount: 100, raw_amount: "100000", decimals: 3 }),
+    getActiveBin: async () => assert.fail("cross-DEX must not decode DLMM"),
+    getSpotExitQuote: async () => { throw new Error("Jupiter HTTP 429"); },
+    markSpotQuoteUnavailable: () => ({ ...position, lastQuoteError: "Jupiter HTTP 429" }),
+    now: () => now,
+  });
+  assert.equal(result.priceable, false);
+  assert.equal(result.exit.action, "QUOTE_OUTAGE");
+  assert.match(result.exit.reason, /20\.0s.*15s/i);
 });
 
 test("candidate screening rejects a behavioral Token-2022 extension before AI selection", async () => {
@@ -465,18 +510,33 @@ test("round-trip execution gate rejects entries whose spread consumes the profit
   const viable = evaluateSpotRoundTripQuote({
     inputLamports: "500000000",
     expectedReturnLamports: "496994891",
+    minimumReturnLamports: "488000000",
     maxLossPct: 0.75,
+    maxWorstCaseLossPct: 2.5,
   });
   assert.equal(viable.pass, true);
   assert.ok(Math.abs(viable.expectedLossPct - 0.6010218) < 1e-9);
+  assert.ok(Math.abs(viable.worstCaseLossPct - 2.4) < 1e-12);
 
   const expensive = evaluateSpotRoundTripQuote({
     inputLamports: "500000000",
     expectedReturnLamports: "487756591",
+    minimumReturnLamports: "482000000",
     maxLossPct: 0.75,
+    maxWorstCaseLossPct: 2.5,
   });
   assert.equal(expensive.pass, false);
   assert.match(expensive.reason, /round-trip.*2\.45%.*0\.75%/i);
+
+  const unsafeMinimum = evaluateSpotRoundTripQuote({
+    inputLamports: "500000000",
+    expectedReturnLamports: "498000000",
+    minimumReturnLamports: "475000000",
+    maxLossPct: 0.75,
+    maxWorstCaseLossPct: 2.5,
+  });
+  assert.equal(unsafeMinimum.pass, false);
+  assert.match(unsafeMinimum.reason, /worst.case.*5\.00%.*2\.50%/i);
 });
 
 test("entry selector favors lower executable round-trip cost after all gates pass", async () => {
@@ -496,17 +556,25 @@ test("spike scalp exits immediately at the tight stop, quick profit, fade, or fi
     peakPnlPct: 0,
   };
   const beforeTimeout = new Date("2026-09-02T00:01:00.000Z");
-  assert.equal(evaluateSpotExit({ position, currentValueSol: 0.485, now: beforeTimeout }).action, "STOP_LOSS");
-  assert.equal(evaluateSpotExit({ position, currentValueSol: 0.505, now: beforeTimeout }).action, "TAKE_PROFIT");
-  assert.equal(evaluateSpotExit({ position, currentValueSol: 0.5049, now: beforeTimeout }).action, "HOLD");
+  assert.equal(evaluateSpotExit({ position, currentValueSol: 0.4937, now: beforeTimeout }).action, "STOP_LOSS");
+  assert.equal(evaluateSpotExit({ position, currentValueSol: 0.5126, now: beforeTimeout }).action, "TAKE_PROFIT");
+  assert.equal(evaluateSpotExit({ position, currentValueSol: 0.5124, now: beforeTimeout }).action, "HOLD");
 
   const trailing = evaluateSpotExit({
-    position: { ...position, peakPnlPct: 2 },
-    currentValueSol: 0.5075,
+    position: { ...position, peakPnlPct: 2.5 },
+    currentValueSol: 0.5087,
     now: beforeTimeout,
-    policy: { takeProfitPct: 3 },
+    policy: { takeProfitPct: 3, trailingTriggerPct: 2, trailingDropPct: 0.75 },
   });
   assert.equal(trailing.action, "TRAILING_TAKE_PROFIT");
+
+  const unpriceableTimeout = evaluateSpotExit({
+    position,
+    currentValueSol: null,
+    now: new Date("2026-09-02T00:06:00.000Z"),
+  });
+  assert.equal(unpriceableTimeout.action, "MAX_HOLD");
+  assert.equal(unpriceableTimeout.pnlPct, null);
 
   const timed = evaluateSpotExit({
     position,
@@ -544,7 +612,14 @@ test("spot state persists opening, open, observation, and closed transitions", (
       buyTx: "buy-tx",
     }, options);
     assert.equal(open.entryCostSol, 0.504);
+    const unavailable = markSpotQuoteUnavailable(open.id, {
+      reason: "Jupiter HTTP 429",
+      observedAt: "2026-09-02T00:00:10.000Z",
+    }, options);
+    assert.equal(unavailable.quoteUnavailableSince, "2026-09-02T00:00:10.000Z");
+    assert.match(unavailable.lastQuoteError, /429/);
     updateSpotObservation(open.id, { pnlPct: 4, peakPnlPct: 4, currentValueSol: 0.524 }, options);
+    assert.equal(getSpotPosition(options).quoteUnavailableSince, undefined);
     markSpotClosing(open.id, { reason: "take profit", solBalanceBeforeClose: 0.4, tokenBalanceBeforeClose: 100 }, options);
     const closed = completeSpotClose(open.id, {
       sellTx: "sell-tx",
@@ -833,6 +908,9 @@ test("round-trip quote validation binds both mints, amount, impact, fee, and min
     feeMint: SOL_MINT,
     router: "metis",
     mode: "manual",
+    signatureFeeLamports: 5000,
+    prioritizationFeeLamports: 300000,
+    rentFeeLamports: 2000000,
   };
   const validated = validateJupiterQuote(quote, {
     inputMint: quote.inputMint,
@@ -841,9 +919,12 @@ test("round-trip quote validation binds both mints, amount, impact, fee, and min
     maxSlippageBps: 150,
     maxPriceImpactPct: 1,
     maxFeeBps: 60,
+    maxTotalFeeLamports: 2500000,
+    requireTransactionFeeBreakdown: true,
   });
   assert.equal(validated.outAmount, "1000000");
   assert.equal(validated.priceImpactPct, -0.4);
+  assert.equal(validated.totalFeeLamports, 2305000);
 
   assert.throws(() => validateJupiterQuote({ ...quote, outputMint: "attacker" }, {
     inputMint: quote.inputMint,
@@ -1155,11 +1236,7 @@ test("spot snapshot and close value only the tracked tokens, not unrelated walle
   let recordedPnl = null;
   const closed = await closeSpotPosition({ reason: "TAKE_PROFIT: lock a real net gain" }, {
     dryRun: false,
-    spotConfig: buildSpotConfig({
-      spotTakeProfitPct: 1,
-      spotMinProfitExitPct: 0.1,
-      spotProfitExitSlippageBps: 50,
-    }),
+    spotConfig: buildSpotConfig({ spotProfitExitSlippageBps: 50 }),
     readSpotPosition: () => position,
     getTokenBalanceByMint: async (requestedMint) => {
       if (requestedMint === SOL_MINT) {
@@ -1182,7 +1259,7 @@ test("spot snapshot and close value only the tracked tokens, not unrelated walle
   assert.equal(sold.rawAmount, "100000");
   assert.equal(sold.amount, 100);
   assert.equal(sold.slippageBps, 50);
-  assert.equal(sold.minimumNetOutputLamports, "500500000");
+  assert.equal(sold.minimumNetOutputLamports, "506250000");
   assert.equal(closed.trade_status, "closed");
   assert.ok(Math.abs(recordedPnl - 0.03) < 1e-12);
 });

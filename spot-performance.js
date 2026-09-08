@@ -52,7 +52,7 @@ export function replaySpotExits({ entryCostSol, openedAt, quotes = [], policy = 
     position.peakPnlPct = exit.peakPnlPct;
     lastNetPnlPct = (netValueSol - entry) / entry * 100;
     const protectedProfit = ["TAKE_PROFIT", "TRAILING_TAKE_PROFIT"].includes(exit.action);
-    if (exit.action === "HOLD" || (protectedProfit && exit.pnlPct < (policy.minProfitExitPct ?? 0.1))) continue;
+    if (exit.action === "HOLD" || (protectedProfit && exit.pnlPct < (policy.minProfitExitPct ?? 1.25))) continue;
     return { action: exit.action, at: quote.at, netPnlSol: netValueSol - entry, lastNetPnlPct,
       reason: netValueSol < 0 ? `${exit.reason}; exit fees exceed sale proceeds` : exit.reason,
       executed: false, basis: "tracked-size minimum output less exit fee, against measured entry cost" };

@@ -550,17 +550,20 @@ All fields are optional — defaults shown. Edit `user-config.json`.
 | `spotMaxBotHoldersPct` | `20` | Maximum bot-holder percentage |
 | `spotRequireLegacyTokenProgram` | `false` | Set true to reject every Token-2022 mint |
 | `spotAllowMetadataOnlyToken2022` | `true` | Permit Token-2022 only when every extension is metadata-only |
-| `spotEntrySlippageBps` | `150` | Entry minimum-output tolerance; the order must also satisfy impact and fee caps |
-| `spotExitSlippageBps` | `300` | Exit minimum-output tolerance; the order must also satisfy impact and fee caps |
+| `spotEntrySlippageBps` | `100` | Entry minimum-output tolerance; the order must also satisfy impact and fee caps |
+| `spotExitSlippageBps` | `100` | Emergency-exit minimum-output tolerance, kept inside the gap between the early stop and intended maximum loss |
 | `spotProfitExitSlippageBps` | `50` | Tighter tolerance for take-profit exits; stop-loss, max-hold, and manual exits keep the normal exit tolerance |
-| `spotMaxEntryRoundTripLossPct` | `0.75` | Reject an entry when fresh buy-then-sell quotes show spread, fees, and impact would consume at least this much capital |
-| `spotStopLossTriggerPct` | `-3` | Early mechanical stop trigger |
-| `spotStopLossPct` | `-5` | Intended maximum-loss target; fast markets can still execute beyond it |
-| `spotTakeProfitPct` | `1` | Indicative realtime PnL that immediately triggers a take-profit quote |
-| `spotMinProfitExitPct` | `0.1` | Minimum executable net profit over measured entry cost after Jupiter's worst-case output and transaction fees |
-| `spotTrailingTriggerPct` | `1.5` | Enables tight trailing protection after this PnL |
-| `spotTrailingDropPct` | `0.5` | Exit after this retracement from peak PnL |
+| `spotMaxEntryRoundTripLossPct` | `0.75` | Reject an entry when expected fresh buy-then-sell output, including Jupiter fees and estimated transaction costs, loses more than this |
+| `spotMaxEntryWorstCaseLossPct` | `2.5` | Reject an entry when the two minimum-output bounds plus estimated transaction costs exceed the intended maximum loss |
+| `spotMinRewardRiskRatio` | `1` | Require the executable profit floor to be at least this multiple of the early stop distance |
+| `spotStopLossTriggerPct` | `-1.25` | Early mechanical stop trigger |
+| `spotStopLossPct` | `-2.5` | Intended maximum-loss target; fast markets can still execute beyond it |
+| `spotTakeProfitPct` | `2.5` | Indicative realtime PnL that immediately triggers a take-profit quote |
+| `spotMinProfitExitPct` | `1.25` | Minimum executable net profit over measured entry cost after Jupiter's minimum output and transaction fees |
+| `spotTrailingTriggerPct` | `2` | Enables trailing protection after this PnL |
+| `spotTrailingDropPct` | `0.75` | Exit after this retracement from peak PnL |
 | `spotMaxHoldMinutes` | `5` | Maximum time in one spike position |
+| `spotMaxQuoteOutageSec` | `15` | Force repeated emergency close attempts when an executable quote remains unavailable this long |
 | `spotExitConfirmTicks` | `1` | Consecutive matching exit decisions required before submission |
 | `spotScanIntervalSec` | `5` | Candidate scan interval; overlapping scans remain blocked |
 | `spotManagementPollIntervalSec` | `1` | Fallback position/PnL refresh interval when no WebSocket event arrives |
@@ -569,11 +572,11 @@ All fields are optional — defaults shown. Edit `user-config.json`.
 | `spotRealtimeEventDebounceMs` | `100` | Coalescing window for bursts of pool-account updates |
 | `spotRealtimeMinRefreshMs` | `500` | Minimum interval between full PnL refreshes from the pool's on-chain active-bin price |
 
-The realtime monitor is event-driven: Solana pool-account changes can arrive between fallback ticks, are coalesced to prevent overlapping work, and expose p50/p95/p99 trigger and refresh latency in `get_spot_status`. Open-position valuation uses the confirmed Meteora active-bin price directly from RPC and calls Jupiter Price V3 only as a bounded fallback, preserving Jupiter capacity for the sell order. Failed price/RPC refreshes use bounded exponential backoff and recover automatically. WebSocket delivery, RPC slots, price publication, and transaction landing are not guaranteed millisecond operations.
+The realtime monitor is event-driven: Solana pool-account changes can arrive between fallback ticks, are coalesced to prevent overlapping work, and expose p50/p95/p99 trigger and refresh latency in `get_spot_status`. Meteora positions use the confirmed active-bin price with Jupiter Price V3 as a bounded fallback. Cross-DEX positions use the tracked-size Jupiter exit quote after estimated transaction costs. A persistent quote outage no longer leaves a position in an indefinite HOLD: after `spotMaxQuoteOutageSec`, management repeatedly attempts an emergency close, while maximum holding time remains enforceable even without a price. WebSocket delivery, RPC slots, quotes, and transaction landing are not guaranteed millisecond operations.
 
 Active-bin PnL is only an indicative trigger. Before signing `TAKE_PROFIT` or `TRAILING_TAKE_PROFIT`, the bot requires Jupiter's minimum SOL output minus transaction fees to exceed the measured entry cost by `spotMinProfitExitPct`; otherwise the order is rejected before submission and retried on a later signal. Emergency stop-loss, max-hold, and manual exits intentionally remain able to realize a loss because blocking those exits could increase it. No strategy can guarantee profit when the executable market price gaps below the entry or an RPC/router is unavailable.
 
-Spot discovery is intentionally broader than the fresh entry gate, so more pools reach the expensive token and indicator checks without weakening the final decision. The final entry gate looks for an early spike rather than a late pump: 5-minute price acceleration must remain inside the configured band, volume and buyer pressure must be rising, and their composite spike score must pass. It also requires a SOL quote, disabled mint and freeze authorities, a fresh token audit, real 5-minute and 15-minute indicator evidence, positive buyers, bounded concentration, and a fresh round-trip quote whose expected cost fits below the configured profit target. A disabled or evidence-free indicator service fails closed. After all gates pass, the backend selects the lowest executable round-trip cost deterministically and revalidates immediately; the LLM is not in the automatic transaction hot path. Legacy SPL tokens are supported; Token-2022 mints are supported only with no extensions or the `MetadataPointer`/`TokenMetadata` extensions. Every behavioral or unknown extension—including transfer fees, hooks, permanent delegates, pausing, non-transferability, and mint-close authority—is rejected fail-closed. Jupiter orders are checked for the exact mint pair and amount, explicit minimum output, quote age, price impact, fees, expiry, local simulation, mainnet identity, and finalized outcome. These controls reduce avoidable execution risk; they cannot guarantee profit or prevent all memecoin losses.
+Spot discovery is intentionally broader than the fresh entry gate, so more pools reach the expensive token and indicator checks without weakening the final decision. The final entry gate looks for an early spike rather than a late pump: 5-minute price acceleration must remain inside the configured band, volume and buyer pressure must be rising, and their composite spike score must pass. It also requires a SOL quote, disabled mint and freeze authorities, a fresh token audit, real 5-minute and 15-minute indicator evidence, positive buyers, bounded concentration, and a fresh round-trip quote. Both expected output and the two-leg minimum-output tail are checked after estimated transaction costs, and configuration rejects an unfavorable executable reward/risk ratio. A disabled or evidence-free indicator service fails closed. After all gates pass, the backend selects the lowest executable round-trip cost deterministically and revalidates immediately; the LLM is not in the automatic transaction hot path. Legacy SPL tokens are supported; Token-2022 mints are supported only with no extensions or the `MetadataPointer`/`TokenMetadata` extensions. Every behavioral or unknown extension—including transfer fees, hooks, permanent delegates, pausing, non-transferability, and mint-close authority—is rejected fail-closed. Jupiter orders are checked for the exact mint pair and amount, explicit minimum output, quote age, price impact, fees, expiry, local simulation, mainnet identity, and finalized outcome. These controls reduce avoidable execution risk; they cannot guarantee profit or prevent all memecoin losses.
 
 ### Screening
 

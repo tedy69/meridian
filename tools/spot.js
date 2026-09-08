@@ -20,6 +20,7 @@ import {
   confirmSpotOpen,
   getSpotHistory,
   getSpotPosition as readSpotPosition,
+  markSpotQuoteUnavailable,
   markSpotOpeningSubmitted,
   markSpotClosing,
   restoreSpotOpen,
@@ -186,6 +187,7 @@ function spotDeps(overrides = {}) {
     readSpotPosition,
     getSpotHistory,
     beginSpotOpen,
+    markSpotQuoteUnavailable,
     markSpotOpeningSubmitted,
     confirmSpotOpen,
     cancelSpotOpen,
@@ -293,6 +295,8 @@ async function readSpotMomentumCandidates({ limit = 10 } = {}, overrides = {}) {
           spot_metrics: {
             ...evaluation.metrics,
             roundTripExpectedLossPct: roundTripQuote.expectedLossPct,
+            roundTripWorstCaseLossPct: roundTripQuote.worstCaseLossPct,
+            roundTripTransactionFeeLamports: roundTripQuote.totalTransactionFeeLamports ?? null,
             buyPriceImpactPct: roundTripQuote.buy?.priceImpactPct ?? null,
             sellPriceImpactPct: roundTripQuote.sell?.priceImpactPct ?? null,
           },
@@ -386,6 +390,7 @@ async function readSpotEntry(poolAddressValue, overrides = {}) {
         metrics: {
           ...evaluation.metrics,
           roundTripExpectedLossPct: roundTripQuote?.expectedLossPct ?? null,
+          roundTripWorstCaseLossPct: roundTripQuote?.worstCaseLossPct ?? null,
         },
       };
     }
@@ -402,6 +407,8 @@ async function readSpotEntry(poolAddressValue, overrides = {}) {
         ...evaluation.metrics,
         momentum: momentum?.intervals ?? [],
         roundTripExpectedLossPct: roundTripQuote.expectedLossPct,
+        roundTripWorstCaseLossPct: roundTripQuote.worstCaseLossPct,
+        roundTripTransactionFeeLamports: roundTripQuote.totalTransactionFeeLamports ?? null,
         roundTripQuoteCheckedAt: roundTripQuote.checkedAt ?? null,
         buyPriceImpactPct: roundTripQuote.buy?.priceImpactPct ?? null,
         sellPriceImpactPct: roundTripQuote.sell?.priceImpactPct ?? null,
@@ -673,7 +680,46 @@ export async function getSpotPositionSnapshot(_args = {}, overrides = {}) {
       if (!Number.isFinite(currentValueSol) || currentValueSol < 0) throw new Error("Net exit quote is invalid");
       priceSource = "jupiter_quote";
     } catch (error) {
-      return { position, status: "open", priceable: false, reason: `Executable exit quote unavailable: ${error.message}` };
+      const now = deps.now();
+      const nowMs = now instanceof Date ? now.getTime() : Date.parse(now);
+      const observedAt = Number.isFinite(nowMs) ? new Date(nowMs).toISOString() : new Date().toISOString();
+      let updated = position;
+      try {
+        updated = deps.markSpotQuoteUnavailable(position.id, {
+          reason: error.message,
+          observedAt,
+        });
+      } catch (stateError) {
+        log("spot_state_error", `Could not persist quote outage for ${position.id}: ${stateError.message}`);
+      }
+      let exit = evaluateSpotExit({ position: updated, currentValueSol: null, now, policy: deps.spotConfig });
+      const unavailableSinceMs = Date.parse(updated.quoteUnavailableSince || "");
+      const outageSeconds = Number.isFinite(nowMs) && Number.isFinite(unavailableSinceMs)
+        ? Math.max(0, (nowMs - unavailableSinceMs) / 1000)
+        : null;
+      const outageLimit = Number(deps.spotConfig.maxQuoteOutageSec);
+      if (exit.action === "HOLD" && outageSeconds != null && Number.isFinite(outageLimit)
+        && outageSeconds >= outageLimit) {
+        exit = {
+          ...exit,
+          action: "QUOTE_OUTAGE",
+          reason: `Executable exit quote unavailable for ${outageSeconds.toFixed(1)}s >= ${outageLimit}s: ${error.message}`,
+          quoteOutageSeconds: outageSeconds,
+        };
+      }
+      return {
+        position: updated,
+        status: "open",
+        priceable: false,
+        reason: `Executable exit quote unavailable: ${error.message}`,
+        token_balance: { ...balance, position_amount: trackedTokenAmount, position_raw_amount: trackedRaw.toString() },
+        current_value_sol: null,
+        pnl_pct: null,
+        peak_pnl_pct: exit.peakPnlPct,
+        exit,
+        price_source: "unavailable",
+        quote_outage_seconds: outageSeconds,
+      };
     }
   } else if (activeBinPrice != null && activeBinPrice > 0) {
     currentValueSol = trackedTokenAmount * activeBinPrice;

@@ -403,6 +403,8 @@ export function validateJupiterQuote(order, {
   maxSlippageBps = null,
   maxPriceImpactPct = null,
   maxFeeBps = null,
+  maxTotalFeeLamports = null,
+  requireTransactionFeeBreakdown = false,
 } = {}) {
   if (!order || typeof order !== "object") throw new Error("Jupiter quote is missing");
   if (order.errorCode || order.errorMessage || order.error) {
@@ -433,6 +435,20 @@ export function validateJupiterQuote(order, {
   if (feeBps > 0 && order.feeMint !== inputMint && order.feeMint !== outputMint) {
     throw new Error("Jupiter quote fee mint is not part of the requested pair");
   }
+  const transactionFees = [order.signatureFeeLamports, order.prioritizationFeeLamports, order.rentFeeLamports]
+    .map(Number);
+  const requiresTransactionFees = requireTransactionFeeBreakdown || maxTotalFeeLamports != null;
+  if (requiresTransactionFees && transactionFees.some((value) => !Number.isSafeInteger(value) || value < 0)) {
+    throw new Error("Jupiter quote transaction fee breakdown is missing or invalid");
+  }
+  const totalFeeLamports = transactionFees
+    .reduce((sum, value) => sum + (Number.isFinite(value) ? value : 0), 0);
+  if (requiresTransactionFees && !Number.isSafeInteger(totalFeeLamports)) {
+    throw new Error("Jupiter quote total transaction fee is outside the safe integer range");
+  }
+  if (maxTotalFeeLamports != null && totalFeeLamports > Number(maxTotalFeeLamports)) {
+    throw new Error(`Jupiter quote transaction fees ${totalFeeLamports} lamports exceed ${maxTotalFeeLamports}`);
+  }
   return {
     outAmount: String(order.outAmount),
     minimumOutAmount: String(order.otherAmountThreshold),
@@ -440,6 +456,7 @@ export function validateJupiterQuote(order, {
     feeBps,
     router: String(order.router || "unknown"),
     mode: String(order.mode || "unknown"),
+    totalFeeLamports,
   };
 }
 
@@ -714,6 +731,8 @@ async function fetchJupiterQuoteOnly({
   amountAtomic,
   slippageBps,
   maxPriceImpactPct,
+  maxTotalFeeLamports = null,
+  requireTransactionFeeBreakdown = false,
 }) {
   const apiKey = requireJupiterApiKey();
   const search = new URLSearchParams({
@@ -739,6 +758,8 @@ async function fetchJupiterQuoteOnly({
     maxSlippageBps: slippageBps,
     maxPriceImpactPct,
     maxFeeBps: config.spot.maxFeeBps,
+    maxTotalFeeLamports,
+    requireTransactionFeeBreakdown,
   });
 }
 
@@ -747,10 +768,15 @@ export async function getSpotExitQuote({ mint, rawAmount }) {
   if (inputMint === SOL_MINT || !/^[1-9][0-9]*$/.test(String(rawAmount))) throw new Error("Valid tracked token amount is required for an exit quote");
   return exitQuoteCache.get(`${inputMint}:${rawAmount}:${config.spot.profitExitSlippageBps}:${config.spot.maxTotalFeeLamports}`, async () => {
     const quote = await fetchJupiterQuoteOnly({ inputMint, outputMint: SOL_MINT, amountAtomic: rawAmount,
-      slippageBps: config.spot.profitExitSlippageBps, maxPriceImpactPct: config.spot.maxExitPriceImpactPct });
-    const minimum = BigInt(quote.minimumOutAmount) - BigInt(config.spot.maxTotalFeeLamports);
-    return { ...quote, netValueSol: Number(minimum > 0n ? minimum : 0n) / LAMPORTS_PER_SOL,
-      checkedAt: new Date().toISOString(), basis: "minimum output less maximum transaction fee buffer" };
+      slippageBps: config.spot.profitExitSlippageBps, maxPriceImpactPct: config.spot.maxExitPriceImpactPct,
+      maxTotalFeeLamports: config.spot.maxTotalFeeLamports, requireTransactionFeeBreakdown: true });
+    const fees = BigInt(quote.totalFeeLamports);
+    const expected = BigInt(quote.outAmount) - fees;
+    const minimum = BigInt(quote.minimumOutAmount) - fees;
+    return { ...quote,
+      netValueSol: Number(expected > 0n ? expected : 0n) / LAMPORTS_PER_SOL,
+      minimumNetValueSol: Number(minimum > 0n ? minimum : 0n) / LAMPORTS_PER_SOL,
+      checkedAt: new Date().toISOString(), basis: "expected and minimum tracked-size output less quoted transaction fees" };
   }, { ttlMs: config.spot.quoteMaxAgeMs, rateLimitKey: "jupiter-exit-quotes" });
 }
 
@@ -779,6 +805,8 @@ async function readSpotRoundTripQuote({ mint, amountSol }) {
     amountAtomic: inputLamports,
     slippageBps: config.spot.entrySlippageBps,
     maxPriceImpactPct: config.spot.maxEntryPriceImpactPct,
+    maxTotalFeeLamports: config.spot.maxTotalFeeLamports,
+    requireTransactionFeeBreakdown: true,
   });
   const sell = await fetchJupiterQuoteOnly({
     inputMint: outputMint,
@@ -786,21 +814,36 @@ async function readSpotRoundTripQuote({ mint, amountSol }) {
     amountAtomic: buy.outAmount,
     slippageBps: config.spot.profitExitSlippageBps,
     maxPriceImpactPct: config.spot.maxExitPriceImpactPct,
+    maxTotalFeeLamports: config.spot.maxTotalFeeLamports,
+    requireTransactionFeeBreakdown: true,
   });
+  const totalTransactionFees = BigInt(buy.totalFeeLamports) + BigInt(sell.totalFeeLamports);
+  const expectedReturn = BigInt(sell.outAmount) - totalTransactionFees;
+  // The second quote uses expected buy output. Scale its minimum output down by
+  // the first leg's minimum/expected ratio so the entry gate also prices the
+  // configured slippage tail instead of treating both expected fills as certain.
+  const scaledMinimumGross = BigInt(sell.minimumOutAmount) * BigInt(buy.minimumOutAmount)
+    / BigInt(buy.outAmount);
+  const minimumReturn = scaledMinimumGross - totalTransactionFees;
   const viability = evaluateSpotRoundTripQuote({
     inputLamports,
-    expectedReturnLamports: sell.outAmount,
+    expectedReturnLamports: expectedReturn > 0n ? expectedReturn.toString() : "0",
+    minimumReturnLamports: minimumReturn > 0n ? minimumReturn.toString() : "0",
     maxLossPct: config.spot.maxEntryRoundTripLossPct,
+    maxWorstCaseLossPct: config.spot.maxEntryWorstCaseLossPct,
   });
   return {
     ...viability,
     checkedAt: new Date().toISOString(),
     durationMs: Date.now() - startedAt,
     inputLamports,
-    expectedReturnLamports: sell.outAmount,
-    minimumReturnLamports: sell.minimumOutAmount,
-    buy: { router: buy.router, mode: buy.mode, priceImpactPct: buy.priceImpactPct, feeBps: buy.feeBps },
-    sell: { router: sell.router, mode: sell.mode, priceImpactPct: sell.priceImpactPct, feeBps: sell.feeBps },
+    expectedReturnLamports: expectedReturn > 0n ? expectedReturn.toString() : "0",
+    minimumReturnLamports: minimumReturn > 0n ? minimumReturn.toString() : "0",
+    totalTransactionFeeLamports: totalTransactionFees.toString(),
+    buy: { router: buy.router, mode: buy.mode, priceImpactPct: buy.priceImpactPct, feeBps: buy.feeBps,
+      totalFeeLamports: buy.totalFeeLamports },
+    sell: { router: sell.router, mode: sell.mode, priceImpactPct: sell.priceImpactPct, feeBps: sell.feeBps,
+      totalFeeLamports: sell.totalFeeLamports },
   };
 }
 

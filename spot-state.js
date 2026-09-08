@@ -148,6 +148,23 @@ export function updateSpotObservation(id, observation, options = {}) {
   state.position.lastPnlPct = Number.isFinite(Number(observation.pnlPct)) ? Number(observation.pnlPct) : null;
   state.position.lastValueSol = Number.isFinite(Number(observation.currentValueSol)) ? Number(observation.currentValueSol) : null;
   state.position.lastObservedAt = observation.observedAt || new Date().toISOString();
+  delete state.position.quoteUnavailableSince;
+  delete state.position.lastQuoteFailureAt;
+  delete state.position.lastQuoteError;
+  write(state, options);
+  return { ...state.position };
+}
+
+export function markSpotQuoteUnavailable(id, observation = {}, options = {}) {
+  const state = read(options);
+  if (!state.position || state.position.id !== id || state.position.status !== "open") {
+    throw new Error(`Open spot position ${id} was not found.`);
+  }
+  const observedAt = observation.observedAt || new Date().toISOString();
+  if (!Number.isFinite(Date.parse(observedAt))) throw new Error("Spot quote failure timestamp is invalid.");
+  state.position.quoteUnavailableSince ||= observedAt;
+  state.position.lastQuoteFailureAt = observedAt;
+  state.position.lastQuoteError = cleanText(observation.reason || "Executable exit quote unavailable", 280);
   write(state, options);
   return { ...state.position };
 }
