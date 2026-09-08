@@ -113,7 +113,7 @@ test("a qualified spot entry does not wait for the slower LP scanner", async () 
 test("daemon routes hybrid screening and monitors both spot and LP positions", () => {
   const source = fs.readFileSync(new URL("../index.js", import.meta.url), "utf8");
   assert.match(source, /config\.trading\.mode === "hybrid"\) return runHybridScreeningCycle/);
-  assert.match(source, /if \(isLpEnabled\(\)\) pnlPollInterval/);
+  assert.match(source, /onRefresh: runLpRealtimeRefresh/);
   assert.match(source, /onRefresh: \(\) => runSpotManagementCycle/);
   assert.match(source, /if \(isSpotEnabled\(\) && readSpotPosition\(\)\) return runSpotManagementCycle/);
 });

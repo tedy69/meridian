@@ -6,6 +6,7 @@ import { log } from "../logger.js";
 import { assertReadActive, withReadDeadline } from "../read-deadline.js";
 import { summarizeSpotPerformance } from "../spot-performance.js";
 import { getSpotRealtimeTelemetry } from "../spot-realtime.js";
+import { updateEntryWatchlist } from "../runtime-events.js";
 import { isSpotEnabled, withHybridEntry } from "../hybrid-risk.js";
 import {
   calculateSpotPnlPct,
@@ -35,12 +36,11 @@ import {
   reserveSpotBuy,
 } from "../spot-risk-budget.js";
 import { confirmIndicatorPreset } from "./chart-indicators.js";
-import { getActiveBin, getMyPositions } from "./dlmm.js";
+import { getMyPositions } from "./dlmm.js";
 import { discoverSpotMarkets, getSpotMarket } from "./spot-markets.js";
 import { getTokenInfo } from "./token.js";
 import {
   buySpotToken,
-  getFinalizedSlot,
   getJupiterPrices,
   getSpotRoundTripQuote,
   getSpotExitQuote,
@@ -174,12 +174,10 @@ function spotDeps(overrides = {}) {
     getPoolDetail: getSpotMarket,
     getTokenInfo,
     confirmIndicatorPreset,
-    getActiveBin,
     getMyPositions,
     getTokenBalanceByMint,
     inspectMintSafety,
     getJupiterPrices,
-    getFinalizedSlot,
     getSpotRoundTripQuote,
     getSpotExitQuote,
     buySpotToken,
@@ -219,7 +217,7 @@ export function getSpotMomentumCandidates(args = {}, overrides = {}) {
   });
 }
 
-async function readSpotMomentumCandidates({ limit = 10 } = {}, overrides = {}) {
+async function readSpotMomentumCandidates({ limit = 10, refresh = false } = {}, overrides = {}) {
   const deps = spotDeps(overrides);
   if (!isSpotEnabled(deps.tradingMode)) {
     return { candidates: [], blocked: true, reason: "tradingMode does not enable spot" };
@@ -229,7 +227,7 @@ async function readSpotMomentumCandidates({ limit = 10 } = {}, overrides = {}) {
 
   const discoveryPolicy = spotScreeningPolicy(deps.spotDiscoveryConfig);
   const entryPolicy = spotScreeningPolicy(deps.spotConfig);
-  const discovery = await deps.discoverPools({ page_size: 50, profile: "spot_momentum" });
+  const discovery = await deps.discoverPools({ page_size: 50, profile: "spot_momentum", refresh });
   const broadFiltered = [];
   const seenMints = new Set();
   const pools = (discovery?.pools || [])
@@ -246,6 +244,7 @@ async function readSpotMomentumCandidates({ limit = 10 } = {}, overrides = {}) {
       return true;
     })
     .slice(0, 15);
+  updateEntryWatchlist("spot", pools);
   const candidates = [];
   const filtered = [];
 
@@ -652,101 +651,80 @@ export async function getSpotPositionSnapshot(_args = {}, overrides = {}) {
   }
   if (position.status !== "open") return { position, status: position.status, priceable: false };
 
-  const [balance, activeBinResult] = await Promise.all([
-    deps.getTokenBalanceByMint(position.mint),
-    (position.priceSource === "jupiter_quote" ? Promise.resolve(null) : deps.getActiveBin({ pool_address: position.pool }))
-      .then((value) => ({ value, error: null }))
-      .catch((error) => ({ value: null, error })),
-  ]);
   const trackedRaw = BigInt(String(position.tokenRawAmount || "0"));
-  const walletRaw = BigInt(String(balance.raw_amount || "0"));
-  if (trackedRaw <= 0n || walletRaw < trackedRaw) {
+  if (trackedRaw <= 0n) return { position, status: "open", priceable: false, reason: "Tracked token amount is invalid; reconciliation is required." };
+  // Quote the exact position size in parallel with the finalized balance. A
+  // pool mark is not executable proceeds: routing, impact and fees matter.
+  const [balanceResult, quoteResult] = await Promise.allSettled([
+    withReadDeadline(() => deps.getTokenBalanceByMint(position.mint), {
+      timeoutMs: deps.spotConfig.quoteMaxAgeMs, label: "Spot monitoring balance",
+    }),
+    withReadDeadline(() => deps.getSpotExitQuote({ mint: position.mint, rawAmount: trackedRaw.toString() }), {
+      timeoutMs: deps.spotConfig.quoteMaxAgeMs, label: "Spot monitoring quote",
+    }),
+  ]);
+  const balance = balanceResult.status === "fulfilled" ? balanceResult.value : null;
+  const walletRaw = balance ? BigInt(String(balance.raw_amount || "0")) : null;
+  // Never let a late read overwrite a newer position or a submitted close.
+  const latest = deps.readSpotPosition();
+  if (!latest || latest.id !== position.id || latest.status !== "open"
+    || String(latest.tokenRawAmount) !== String(position.tokenRawAmount)) {
+    return { position: latest, status: latest?.status ?? "none", priceable: false, reason: "Position changed during the market read." };
+  }
+  position = latest;
+  if (walletRaw != null && walletRaw < trackedRaw) {
     return { position, status: "open", priceable: false, reason: "Finalized wallet balance is below the position's tracked token amount; reconciliation is required." };
   }
   const trackedTokenAmount = atomicToUiAmount(trackedRaw, position.tokenDecimals);
-  const activeBinPrice = safeNumber(activeBinResult.value?.price);
   let currentValueSol;
-  let tokenPrice = null;
-  let solPrice = null;
-  let priceSource;
-  let blockLag = null;
-  let activeBinId = null;
-  let poolPriceSolPerToken = null;
-
-  if (position.priceSource === "jupiter_quote") {
+  let minimumNetValueSol = null;
+  try {
+    if (quoteResult.status === "rejected") throw quoteResult.reason;
+    const quote = quoteResult.value;
+    currentValueSol = quote.netValueSol;
+    minimumNetValueSol = quote.minimumNetValueSol ?? null;
+    if (!Number.isFinite(currentValueSol) || currentValueSol < 0) throw new Error("Net exit quote is invalid");
+  } catch (error) {
+    const now = deps.now();
+    const nowMs = now instanceof Date ? now.getTime() : Date.parse(now);
+    const observedAt = Number.isFinite(nowMs) ? new Date(nowMs).toISOString() : new Date().toISOString();
+    let updated = position;
     try {
-      const quote = await deps.getSpotExitQuote({ mint: position.mint, rawAmount: trackedRaw.toString() });
-      currentValueSol = quote.netValueSol;
-      if (!Number.isFinite(currentValueSol) || currentValueSol < 0) throw new Error("Net exit quote is invalid");
-      priceSource = "jupiter_quote";
-    } catch (error) {
-      const now = deps.now();
-      const nowMs = now instanceof Date ? now.getTime() : Date.parse(now);
-      const observedAt = Number.isFinite(nowMs) ? new Date(nowMs).toISOString() : new Date().toISOString();
-      let updated = position;
-      try {
-        updated = deps.markSpotQuoteUnavailable(position.id, {
-          reason: error.message,
-          observedAt,
-        });
-      } catch (stateError) {
-        log("spot_state_error", `Could not persist quote outage for ${position.id}: ${stateError.message}`);
-      }
-      let exit = evaluateSpotExit({ position: updated, currentValueSol: null, now, policy: deps.spotConfig });
-      const unavailableSinceMs = Date.parse(updated.quoteUnavailableSince || "");
-      const outageSeconds = Number.isFinite(nowMs) && Number.isFinite(unavailableSinceMs)
-        ? Math.max(0, (nowMs - unavailableSinceMs) / 1000)
-        : null;
-      const outageLimit = Number(deps.spotConfig.maxQuoteOutageSec);
-      if (exit.action === "HOLD" && outageSeconds != null && Number.isFinite(outageLimit)
-        && outageSeconds >= outageLimit) {
-        exit = {
-          ...exit,
-          action: "QUOTE_OUTAGE",
-          reason: `Executable exit quote unavailable for ${outageSeconds.toFixed(1)}s >= ${outageLimit}s: ${error.message}`,
-          quoteOutageSeconds: outageSeconds,
-        };
-      }
-      return {
-        position: updated,
-        status: "open",
-        priceable: false,
-        reason: `Executable exit quote unavailable: ${error.message}`,
-        token_balance: { ...balance, position_amount: trackedTokenAmount, position_raw_amount: trackedRaw.toString() },
-        current_value_sol: null,
-        pnl_pct: null,
-        peak_pnl_pct: exit.peakPnlPct,
-        exit,
-        price_source: "unavailable",
-        quote_outage_seconds: outageSeconds,
+      updated = deps.markSpotQuoteUnavailable(position.id, {
+        reason: error.message,
+        observedAt,
+      });
+    } catch (stateError) {
+      log("spot_state_error", `Could not persist quote outage for ${position.id}: ${stateError.message}`);
+    }
+    let exit = evaluateSpotExit({ position: updated, currentValueSol: null, now, policy: deps.spotConfig });
+    const unavailableSinceMs = Date.parse(updated.quoteUnavailableSince || "");
+    const outageSeconds = Number.isFinite(nowMs) && Number.isFinite(unavailableSinceMs)
+      ? Math.max(0, (nowMs - unavailableSinceMs) / 1000)
+      : null;
+    const outageLimit = Number(deps.spotConfig.maxQuoteOutageSec);
+    if (exit.action === "HOLD" && outageSeconds != null && Number.isFinite(outageLimit)
+      && outageSeconds >= outageLimit) {
+      exit = {
+        ...exit,
+        action: "QUOTE_OUTAGE",
+        reason: `Executable exit quote unavailable for ${outageSeconds.toFixed(1)}s >= ${outageLimit}s: ${error.message}`,
+        quoteOutageSeconds: outageSeconds,
       };
     }
-  } else if (activeBinPrice != null && activeBinPrice > 0) {
-    currentValueSol = trackedTokenAmount * activeBinPrice;
-    priceSource = "meteora_active_bin_confirmed";
-    activeBinId = safeNumber(activeBinResult.value?.binId);
-    poolPriceSolPerToken = activeBinPrice;
-  } else {
-    const [prices, finalizedSlot] = await Promise.all([
-      deps.getJupiterPrices([position.mint, SOL_MINT]),
-      deps.getFinalizedSlot(),
-    ]);
-    tokenPrice = safeNumber(prices?.[position.mint]?.usdPrice);
-    solPrice = safeNumber(prices?.[SOL_MINT]?.usdPrice);
-    const tokenBlock = safeNumber(prices?.[position.mint]?.blockId);
-    const solBlock = safeNumber(prices?.[SOL_MINT]?.blockId);
-    if (tokenPrice == null || tokenPrice <= 0 || solPrice == null || solPrice <= 0 || tokenBlock == null || solBlock == null) {
-      return { position, status: "open", priceable: false, reason: `Meteora active-bin price was unavailable${activeBinResult.error ? ` (${activeBinResult.error.message})` : ""}, and Jupiter declined to provide a trustworthy fallback price.` };
-    }
-    const rawBlockLag = finalizedSlot - Math.min(tokenBlock, solBlock);
-    blockLag = Math.max(0, rawBlockLag);
-    // Price V3 may observe a recent confirmed slot ahead of this RPC's finalized
-    // root. That is fresh (lag 0), not stale; only an older price is rejected.
-    if (!Number.isFinite(rawBlockLag) || rawBlockLag > deps.spotConfig.maxPriceBlockLag) {
-      return { position, status: "open", priceable: false, reason: `Jupiter fallback price is stale by ${rawBlockLag} slots.` };
-    }
-    currentValueSol = (trackedTokenAmount * tokenPrice) / solPrice;
-    priceSource = "jupiter_price_v3_fallback";
+    return {
+      position: updated,
+      status: "open",
+      priceable: false,
+      reason: `Executable exit quote unavailable: ${error.message}`,
+      token_balance: { ...balance, position_amount: trackedTokenAmount, position_raw_amount: trackedRaw.toString() },
+      current_value_sol: null,
+      pnl_pct: null,
+      peak_pnl_pct: exit.peakPnlPct,
+      exit,
+      price_source: "unavailable",
+      quote_outage_seconds: outageSeconds,
+    };
   }
   const exit = evaluateSpotExit({ position, currentValueSol, now: deps.now(), policy: deps.spotConfig });
   const updated = deps.updateSpotObservation(position.id, {
@@ -759,16 +737,16 @@ export async function getSpotPositionSnapshot(_args = {}, overrides = {}) {
     status: "open",
     priceable: true,
     token_balance: { ...balance, position_amount: trackedTokenAmount, position_raw_amount: trackedRaw.toString() },
-    token_price_usd: tokenPrice,
-    sol_price_usd: solPrice,
-    pool_price_sol_per_token: poolPriceSolPerToken,
+    balance_verified: balanceResult.status === "fulfilled",
+    balance_error: balanceResult.status === "rejected" ? balanceResult.reason.message : null,
     current_value_sol: currentValueSol,
+    minimum_net_value_sol: minimumNetValueSol,
     pnl_pct: exit.pnlPct,
     peak_pnl_pct: exit.peakPnlPct,
     exit,
-    price_source: priceSource,
-    active_bin_id: activeBinId,
-    block_lag: blockLag,
+    price_source: "jupiter_quote",
+    active_bin_id: null,
+    block_lag: null,
   };
 }
 

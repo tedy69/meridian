@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { repoPath } from "./repo-root.js";
+import { publishRuntimeChange } from "./runtime-events.js";
 
 const DEFAULT_SPOT_STATE_PATH = process.env.MERIDIAN_SPOT_STATE_FILE || repoPath("spot-state.json");
 const MAX_HISTORY = 200;
@@ -38,6 +39,10 @@ function write(state, options = {}) {
   try {
     fs.writeFileSync(temporary, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
     fs.renameSync(temporary, file);
+    if (file === DEFAULT_SPOT_STATE_PATH) {
+      const p = next.position;
+      publishRuntimeChange("spot_position", JSON.stringify(p ? [p.id, p.status, p.pool, p.tokenRawAmount] : null));
+    }
   } finally {
     if (fs.existsSync(temporary)) fs.unlinkSync(temporary);
   }

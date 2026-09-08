@@ -84,3 +84,15 @@ test("entry resolution binds exact pair and re-fetches token stats without cache
   assert.ok(calls.every(({ opts }) => opts.ttlMs === 0));
   await assert.rejects(provider.resolve({ pool_address: SOL_MINT }), /match/i);
 });
+
+test("an on-chain entry trigger bypasses completed token and pair discovery caches", async () => {
+  const calls = [];
+  const provider = createSpotMarketProvider({ now: () => now, requestJson: async (url, options) => {
+    calls.push(options);
+    return url.includes("tokens/v2") ? [token()] : [pair()];
+  } });
+  const result = await provider.discover({ refresh: true });
+  assert.equal(result.pools.length, 1);
+  assert.equal(calls.length, 3);
+  assert.ok(calls.every((options) => options.ttlMs === 0));
+});

@@ -12,6 +12,7 @@ import fs from "fs";
 import { log } from "./logger.js";
 import { repoPath } from "./repo-root.js";
 import { evaluateTrailingProfitFloor } from "./trailing-safety.js";
+import { publishRuntimeChange } from "./runtime-events.js";
 
 const STATE_FILE = process.env.MERIDIAN_STATE_FILE || repoPath("state.json");
 
@@ -60,6 +61,8 @@ function save(state) {
     normalizeState(state);
     state.lastUpdated = new Date().toISOString();
     fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+    publishRuntimeChange("lp_positions", JSON.stringify(Object.values(state.positions)
+      .filter((p) => !p.closed).map((p) => [p.position, p.pool])));
   } catch (err) {
     log("state_error", `Failed to write state.json: ${err.message}`);
   }

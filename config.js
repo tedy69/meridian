@@ -76,11 +76,6 @@ function nullablePositiveNumberConfig(value, fallback, label) {
   return numeric;
 }
 
-function nonNegativeNumberConfig(value, fallback) {
-  const numeric = numericConfig(value);
-  return numeric != null && numeric >= 0 ? numeric : fallback;
-}
-
 function fractionConfig(value, fallback) {
   const numeric = numericConfig(value);
   return numeric != null && numeric > 0 && numeric <= 1 ? numeric : fallback;
@@ -100,10 +95,6 @@ const strategyDefaultBinsBelow = Math.max(
 );
 
 export function buildRiskConfig(userConfig = {}) {
-  const legacyLossCircuitCooldownHours = nonNegativeNumberConfig(
-    userConfig.lossCircuitCooldownHours,
-    null,
-  );
   return {
     maxPositions: userConfig.maxPositions ?? 1,
     // `null` deliberately disables the per-position SOL ceiling. An absent
@@ -119,22 +110,12 @@ export function buildRiskConfig(userConfig = {}) {
     maxConsecutiveLosses: positiveIntegerConfig(userConfig.maxConsecutiveLosses, 3),
     maxRollingLossPct: numericConfig(userConfig.maxRollingLossPct) ?? 12,
     maxSingleLossPct: numericConfig(userConfig.maxSingleLossPct) ?? 12,
-    // A zero-hour pause keeps loss context and reduced recovery sizing without
-    // blocking the next high-quality setup. Existing explicit cooldown values
-    // remain supported for backwards compatibility.
-    lossCircuitCooldownHours: legacyLossCircuitCooldownHours ?? 0,
-    lossCircuitStreakCooldownHours: nonNegativeNumberConfig(
-      userConfig.lossCircuitStreakCooldownHours,
-      legacyLossCircuitCooldownHours ?? 0,
-    ),
-    lossCircuitRollingCooldownHours: nonNegativeNumberConfig(
-      userConfig.lossCircuitRollingCooldownHours,
-      legacyLossCircuitCooldownHours ?? 0,
-    ),
-    lossCircuitSingleCooldownHours: nonNegativeNumberConfig(
-      userConfig.lossCircuitSingleCooldownHours,
-      legacyLossCircuitCooldownHours ?? 0,
-    ),
+    // Loss history changes recovery sizing, never creates a timed freeze.
+    // Ignore legacy pause settings so an existing installation also migrates.
+    lossCircuitCooldownHours: 0,
+    lossCircuitStreakCooldownHours: 0,
+    lossCircuitRollingCooldownHours: 0,
+    lossCircuitSingleCooldownHours: 0,
     lossCircuitRecoverySizePct: fractionConfig(userConfig.lossCircuitRecoverySizePct, 0.5),
   };
 }
@@ -344,8 +325,8 @@ export function buildSpotConfig(userConfig = {}) {
     managementPollIntervalSec: positiveIntegerConfig(userConfig.spotManagementPollIntervalSec, 1),
     realtimeEnabled: userConfig.spotRealtimeEnabled ?? true,
     realtimeCommitment,
-    realtimeEventDebounceMs: boundedIntegerConfig(userConfig.spotRealtimeEventDebounceMs, 100, 25, 1_000, "spotRealtimeEventDebounceMs"),
-    realtimeMinRefreshMs: boundedIntegerConfig(userConfig.spotRealtimeMinRefreshMs, 500, 100, 10_000, "spotRealtimeMinRefreshMs"),
+    realtimeEventDebounceMs: boundedIntegerConfig(userConfig.spotRealtimeEventDebounceMs, 0, 0, 1_000, "spotRealtimeEventDebounceMs"),
+    realtimeMinRefreshMs: boundedIntegerConfig(userConfig.spotRealtimeMinRefreshMs, 0, 0, 10_000, "spotRealtimeMinRefreshMs"),
   };
 }
 
@@ -502,11 +483,12 @@ export const config = {
     // never burns the main RPC_URL or the LPAgent sponsor budget.
     rpcUrl: nonEmptyString(u.pnlRpcUrl, process.env.PNL_RPC_URL, "https://pump.helius-rpc.com"),
     source: nonEmptyString(u.pnlSource, "rpc"), // rpc | meteora (fallback-only)
-    pollIntervalSec: Number(u.pnlPollIntervalSec ?? 3),
+    pollIntervalSec: Number(u.pnlPollIntervalSec ?? 1),
+    realtimeEnabled: u.pnlRealtimeEnabled ?? true,
     depositCacheTtlSec: Number(u.pnlDepositCacheTtlSec ?? 300),
     // Consecutive confirming polls required before a peak is raised or an exit fires.
-    // At a 3s poll cadence, 2 ticks ≈ 3-6s — filters single-tick noise without the
-    // old fixed 15s setTimeout recheck.
+    // Events drive confirmations; the one-second fallback covers quiet pools.
+    // Stop-loss uses its own confirmation policy without a fixed timer delay.
     confirmTicks: Number(u.pnlConfirmTicks ?? 2),
   },
 

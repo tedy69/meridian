@@ -165,8 +165,8 @@ test("spot momentum explicitly enables a backend-capped 0.5 SOL trade", () => {
   assert.equal(spot.managementPollIntervalSec, 1);
   assert.equal(spot.realtimeEnabled, true);
   assert.equal(spot.realtimeCommitment, "processed");
-  assert.equal(spot.realtimeEventDebounceMs, 100);
-  assert.equal(spot.realtimeMinRefreshMs, 500);
+  assert.equal(spot.realtimeEventDebounceMs, 0);
+  assert.equal(spot.realtimeMinRefreshMs, 0);
   assert.equal(spot.minPriceChange5mPct, 1.5);
   assert.equal(spot.maxPriceChange5mPct, 8);
   assert.equal(spot.minVolumeChangePct, 20);
@@ -189,7 +189,7 @@ test("spot momentum explicitly enables a backend-capped 0.5 SOL trade", () => {
   assert.equal(buildSpotConfig({ spotRealtimeMinRefreshMs: 200 }).realtimeMinRefreshMs, 200);
   assert.throws(() => buildSpotConfig({ spotRealtimeEnabled: "false" }), /spotRealtimeEnabled/i);
   assert.throws(() => buildSpotConfig({ spotRealtimeCommitment: "fastest" }), /spotRealtimeCommitment/i);
-  assert.throws(() => buildSpotConfig({ spotRealtimeEventDebounceMs: 10 }), /spotRealtimeEventDebounceMs/i);
+  assert.throws(() => buildSpotConfig({ spotRealtimeEventDebounceMs: -1 }), /spotRealtimeEventDebounceMs/i);
 });
 
 test("spot discovery is broad while the fresh entry gate stays selective", () => {
@@ -686,7 +686,7 @@ test("opening spot state reconciles from finalized balance growth", async () => 
   let confirmed = null;
   const snapshot = await getSpotPositionSnapshot({}, {
     spotConfig: buildSpotConfig({}),
-    readSpotPosition: () => opening,
+    readSpotPosition: () => confirmed ? { ...opening, ...confirmed, status: "open" } : opening,
     getTokenBalanceByMint: async (requestedMint) => requestedMint === SOL_MINT
       ? { amount: 0.695, raw_amount: "695000000", decimals: 9 }
       : { amount: 150, raw_amount: "150000", decimals: 3 },
@@ -700,7 +700,7 @@ test("opening spot state reconciles from finalized balance growth", async () => 
       confirmed = data;
       return { ...opening, ...data, status: "open", openedAt: "2026-09-02T00:00:00.000Z", peakPnlPct: 0 };
     },
-    getFinalizedSlot: async () => 1_000,
+    getSpotExitQuote: async () => ({ netValueSol: 0.5 }),
     updateSpotObservation: (_id, observation) => ({ ...opening, status: "open", ...confirmed, ...observation }),
     now: () => new Date("2026-09-02T00:01:00.000Z"),
   });
@@ -709,7 +709,7 @@ test("opening spot state reconciles from finalized balance growth", async () => 
   assert.equal(confirmed.tokenAmount, 100);
   assert.equal(confirmed.entryTokenUsd, null);
   assert.ok(Math.abs(confirmed.entryCostSol - 0.505) < 1e-12);
-  assert.equal(snapshot.price_source, "jupiter_price_v3_fallback");
+  assert.equal(snapshot.price_source, "jupiter_quote");
 });
 
 test("opening reconciliation rejects an airdrop without the exact SOL debit", async () => {
@@ -1215,7 +1215,10 @@ test("spot snapshot and close value only the tracked tokens, not unrelated walle
     spotConfig: buildSpotConfig({}),
     readSpotPosition: () => position,
     getTokenBalanceByMint: async () => ({ amount: 150, raw_amount: "150000", decimals: 3 }),
-    getActiveBin: async () => ({ binId: 42, price: "0.01" }),
+    getSpotExitQuote: async ({ rawAmount }) => {
+      assert.equal(rawAmount, "100000");
+      return { netValueSol: 1 };
+    },
     getJupiterPrices: async () => {
       jupiterPriceReads += 1;
       throw new Error("Jupiter price API must not be used when the on-chain active bin is available");
@@ -1224,8 +1227,8 @@ test("spot snapshot and close value only the tracked tokens, not unrelated walle
     now: () => new Date("2026-09-02T00:01:00.000Z"),
   });
   assert.equal(snapshot.current_value_sol, 1);
-  assert.equal(snapshot.price_source, "meteora_active_bin_confirmed");
-  assert.equal(snapshot.active_bin_id, 42);
+  assert.equal(snapshot.price_source, "jupiter_quote");
+  assert.equal(snapshot.active_bin_id, null);
   assert.equal(snapshot.block_lag, null);
   assert.equal(snapshot.token_balance.position_amount, 100);
   assert.equal(jupiterPriceReads, 0);

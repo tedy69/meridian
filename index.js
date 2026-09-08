@@ -52,6 +52,8 @@ import { formatNetPnlPercent } from "./position-performance.js";
 import { buildRiskIntelligenceBrief, evaluateLossCircuitBreaker, evaluateTokenAuditRisk } from "./risk-intelligence.js";
 import { getSpotMomentumCandidates, getSpotPositionSnapshot, getSpotStatus } from "./tools/spot.js";
 import { createSpotRealtimeMonitor } from "./spot-realtime.js";
+import { createAccountRealtimeMonitor } from "./account-realtime.js";
+import { getEntryWatchAccounts, onRuntimeChange } from "./runtime-events.js";
 import { selectSpotEntryCandidate } from "./spot-momentum.js";
 import { isSpotEnabled, isLpEnabled, getHybridRiskStatus } from "./hybrid-risk.js";
 import { scanHybridCandidates } from "./hybrid-strategy.js";
@@ -160,6 +162,21 @@ let _screeningLastTriggered = 0; // epoch ms — prevents management from spammi
 let _spotExitKey = null;
 let _spotExitCount = 0;
 let _spotRealtimeMonitor = null;
+let _lpRealtimeMonitor = null;
+let _entryRealtimeMonitor = null;
+let _unsubscribeRuntimeChanges = null;
+let _spotPollBusy = false;
+let _pnlPollBusy = false;
+let _spotExitPending = false;
+let _lpExitPending = false;
+let _entryScanPending = false;
+
+function wakeRealtimeExits() {
+  if (_managementBusy || _screeningBusy || _claimAllBusy) return;
+  if (_spotExitPending) _spotRealtimeMonitor?.triggerRefresh("lane_available");
+  if (_lpExitPending) _lpRealtimeMonitor?.triggerRefresh("lane_available");
+  if (_entryScanPending) _entryRealtimeMonitor?.triggerRefresh("lane_available");
+}
 const spotConfirmationStore = createSpotConfirmationStore();
 // Exit/peak confirmation is now done by consecutive-tick counting in state.js
 // (registerExitSignal / confirmPeak), driven by the 3s RPC poller — no setTimeout rechecks.
@@ -216,6 +233,13 @@ async function maybeRunMissedBriefing() {
 
 function stopCronJobs() {
   runtimeHealth.pause();
+  _unsubscribeRuntimeChanges?.();
+  _unsubscribeRuntimeChanges = null;
+  for (const monitor of [_lpRealtimeMonitor, _entryRealtimeMonitor]) {
+    monitor?.stop().catch((error) => log("realtime_warn", `Stop failed: ${error.message}`));
+  }
+  _lpRealtimeMonitor = null;
+  _entryRealtimeMonitor = null;
   for (const task of _cronTasks) task.stop();
   if (_cronTasks._pnlPollInterval) clearInterval(_cronTasks._pnlPollInterval);
   if (_cronTasks._opportunityPollInterval) clearInterval(_cronTasks._opportunityPollInterval);
@@ -363,8 +387,9 @@ function confirmSpotExit(positionId, action) {
 }
 
 async function runSpotManagementCycle({ silent = false } = {}) {
-  if (_managementBusy || _claimAllBusy || _screeningBusy) return null;
-  _managementBusy = true;
+  if (_spotPollBusy) return null;
+  _spotPollBusy = true;
+  let ownsManagementLock = false;
   timers.managementLastRun = Date.now();
   let report = null;
   let liveMessage = null;
@@ -373,7 +398,9 @@ async function runSpotManagementCycle({ silent = false } = {}) {
       liveMessage = await createLiveMessage("⚡ Spot Management", "Refreshing finalized balance and price...");
     }
     const snapshot = await getSpotPositionSnapshot();
+    _spotExitPending = false;
     if (!snapshot.position) {
+      _spotExitPending = false;
       resetSpotExitConfirmation();
       report = "No spot position is open.";
       return report;
@@ -394,6 +421,7 @@ async function runSpotManagementCycle({ silent = false } = {}) {
       ? `${snapshot.pnl_pct >= 0 ? "+" : ""}${snapshot.pnl_pct.toFixed(2)}%`
       : "N/A";
     if (exit.action === "HOLD") {
+      _spotExitPending = false;
       resetSpotExitConfirmation();
       const valueText = Number.isFinite(snapshot.current_value_sol)
         ? `${snapshot.current_value_sol.toFixed(6)} SOL`
@@ -407,6 +435,15 @@ async function runSpotManagementCycle({ silent = false } = {}) {
       report = `${snapshot.position.symbol || snapshot.position.mint}: ${exit.action} awaiting confirmation ${confirmation.count}/${confirmation.required} | PnL ${pnlText}.`;
       return report;
     }
+
+    if (_managementBusy || _screeningBusy || _claimAllBusy) {
+      _spotExitPending = true;
+      report = `${exit.action} detected; retrying immediately when the transaction lane is free.`;
+      return report;
+    }
+    _spotExitPending = false;
+    _managementBusy = true;
+    ownsManagementLock = true;
 
     log("spot", `${exit.action} confirmed for ${snapshot.position.symbol || snapshot.position.mint}: ${exit.reason}`);
     await liveMessage?.toolStart("close_spot_position");
@@ -432,7 +469,9 @@ async function runSpotManagementCycle({ silent = false } = {}) {
     if (silent) throw error;
     report = `Spot management failed: ${error.message}`;
   } finally {
-    _managementBusy = false;
+    _spotPollBusy = false;
+    if (ownsManagementLock) _managementBusy = false;
+    wakeRealtimeExits();
     if (!silent && telegramEnabled() && report) {
       if (liveMessage) await liveMessage.finalize(stripThink(report)).catch(() => {});
       else sendMessage(`⚡ Spot Management\n\n${stripThink(report)}`).catch(() => {});
@@ -441,7 +480,7 @@ async function runSpotManagementCycle({ silent = false } = {}) {
   return report;
 }
 
-async function runSpotScreeningCycle({ silent = false } = {}) {
+async function runSpotScreeningCycle({ silent = false, refresh = false } = {}) {
   if (_screeningBusy || _claimAllBusy || _managementBusy) {
     runtimeHealth.skipped("transaction lane is busy");
     log("cron", "Spot screening skipped — transaction lane is busy");
@@ -486,7 +525,7 @@ async function runSpotScreeningCycle({ silent = false } = {}) {
       return report;
     }
 
-    const screened = await getSpotMomentumCandidates({ limit: 10 });
+    const screened = await getSpotMomentumCandidates({ limit: 10, refresh });
     const candidates = screened?.candidates || [];
     if (candidates.length === 0) {
       const examples = (screened?.filtered_examples || [])
@@ -546,6 +585,7 @@ async function runSpotScreeningCycle({ silent = false } = {}) {
     report = `Spot screening failed: ${error.message}`;
   } finally {
     _screeningBusy = false;
+    wakeRealtimeExits();
     runtimeHealth.complete(healthStatus, report);
     if (!silent && telegramEnabled() && report) {
       if (liveMessage) await liveMessage.finalize(stripThink(report)).catch(() => {});
@@ -555,7 +595,7 @@ async function runSpotScreeningCycle({ silent = false } = {}) {
   return report;
 }
 
-async function runHybridScreeningCycle({ silent = false } = {}) {
+async function runHybridScreeningCycle({ silent = false, refresh = false } = {}) {
   if (_screeningBusy || _managementBusy || _claimAllBusy) {
     runtimeHealth.skipped(_screeningBusy ? "previous screening is busy" : "management/claim lane is busy");
     return null;
@@ -597,10 +637,10 @@ async function runHybridScreeningCycle({ silent = false } = {}) {
         if (!spotFunded && !sizing.funded) return blocked("Reserve plus entry-cost buffer is not funded.");
         runtimeHealth.stage("reading", "independent spot and LP candidates");
         const candidates = await scanHybridCandidates({
-          scanSpot: () => spotFunded ? getSpotMomentumCandidates({ limit: 5 }) : Promise.resolve({ candidates: [], reason: "Spot capital plus reserve/cost buffer is not funded" }),
+          scanSpot: () => spotFunded ? getSpotMomentumCandidates({ limit: 5, refresh }) : Promise.resolve({ candidates: [], reason: "Spot capital plus reserve/cost buffer is not funded" }),
           scanLp: () => sizing.funded
             ? hybridLpCache.get("lp-candidates", () => getTopCandidates({ limit: 1 }), {
-              ttlMs: 30_000, requestTimeoutMs: 20_000, rateLimitKey: "lp-screener",
+              ttlMs: refresh ? 0 : 30_000, requestTimeoutMs: 20_000, rateLimitKey: "lp-screener",
             }) : Promise.resolve({ candidates: [], reason: "LP reserve/rent buffer is not funded" }),
         });
         return { ...candidates, sizing };
@@ -654,6 +694,7 @@ async function runHybridScreeningCycle({ silent = false } = {}) {
     return report;
   } finally {
     _screeningBusy = false;
+    wakeRealtimeExits();
     runtimeHealth.complete(healthStatus, report);
     log("screening_cycle", `Hybrid ${healthStatus} after ${Date.now() - startedAt}ms`);
     if (!silent && telegramEnabled() && report) sendMessage(report).catch(() => {});
@@ -806,6 +847,7 @@ export async function runManagementCycle({ silent = false } = {}) {
     mgmtReport = `Management cycle failed: ${error.message}`;
   } finally {
     _managementBusy = false;
+    wakeRealtimeExits();
     if (!silent && telegramEnabled()) {
       if (mgmtReport) {
         if (liveMessage) await liveMessage.finalize(stripThink(mgmtReport)).catch(() => {});
@@ -821,9 +863,9 @@ export async function runManagementCycle({ silent = false } = {}) {
   return mgmtReport;
 }
 
-export async function runScreeningCycle({ silent = false } = {}) {
-  if (config.trading.mode === "hybrid") return runHybridScreeningCycle({ silent });
-  if (config.trading.mode === "spot_momentum") return runSpotScreeningCycle({ silent });
+export async function runScreeningCycle({ silent = false, refresh = false } = {}) {
+  if (config.trading.mode === "hybrid") return runHybridScreeningCycle({ silent, refresh });
+  if (config.trading.mode === "spot_momentum") return runSpotScreeningCycle({ silent, refresh });
   if (_screeningBusy || _claimAllBusy) {
     log("cron", "Screening skipped — previous cycle still running");
     return null;
@@ -844,6 +886,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
       reason,
     });
     _screeningBusy = false;
+    wakeRealtimeExits();
     return `Screening skipped — ${reason}`;
   }
   const lossCircuit = evaluateLossCircuitBreaker({
@@ -865,6 +908,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
       reason,
     });
     _screeningBusy = false;
+    wakeRealtimeExits();
     return `Screening skipped — ${reason}`;
   }
 
@@ -884,6 +928,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
         reason: `Max positions reached (${prePositions.total_positions}/${config.risk.maxPositions})`,
       });
       _screeningBusy = false;
+      wakeRealtimeExits();
       return screenReport;
     }
     preDeploySizing = getCircuitAdjustedDeploySizing(preBalance.sol, lossCircuit);
@@ -904,12 +949,14 @@ export async function runScreeningCycle({ silent = false } = {}) {
         reason: `Insufficient SOL after ${preDeploySizing.reserve} gas reserve`,
       });
       _screeningBusy = false;
+      wakeRealtimeExits();
       return screenReport;
     }
   } catch (e) {
     log("cron_error", `Screening pre-check failed: ${e.message}`);
     screenReport = `Screening pre-check failed: ${e.message}`;
     _screeningBusy = false;
+    wakeRealtimeExits();
     return screenReport;
   }
   if (!silent && telegramEnabled()) {
@@ -1187,6 +1234,7 @@ IMPORTANT:
     screenReport = `Screening cycle failed: ${error.message}`;
   } finally {
     _screeningBusy = false;
+    wakeRealtimeExits();
     if (!silent && telegramEnabled()) {
       if (screenReport) {
         if (liveMessage) await liveMessage.finalize(stripThink(screenReport)).catch(() => {});
@@ -1239,6 +1287,7 @@ Summarize the current portfolio health, total fees earned, and performance of al
       log("cron_error", `Health check failed: ${error.message}`);
     } finally {
       _managementBusy = false;
+      wakeRealtimeExits();
     }
   });
 
@@ -1274,9 +1323,8 @@ Summarize the current portfolio health, total fees earned, and performance of al
   // management-interval cooldown gate that used to swallow rule hits).
   const pnlPollMs = Math.max(1, Number(config.pnl.pollIntervalSec ?? 3)) * 1000;
   const confirmTicks = Math.max(1, Number(config.pnl.confirmTicks ?? 2));
-  let _pnlPollBusy = false;
   let pnlPollInterval = null;
-  if (isLpEnabled()) pnlPollInterval = setInterval(async () => {
+  const runLpRealtimeRefresh = async () => {
     const pollGate = getPnlWatchdogGate({
       pnlPollBusy: _pnlPollBusy,
       managementBusy: _managementBusy,
@@ -1284,11 +1332,12 @@ Summarize the current portfolio health, total fees earned, and performance of al
       claimAllBusy: _claimAllBusy,
     });
     if (!pollGate.shouldPoll) return;
-    if (getTrackedPositions(true).length === 0) return;
+    if (getTrackedPositions(true).length === 0) { _lpExitPending = false; return; }
     _pnlPollBusy = true;
     try {
       const result = await getMyPositions({ force: true, silent: true }).catch(() => null);
-      if (!result?.positions?.length) return;
+      if (!result?.positions?.length) { _lpExitPending = false; return; }
+      _lpExitPending = false;
       for (const p of result.positions) {
         confirmPeak(p.position, p.pnl_pct, confirmTicks);
 
@@ -1325,6 +1374,7 @@ Summarize the current portfolio health, total fees earned, and performance of al
           claimAllBusy: _claimAllBusy,
         });
         if (!executionGate.canExecuteExit) {
+          _lpExitPending = true;
           if (signal === "STOP_LOSS") {
             log("state", `[PnL poll] STOP_LOSS for ${p.pair} deferred while ${executionGate.executionBlocker} owns the transaction lane`);
           }
@@ -1350,13 +1400,32 @@ Summarize the current portfolio health, total fees earned, and performance of al
           log("cron_error", `Poll-triggered close failed: ${e.message}`);
         } finally {
           _managementBusy = false;
+          wakeRealtimeExits();
         }
         break; // one action per tick
       }
     } finally {
       _pnlPollBusy = false;
     }
-  }, pnlPollMs);
+  };
+  if (isLpEnabled()) {
+    if (config.pnl.realtimeEnabled) {
+      _lpRealtimeMonitor = createAccountRealtimeMonitor({
+        monitorName: "lp",
+        getAccountAddresses: () => getTrackedPositions(true).flatMap((p) => [p.pool, p.position]),
+        onRefresh: runLpRealtimeRefresh,
+        commitment: "processed",
+        eventDebounceMs: 0,
+        minRefreshMs: 0,
+        fallbackIntervalMs: pnlPollMs,
+      });
+      _lpRealtimeMonitor.start().catch((error) => log("realtime_error", `LP monitor failed: ${error.message}`));
+    } else {
+      pnlPollInterval = setInterval(() => {
+        runLpRealtimeRefresh().catch((error) => log("realtime_error", error.message));
+      }, pnlPollMs);
+    }
+  }
 
   // Opportunity poller — catches strong pools between the (slow) screening cycles.
   // Reuses the getTopCandidates pipeline (discovery + holder audit + filters + score);
@@ -1444,6 +1513,36 @@ Summarize the current portfolio health, total fees earned, and performance of al
       runScreeningCycle({ silent: true }).catch((error) => log("cron_error", `Spot scan failed: ${error.message}`));
     }, scanMs);
   }
+
+  // Known pools wake screening on-chain; discovery polls remain necessary to
+  // learn about new pools that were not in the latest provider snapshot.
+  _entryRealtimeMonitor = createAccountRealtimeMonitor({
+    monitorName: "entry",
+    watchLogs: true,
+    getAccountAddresses: () => readSpotPosition() || getTrackedPositions(true).length
+      ? [] : getEntryWatchAccounts(),
+    onRefresh: () => {
+      if (_screeningBusy || _managementBusy || _claimAllBusy) {
+        _entryScanPending = true;
+        return;
+      }
+      _entryScanPending = false;
+      return runScreeningCycle({ silent: true, refresh: true });
+    },
+    commitment: "processed",
+    eventDebounceMs: 0,
+    minRefreshMs: 0,
+    fallbackIntervalMs: 5_000,
+  });
+  _entryRealtimeMonitor.start().catch((error) => log("realtime_error", `Entry monitor failed: ${error.message}`));
+  _unsubscribeRuntimeChanges = onRuntimeChange(async (kind) => {
+    const monitors = kind.startsWith("watchlist:")
+      ? [_entryRealtimeMonitor] : [_spotRealtimeMonitor, _lpRealtimeMonitor, _entryRealtimeMonitor];
+    await Promise.all(monitors.filter(Boolean).map(async (monitor) => {
+      await monitor.syncNow();
+      if (!kind.startsWith("watchlist:")) monitor.triggerRefresh("position_change");
+    }));
+  });
 
   _cronTasks = [mgmtTask, screenTask, healthTask, briefingTask, briefingWatchdog, settlementTask];
   // Store interval refs so stopCronJobs can clear them
@@ -2136,6 +2235,7 @@ async function telegramHandler(msg) {
       } finally {
         busy = false;
         _screeningBusy = false;
+        wakeRealtimeExits();
         refreshPrompt();
         drainTelegramQueue().catch(() => {});
       }
@@ -2326,6 +2426,7 @@ async function telegramHandler(msg) {
       await sendMessage(`Error: ${error.message}`).catch(() => {});
     } finally {
       _claimAllBusy = false;
+      wakeRealtimeExits();
       busy = false;
       drainTelegramQueue().catch(() => {});
     }

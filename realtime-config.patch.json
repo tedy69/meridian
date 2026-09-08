@@ -1,0 +1,13 @@
+{
+  "spotRealtimeEnabled": true,
+  "spotRealtimeCommitment": "processed",
+  "spotRealtimeEventDebounceMs": 0,
+  "spotRealtimeMinRefreshMs": 0,
+  "spotManagementPollIntervalSec": 1,
+  "pnlRealtimeEnabled": true,
+  "pnlPollIntervalSec": 1,
+  "lossCircuitCooldownHours": 0,
+  "lossCircuitStreakCooldownHours": 0,
+  "lossCircuitRollingCooldownHours": 0,
+  "lossCircuitSingleCooldownHours": 0
+}

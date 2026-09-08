@@ -714,11 +714,9 @@ export async function getJupiterPrices(mints) {
   const normalized = [...new Set((mints || []).map(normalizeMint).filter(Boolean))];
   if (normalized.length === 0) return {};
   const apiKey = requireJupiterApiKey();
-  const response = await fetch(`${JUPITER_PRICE_API}?ids=${encodeURIComponent(normalized.join(","))}`, {
+  return readJson(`${JUPITER_PRICE_API}?ids=${encodeURIComponent(normalized.join(","))}`, {
     headers: { "x-api-key": apiKey },
-  });
-  if (!response.ok) throw new Error(`Jupiter Price API failed: ${response.status} ${await response.text()}`);
-  return response.json();
+  }, { timeoutMs: config.spot.quoteMaxAgeMs, label: "Jupiter Price API" });
 }
 
 export async function getFinalizedSlot() {
@@ -777,7 +775,9 @@ export async function getSpotExitQuote({ mint, rawAmount }) {
       netValueSol: Number(expected > 0n ? expected : 0n) / LAMPORTS_PER_SOL,
       minimumNetValueSol: Number(minimum > 0n ? minimum : 0n) / LAMPORTS_PER_SOL,
       checkedAt: new Date().toISOString(), basis: "expected and minimum tracked-size output less quoted transaction fees" };
-  }, { ttlMs: config.spot.quoteMaxAgeMs, rateLimitKey: "jupiter-exit-quotes" });
+  // Coalesce concurrent reads, but never reuse a completed quote for another
+  // market event. quoteMaxAgeMs bounds transport time, not a stale-price cache.
+  }, { ttlMs: 0, requestTimeoutMs: config.spot.quoteMaxAgeMs, rateLimitKey: "jupiter-exit-quotes" });
 }
 
 export function getSpotRoundTripQuote(args) {

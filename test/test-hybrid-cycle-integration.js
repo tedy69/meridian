@@ -53,6 +53,7 @@ function cycleHarness(overrides = {}) {
       complete: (status, report) => health.push({ event: "complete", status, report }),
     },
     log: (category, message) => logs.push({ category, message }),
+    wakeRealtimeExits: () => {},
     getHybridRiskStatus: () => ({ entry_pending: false }),
     readSpotPosition: () => null,
     getTrackedPositions: () => [],

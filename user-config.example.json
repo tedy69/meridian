@@ -60,8 +60,8 @@
   "spotManagementPollIntervalSec": 1,
   "spotRealtimeEnabled": true,
   "spotRealtimeCommitment": "processed",
-  "spotRealtimeEventDebounceMs": 100,
-  "spotRealtimeMinRefreshMs": 500,
+  "spotRealtimeEventDebounceMs": 0,
+  "spotRealtimeMinRefreshMs": 0,
 
   "deployAmountSol": 0.5,
   "maxPositions": 1,
@@ -168,7 +168,8 @@
 
   "pnlSource": "rpc",
   "pnlRpcUrl": "https://pump.helius-rpc.com",
-  "pnlPollIntervalSec": 3,
+  "pnlRealtimeEnabled": true,
+  "pnlPollIntervalSec": 1,
   "pnlDepositCacheTtlSec": 300,
 
   "gmgnFeeSource": "gmgn",

@@ -61,114 +61,29 @@ function performance(pnlPct, minutesAgo, extra = {}) {
   };
 }
 
-test("loss circuit breaker blocks a fresh deploy after one severe realized loss", () => {
-  const status = evaluateLossCircuitBreaker({
-    performance: [performance(1, 90), performance(-14, 30)],
-    policy: circuitPolicy,
-    now: NOW,
-  });
+for (const [name, returns, trigger] of [
+  ["severe single loss", [1, -14], "single_loss"],
+  ["rolling losses", [2, -5, -4, -6], "rolling_loss"],
+  ["consecutive small losses", [2, -2, -2, -2], "loss_streak"],
+]) {
+  for (const [policyName, policy] of [["legacy", circuitPolicy], ["per-trigger", adaptiveCircuitPolicy]]) {
+    test(`${name} enables immediate recovery despite ${policyName} cooldown settings`, () => {
+      const status = evaluateLossCircuitBreaker({
+        performance: returns.map((value, index) => performance(value, (returns.length - index) * 10)),
+        policy, now: NOW,
+      });
+      assert.equal(status.pass, true);
+      assert.equal(status.trigger, null);
+      assert.equal(status.lastTrigger, trigger);
+      assert.equal(status.blockedUntil, null);
+      assert.equal(status.cooldownHours, 0);
+      assert.equal(status.recoveryMode, true);
+      assert.equal(status.recoverySizePct, 0.5);
+    });
+  }
+}
 
-  assert.equal(status.pass, false);
-  assert.equal(status.trigger, "single_loss");
-  assert.match(status.reason, /-14\.00%.*12\.00%/);
-  assert.equal(status.blockedUntil, "2026-09-02T17:30:00.000Z");
-});
-
-test("loss circuit breaker blocks accumulated losses before another position opens", () => {
-  const status = evaluateLossCircuitBreaker({
-    performance: [
-      performance(2, 50),
-      performance(-5, 40),
-      performance(-4, 30),
-      performance(-6, 20),
-    ],
-    policy: circuitPolicy,
-    now: NOW,
-  });
-
-  assert.equal(status.pass, false);
-  assert.equal(status.trigger, "rolling_loss");
-  assert.equal(status.metrics.rollingPnlPct, -13);
-});
-
-test("loss circuit breaker catches three consecutive smaller losses", () => {
-  const status = evaluateLossCircuitBreaker({
-    performance: [
-      performance(2, 50),
-      performance(-2, 40),
-      performance(-2, 30),
-      performance(-2, 20),
-    ],
-    policy: circuitPolicy,
-    now: NOW,
-  });
-
-  assert.equal(status.pass, false);
-  assert.equal(status.trigger, "loss_streak");
-  assert.equal(status.metrics.consecutiveLosses, 3);
-});
-
-test("loss circuit breaker automatically releases after its cooldown", () => {
-  const status = evaluateLossCircuitBreaker({
-    performance: [performance(-14, 13 * 60)],
-    policy: circuitPolicy,
-    now: NOW,
-  });
-
-  assert.equal(status.pass, true);
-  assert.equal(status.trigger, null);
-});
-
-test("loss circuit breaker uses a four-hour pause for a severe single loss", () => {
-  const status = evaluateLossCircuitBreaker({
-    performance: [performance(1, 90), performance(-14, 30)],
-    policy: adaptiveCircuitPolicy,
-    now: NOW,
-  });
-
-  assert.equal(status.pass, false);
-  assert.equal(status.trigger, "single_loss");
-  assert.equal(status.cooldownHours, 4);
-  assert.equal(status.blockedUntil, "2026-09-02T09:30:00.000Z");
-});
-
-test("loss circuit breaker uses a two-hour pause for rolling losses", () => {
-  const status = evaluateLossCircuitBreaker({
-    performance: [
-      performance(2, 50),
-      performance(-5, 40),
-      performance(-4, 30),
-      performance(-6, 20),
-    ],
-    policy: adaptiveCircuitPolicy,
-    now: NOW,
-  });
-
-  assert.equal(status.pass, false);
-  assert.equal(status.trigger, "rolling_loss");
-  assert.equal(status.cooldownHours, 2);
-  assert.equal(status.blockedUntil, "2026-09-02T07:40:00.000Z");
-});
-
-test("loss circuit breaker uses a one-hour pause for a small-loss streak", () => {
-  const status = evaluateLossCircuitBreaker({
-    performance: [
-      performance(2, 50),
-      performance(-2, 40),
-      performance(-2, 30),
-      performance(-2, 20),
-    ],
-    policy: adaptiveCircuitPolicy,
-    now: NOW,
-  });
-
-  assert.equal(status.pass, false);
-  assert.equal(status.trigger, "loss_streak");
-  assert.equal(status.cooldownHours, 1);
-  assert.equal(status.blockedUntil, "2026-09-02T06:40:00.000Z");
-});
-
-test("an expired circuit stays in half-size recovery until a profitable close", () => {
+test("loss history stays in half-size recovery until a profitable close", () => {
   const status = evaluateLossCircuitBreaker({
     performance: [performance(-14, 5 * 60)],
     policy: adaptiveCircuitPolicy,
@@ -181,7 +96,7 @@ test("an expired circuit stays in half-size recovery until a profitable close", 
   assert.equal(status.lastTrigger, "single_loss");
 });
 
-test("a profitable close after cooldown restores normal deploy sizing", () => {
+test("a profitable close restores normal deploy sizing", () => {
   const status = evaluateLossCircuitBreaker({
     performance: [performance(-14, 7 * 60), performance(1, 60)],
     policy: adaptiveCircuitPolicy,
@@ -460,7 +375,7 @@ test("risk brief exposes recent expectancy and tail-risk to the screener AI", ()
   assert.match(brief, /REALIZED RISK INTELLIGENCE/);
   assert.match(brief, /profit factor 0\.11/i);
   assert.match(brief, /high-volatility tail.*-14\.00%/i);
-  assert.match(brief, /CIRCUIT OPEN/i);
+  assert.match(brief, /LOSS-AWARE RE-ENTRY/i);
 });
 
 test("deploy preflight uses the longer volatility window and blocks its tail", async () => {

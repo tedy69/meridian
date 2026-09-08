@@ -47,7 +47,7 @@ Autonomous DLMM liquidity provider agent for Meteora pools on Solana.
 - Runtime files `hybrid-entry-lock.json` / `hybrid-risk-budget.json` are private, gitignored, and must survive deployments along with spot/LP state. See README for conservative SOL drawdown accounting, wallet transfer caveats, and manual reconciliation procedure.
 - Meteora SDK liquidity entry `slippage` is **percentage**, not bps. Hybrid uses 1.5; legacy intended 10% is represented as 10, not 1000. Keep lazy SDK import, bin-array rent prohibition, mainnet verification and simulation.
 - `tools/trading-status.js` / `get_trading_status`, Telegram `/status` and `/positions`, and CLI `trading-status` show spot and LP separately; missing reads mean unknown. `/close spot` closes spot; numbered `/close` remains LP. Read-only `/screen` must never submit.
-- Spot entry economics are backend-enforced: expected round-trip loss <= 0.75%, two-leg minimum-output loss <= 2.5%, executable profit floor >= 1.25%, early stop at -1.25%, intended maximum loss -2.5%, and reward/risk >= 1. Emergency-exit slippage must fit inside the trigger-to-maximum-loss gap. These risk keys are manual-only. Loss-streak cooldowns default to zero; retain loss-aware recovery sizing and the absolute daily-loss breaker.
+- Spot entry economics are backend-enforced: expected round-trip loss <= 0.75%, two-leg minimum-output loss <= 2.5%, executable profit floor >= 1.25%, early stop at -1.25%, intended maximum loss -2.5%, and reward/risk >= 1. Emergency-exit slippage must fit inside the trigger-to-maximum-loss gap. These risk keys are manual-only. Timed global loss cooldowns are removed, including legacy nonzero settings; retain loss-aware recovery sizing and the absolute daily-loss breaker.
 - New mocked regression suites are explicitly included in `npm test`. A passing suite or read-only discovery probe is not live-execution/profitability evidence. Never execute a financial write as a smoke test.
 
 ```
@@ -115,7 +115,7 @@ Autonomous DLMM liquidity provider agent for Meteora pools on Solana.
 | `state.js` | 513 | `trackPosition`, `markOutOfRange/InRange`, `recordClaim`, `recordClose`, `setPositionInstruction`, `updatePnlAndCheckExits` (the deterministic rules: STOP_LOSS, TRAILING_TP, OUT_OF_RANGE, LOW_YIELD), `getStateSummary`. `syncOpenPositions` reconciles local state with on-chain after 5 min grace. |
 | `pool-memory.js` | 405 | Per-pool deploy history + rolling 48-snapshot trend (5min × 4h). Computes `avg_pnl_pct`, `win_rate`, `adjusted_win_rate` (excludes OOR pumps). Cooldown logic: low yield → 4h pool cooldown, 3× OOR closes → 12h pool+token cooldown, optional repeat-deploy cooldown (configurable trigger count/hours/min fee yield/scope). `recordPositionSnapshot`, `recallForPool` for prompt injection. |
 | `lessons.js` | 765 | `recordPerformance(perf)` called by executor after `close_position`. Builds lesson string (PREFER/AVOID/WORKED/FAILED). Pinned + role-tagged lesson injection (3-tier cap: PINNED, ROLE, RECENT) with `ROLE_TAGS` map. `evolveThresholds` adjusts `minOrganic` and fee thresholds, writes `[AUTO-EVOLVED @ N]` lessons, and applies changes to live `config`. The full performance ledger also feeds deterministic risk intelligence. `pushHiveLesson`/`pushHivePerformanceEvent` are fire-and-forget. |
-| `risk-intelligence.js` | ~500 | Pure deterministic risk layer: immediate loss-aware re-entry with half-size recovery until a profitable close, fresh pool fundamentals including volume/active-TVL, mint-bound token audit, and compact realized expectancy/tail-risk brief for SCREENER. Explicit nonzero cooldowns remain supported. |
+| `risk-intelligence.js` | ~500 | Pure deterministic risk layer: immediate loss-aware re-entry with half-size recovery until a profitable close, fresh pool fundamentals including volume/active-TVL, mint-bound token audit, and compact realized expectancy/tail-risk brief for SCREENER. Legacy cooldown hours are ignored; keep recovery sizing and the absolute daily-loss cap. |
 | `decision-log.js` | 68 | Rolling 100-entry log. Types: `deploy` / `close` / `skip` / `no_deploy`. Each entry: actor, pool, summary, reason, risks[], metrics{}, rejected[]. Surfaced via `get_recent_decisions` tool and `getDecisionSummary()` in the prompt. |
 | `signal-tracker.js` | 87 | In-memory 10-min staging for Darwin screening signals (`organic_score`, `fee_tvl_ratio`, …). On deploy they are merged with the executor's compact fresh fundamentals, audit, and 5m+15m momentum snapshot, then written to `state.json` via `trackPosition({ signal_snapshot })`. |
 | `signal-weights.js` | 330 | Darwinian signal weighting. Recalculates every 5 closes (or 10-sample min). Splits signals into quartiles; top → `weight*1.05`, bottom → `weight*0.95`. Persists `signal-weights.json`. `getWeightsSummary()` injected into SCREENER prompt. |
@@ -186,12 +186,12 @@ Cron tasks created by `startCronJobs()`:
 | Health check | `0 * * * *` | One-shot `agentLoop` as MANAGER with health summary goal |
 | Briefing | `0 1 * * *` (UTC) | `runBriefing()` — 8 AM Jakarta |
 | Briefing watchdog | `0 */6 * * *` (UTC) | `maybeRunMissedBriefing()` — fires on startup if missed |
-| **PnL poller** | every 30s (`setInterval`) | Trailing-TP detection between management cycles (below) |
+| **PnL watchdog** | pool/position WebSocket events, with a 1s fallback | Direct deterministic exit checks between management cycles |
 
 **Race condition guards** (all in `index.js`):
 - `_managementBusy` / `_screeningBusy` flags prevent overlap.
 - `_screeningLastTriggered` (epoch ms) prevents management from spamming screening.
-- `_pollTriggeredAt` cooldown equal to `managementIntervalMin` to avoid PnL-poller double-triggering.
+- Account/log events coalesce with one pending refresh. Deferred exits wake when the transaction lane is free.
 - `deploy_position` safety check uses `force: true` on `getMyPositions()` for a fresh position count.
 
 ### The hybrid management cycle (deterministic + LLM)
@@ -436,7 +436,7 @@ When adding a new persistent JSON store, copy the load/save pattern from `state.
 
 When adding a new pre-LLM enrichment, follow the **3-strikes (Discord pre-checks)** model: cheap checks first (in-memory dedup, file lookup), then network (pool resolution, rugcheck), then more network (deployer, global fees). Log each pass/reject with the stage name.
 
-When scheduling work, follow the **`_busy` flag + cooldown** pattern. `_managementBusy`, `_screeningBusy`, `_pnlPollBusy`, `_pollTriggeredAt`, `_screeningLastTriggered` are the canonical examples.
+When scheduling work, follow the **`_busy` flag + cooldown** pattern. `_managementBusy`, `_screeningBusy`, `_pnlPollBusy`, `_spotPollBusy`, `_screeningLastTriggered` are the canonical examples.
 
 ---
 

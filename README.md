@@ -569,12 +569,16 @@ All fields are optional — defaults shown. Edit `user-config.json`.
 | `spotManagementPollIntervalSec` | `1` | Fallback position/PnL refresh interval when no WebSocket event arrives |
 | `spotRealtimeEnabled` | `true` | Subscribe to the active pool account and trigger position management on each coalesced update |
 | `spotRealtimeCommitment` | `processed` | Fast WebSocket signal commitment; execution still revalidates finalized balances and transaction results |
-| `spotRealtimeEventDebounceMs` | `100` | Coalescing window for bursts of pool-account updates |
-| `spotRealtimeMinRefreshMs` | `500` | Minimum interval between full PnL refreshes from the pool's on-chain active-bin price |
+| `spotRealtimeEventDebounceMs` | `0` | No deliberate event delay; simultaneous updates and in-flight work still coalesce |
+| `spotRealtimeMinRefreshMs` | `0` | No deliberate refresh floor; one refresh runs at a time |
 
-The realtime monitor is event-driven: Solana pool-account changes can arrive between fallback ticks, are coalesced to prevent overlapping work, and expose p50/p95/p99 trigger and refresh latency in `get_spot_status`. Meteora positions use the confirmed active-bin price with Jupiter Price V3 as a bounded fallback. Cross-DEX positions use the tracked-size Jupiter exit quote after estimated transaction costs. A persistent quote outage no longer leaves a position in an indefinite HOLD: after `spotMaxQuoteOutageSec`, management repeatedly attempts an emergency close, while maximum holding time remains enforceable even without a price. WebSocket delivery, RPC slots, quotes, and transaction landing are not guaranteed millisecond operations.
+Spot monitoring reacts to pool-account changes and successful transaction logs mentioning the pool. Logs cover AMMs whose swaps change vaults without changing the pool account. Events coalesce into one in-flight refresh and one pending refresh. Every venue, including Meteora spot, is valued using a new tracked-size Jupiter exit quote after transaction fees. Completed exit quotes are never reused; concurrent readers share only the in-flight request. Balance and quote reads begin together with bounded read deadlines. A persistent quote outage triggers emergency-close attempts after `spotMaxQuoteOutageSec`, and maximum holding time remains enforceable during provider failures. Submission still verifies the finalized token balance.
 
-Active-bin PnL is only an indicative trigger. Before signing `TAKE_PROFIT` or `TRAILING_TAKE_PROFIT`, the bot requires Jupiter's minimum SOL output minus transaction fees to exceed the measured entry cost by `spotMinProfitExitPct`; otherwise the order is rejected before submission and retried on a later signal. Emergency stop-loss, max-hold, and manual exits intentionally remain able to realize a loss because blocking those exits could increase it. No strategy can guarantee profit when the executable market price gaps below the entry or an RPC/router is unavailable.
+LP monitoring subscribes to both pool and position accounts (`pnlRealtimeEnabled: true`) and rechecks authoritative PnL on each event, with a one-second fallback by default. Known entry pools also trigger fresh screening on account/log events; completed discovery caches are bypassed for these triggers. Up to ten candidates per strategy are watched, expiring after sixty seconds. New-pool discovery still needs the provider's periodic feeds. Position lifecycle changes update subscriptions immediately. A stop-loss is observed even while another workflow is busy, then retried when the transaction lane is released. `/status` and `get_trading_status` expose per-monitor p95 event-to-refresh and refresh-duration measurements.
+
+Before signing `TAKE_PROFIT` or `TRAILING_TAKE_PROFIT`, Jupiter's minimum SOL output minus transaction fees must exceed the measured entry cost by `spotMinProfitExitPct`. A rejected profit exit is retried on a fresh signal. Stop-loss, max-hold and manual exits can realize a loss. WebSocket delivery, provider freshness, RPC responses and transaction landing still take time; an event-driven scheduler cannot guarantee zero latency or a profitable outcome.
+
+Existing installations can merge the reviewed keys in [`realtime-config.patch.json`](realtime-config.patch.json) into their existing `user-config.json` during an authorized rollout. Preserve all other settings, wallet credentials and runtime state. The patch is not loaded automatically. See [`REALTIME-VALIDATION.md`](REALTIME-VALIDATION.md) for measured scope and release checks.
 
 Spot discovery is intentionally broader than the fresh entry gate, so more pools reach the expensive token and indicator checks without weakening the final decision. The final entry gate looks for an early spike rather than a late pump: 5-minute price acceleration must remain inside the configured band, volume and buyer pressure must be rising, and their composite spike score must pass. It also requires a SOL quote, disabled mint and freeze authorities, a fresh token audit, real 5-minute and 15-minute indicator evidence, positive buyers, bounded concentration, and a fresh round-trip quote. Both expected output and the two-leg minimum-output tail are checked after estimated transaction costs, and configuration rejects an unfavorable executable reward/risk ratio. A disabled or evidence-free indicator service fails closed. After all gates pass, the backend selects the lowest executable round-trip cost deterministically and revalidates immediately; the LLM is not in the automatic transaction hot path. Legacy SPL tokens are supported; Token-2022 mints are supported only with no extensions or the `MetadataPointer`/`TokenMetadata` extensions. Every behavioral or unknown extension—including transfer fees, hooks, permanent delegates, pausing, non-transferability, and mint-close authority—is rejected fail-closed. Jupiter orders are checked for the exact mint pair and amount, explicit minimum output, quote age, price impact, fees, expiry, local simulation, mainnet identity, and finalized outcome. These controls reduce avoidable execution risk; they cannot guarantee profit or prevent all memecoin losses.
 
@@ -616,9 +620,9 @@ Spot discovery is intentionally broader than the fresh entry gate, so more pools
 | `maxConsecutiveLosses` | `3` | Consecutive realized losses that activate loss-aware recovery |
 | `maxRollingLossPct` | `12` | Rolling loss magnitude that activates recovery sizing |
 | `maxSingleLossPct` | `12` | Single-position loss magnitude that activates recovery sizing |
-| `lossCircuitStreakCooldownHours` | `0` | Timed pause after a smaller-loss streak; `0` allows immediate quality-gated re-entry |
-| `lossCircuitRollingCooldownHours` | `0` | Timed pause after rolling losses; `0` allows immediate quality-gated re-entry |
-| `lossCircuitSingleCooldownHours` | `0` | Timed pause after one severe loss; `0` allows immediate quality-gated re-entry |
+| `lossCircuitStreakCooldownHours` | `0` | Deprecated pause setting, always normalized to `0`; streaks only affect recovery sizing |
+| `lossCircuitRollingCooldownHours` | `0` | Deprecated pause setting, always normalized to `0` |
+| `lossCircuitSingleCooldownHours` | `0` | Deprecated pause setting, always normalized to `0` |
 | `lossCircuitRecoverySizePct` | `0.5` | Fraction of normal size allowed after a loss trigger until a profitable close |
 | `gasReserve` | `0.2` | Minimum SOL to keep for gas |
 | `minSolToOpen` | `0.55` | Minimum wallet SOL before opening |
@@ -635,9 +639,9 @@ Spot discovery is intentionally broader than the fresh entry gate, so more pools
 
 `stopLossTriggerPct` must stay above `stopLossPct` (for example, `-8` and `-15`). This reduces execution overshoot, but a direct on-chain close cannot mathematically guarantee the final PnL during a sudden market move. The fast PnL watchdog keeps sampling while other workflows are busy and defers only transaction submission until the transaction lane is free. A negative settled stop-loss starts the pool/token cooldown so the bot does not immediately re-enter the same collapsing asset. When the LP relay is enabled and returns a valid zap-out order, Meridian uses the relay's configured minimum-output slippage bound before any local fallback.
 
-Before every deploy, Meridian re-fetches pool fundamentals, token audit data, and 5-minute plus 15-minute momentum. Entry fails closed unless both timeframes show a rising price above bullish Supertrend with RSI in the configured `45–72` band. The default loss response has no timed global pause: qualifying setups can be considered immediately, but backend sizing remains at 50% after a loss trigger until a profitable position closes. Neither the model nor a direct `deploy_position` call can bypass these checks.
+Before every deploy, Meridian re-fetches pool fundamentals, token audit data, and 5-minute plus 15-minute momentum. Entry fails closed unless both timeframes show a rising price above bullish Supertrend with RSI in the configured `45–72` band. The loss response has no timed global pause, including when legacy nonzero cooldown settings are present: qualifying setups can be considered immediately, but backend sizing remains at 50% after a loss trigger until a profitable position closes. Neither the model nor a direct `deploy_position` call can bypass these checks.
 
-The opportunity poll runs every 45 seconds and may launch a full decision again after 90 seconds. This 90-second limit only prevents duplicate model/API work; it is not a loss cooldown.
+For new LP pools, the opportunity poll remains a 45-second discovery backstop and may launch a full decision again after 90 seconds. Known watched pools can trigger screening immediately from on-chain events. This 90-second limit only prevents duplicate model/API work; it is not a loss cooldown.
 
 ### Schedule
 
@@ -761,7 +765,7 @@ spot-risk-budget.js Atomic daily spot turnover and realized-loss budget
 spot-momentum.js    Pure candidate and mechanical exit policy
 decision-log.js     Structured decision log for deploy, close, skip, and no-deploy rationale
 lessons.js          Learning engine: records performance, derives lessons, evolves thresholds
-risk-intelligence.js Realized-loss circuit breaker, fresh pool/token gates, AI risk brief
+risk-intelligence.js Realized-loss recovery sizing, fresh pool/token gates, AI risk brief
 pool-memory.js      Per-pool deploy history + snapshots
 strategy-library.js Saved LP strategies
 telegram.js         Telegram bot: polling + notifications

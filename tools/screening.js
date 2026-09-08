@@ -6,6 +6,7 @@ import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
 import { getAgentMeridianBase, getAgentMeridianHeaders } from "./agent-meridian.js";
 import { evaluateFreshPoolRisk } from "../risk-intelligence.js";
 import { assertReadActive, readJson, withReadDeadline } from "../read-deadline.js";
+import { updateEntryWatchlist } from "../runtime-events.js";
 
 const DATAPI_JUP = "https://datapi.jup.ag/v1";
 
@@ -651,6 +652,7 @@ async function readTopCandidates({ limit = 10 } = {}, overrides = {}) {
     if (eligible.length < before) log("dev_blocklist", `Filtered ${before - eligible.length} pool(s) via dev blocklist`);
   }
 
+  updateEntryWatchlist("lp", eligible);
   // Use the SAME read-only gate as execution (including token audit/mint safety),
   // then keep looking after rejected leaders. Execution still revalidates afresh.
   const validateCandidate = overrides.validateCandidate ?? (async (pool) => {

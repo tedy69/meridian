@@ -63,11 +63,11 @@ export function normalizeSpotMarket(pair, token, now = Date.now()) {
 
 export function createSpotMarketProvider({ requestJson: request = requestJson, now = Date.now } = {}) {
   return {
-    async discover({ page_size = 50 } = {}) {
+    async discover({ page_size = 50, refresh = false } = {}) {
       const sourceErrors = [];
       const feeds = await Promise.all(["toptrending", "toptraded"].map(async (category) => {
         try {
-          const result = await request(`${JUPITER}/${category}/5m?limit=50`, { ttlMs: 10000 });
+          const result = await request(`${JUPITER}/${category}/5m?limit=50`, { ttlMs: refresh ? 0 : 10000 });
           if (!Array.isArray(result)) throw new Error("Invalid token feed response");
           return result;
         } catch (error) {
@@ -88,7 +88,7 @@ export function createSpotMarketProvider({ requestJson: request = requestJson, n
       if (selected.length) {
         try {
           const mints = selected.map((token) => address(token.id)).sort().join(",");
-          pairs = await request(`${DEX}/tokens/v1/solana/${mints}`, { ttlMs: 10000 });
+          pairs = await request(`${DEX}/tokens/v1/solana/${mints}`, { ttlMs: refresh ? 0 : 10000 });
           if (!Array.isArray(pairs)) throw new Error("Invalid pair feed response");
         } catch (error) {
           sourceErrors.push({ source: "dexscreener", reason: error.message });

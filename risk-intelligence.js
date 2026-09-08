@@ -32,11 +32,6 @@ function positiveNumber(value, fallback) {
   return numeric != null && numeric > 0 ? numeric : fallback;
 }
 
-function nonNegativeNumber(value, fallback) {
-  const numeric = numberOrNull(value);
-  return numeric != null && numeric >= 0 ? numeric : fallback;
-}
-
 function fraction(value, fallback) {
   const numeric = numberOrNull(value);
   return numeric != null && numeric > 0 && numeric <= 1 ? numeric : fallback;
@@ -62,30 +57,12 @@ function normalizedPerformance(performance) {
 }
 
 function normalizedCircuitPolicy(policy = {}) {
-  const legacyCooldownHours = nonNegativeNumber(
-    policy.cooldownHours ?? policy.lossCircuitCooldownHours,
-    null,
-  );
   return {
     enabled: policy.enabled ?? policy.lossCircuitBreakerEnabled ?? true,
     windowPositions: positiveInteger(policy.windowPositions ?? policy.lossCircuitWindowPositions, 5),
     maxConsecutiveLosses: positiveInteger(policy.maxConsecutiveLosses, 3),
     maxRollingLossPct: positiveNumber(policy.maxRollingLossPct, 12),
     maxSingleLossPct: positiveNumber(policy.maxSingleLossPct, 12),
-    cooldownByTrigger: {
-      loss_streak: nonNegativeNumber(
-        policy.lossCircuitStreakCooldownHours ?? policy.streakCooldownHours,
-        legacyCooldownHours ?? 0,
-      ),
-      rolling_loss: nonNegativeNumber(
-        policy.lossCircuitRollingCooldownHours ?? policy.rollingCooldownHours,
-        legacyCooldownHours ?? 0,
-      ),
-      single_loss: nonNegativeNumber(
-        policy.lossCircuitSingleCooldownHours ?? policy.singleCooldownHours,
-        legacyCooldownHours ?? 0,
-      ),
-    },
     recoverySizePct: fraction(policy.lossCircuitRecoverySizePct ?? policy.recoverySizePct, 0.5),
   };
 }
@@ -202,43 +179,24 @@ export function evaluateLossCircuitBreaker({ performance = [], policy = {}, now 
     };
   }
 
-  const cooldownHours = normalizedPolicy.cooldownByTrigger[latestTrigger.trigger];
-  const blockedUntilMs = latestTrigger.atMs + cooldownHours * 3_600_000;
-  if (nowMs >= blockedUntilMs) {
-    const recovered = records.some((record) => (
-      record._closedAtMs > blockedUntilMs && record.pnl_pct > 0
-    ));
-    const recoveryMode = !recovered;
-    return {
-      pass: true,
-      trigger: null,
-      lastTrigger: latestTrigger.trigger,
-      reason: cooldownHours === 0
-        ? recoveryMode
-          ? "No timed cooldown is configured; re-entry is available immediately under strict entry gates and reduced sizing until a profitable close."
-          : "No timed cooldown is configured and a profitable close restored normal sizing."
-        : recoveryMode
-          ? `The ${cooldownHours}-hour realized-loss cooldown has expired; deploy sizing remains reduced until a profitable close.`
-          : "The latest realized-loss cooldown completed and a profitable close restored normal sizing.",
-      blockedUntil: null,
-      cooldownHours,
-      recoveryMode,
-      recoverySizePct: recoveryMode ? normalizedPolicy.recoverySizePct : 1,
-      metrics,
-    };
-  }
-
-  const blockedUntil = new Date(blockedUntilMs).toISOString();
+  // Historical cooldown keys are intentionally ignored. Loss history reduces
+  // sizing immediately and cannot impose a time-based entry freeze.
+  const recovered = records.some((record) => (
+    record._closedAtMs > latestTrigger.atMs && record.pnl_pct > 0
+  ));
+  const recoveryMode = !recovered;
   return {
-    pass: false,
-    trigger: latestTrigger.trigger,
+    pass: true,
+    trigger: null,
     lastTrigger: latestTrigger.trigger,
-    reason: `${latestTrigger.reason} New deployments are paused until ${blockedUntil}.`,
-    blockedUntil,
-    cooldownHours,
-    recoveryMode: false,
-    recoverySizePct: 1,
-    metrics: latestTrigger.metrics,
+    reason: recoveryMode
+      ? "No timed cooldown; re-entry is available immediately under strict entry gates and reduced sizing until a profitable close."
+      : "No timed cooldown; a profitable close restored normal sizing.",
+    blockedUntil: null,
+    cooldownHours: 0,
+    recoveryMode,
+    recoverySizePct: recoveryMode ? normalizedPolicy.recoverySizePct : 1,
+    metrics,
   };
 }
 
