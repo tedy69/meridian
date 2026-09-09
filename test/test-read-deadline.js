@@ -3,6 +3,19 @@ import test from "node:test";
 import * as reads from "../read-deadline.js";
 import { Connection, PublicKey } from "@solana/web3.js";
 
+test("a Jupiter rate-limit response stops another endpoint before another HTTP request", async (t) => {
+  let calls = 0;
+  t.mock.method(globalThis, "fetch", async () => {
+    calls++;
+    return new Response("{}", { status: 429, headers: {
+      "x-ratelimit-remaining": "-1", "x-ratelimit-reset": String(Math.ceil(Date.now() / 1000) + 30),
+    } });
+  });
+  await assert.rejects(reads.readJson("https://api.jup.ag/tokens/v2/toptrending"), /429/);
+  await assert.rejects(reads.readJson("https://api.jup.ag/price/v3?ids=mint"), /provider.*reset/i);
+  assert.equal(calls, 1, "price and token requests share the same provider quota");
+});
+
 test("market body stalls abort the fetch as well as releasing the caller", async (t) => {
   let signal;
   t.mock.method(globalThis, "fetch", async (_url, options) => {

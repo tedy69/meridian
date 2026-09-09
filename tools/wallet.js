@@ -321,11 +321,12 @@ export async function getTokenBalanceByMint(mint) {
     { mint: new PublicKey(normalizedMint) },
     "finalized",
   );
+  if (!Array.isArray(response?.value)) throw new Error("Finalized token-account response is unavailable");
   let rawAmount = 0n;
   let decimals = null;
   for (const account of response.value || []) {
     const tokenAmount = account.account?.data?.parsed?.info?.tokenAmount;
-    if (!tokenAmount?.amount) continue;
+    if (!tokenAmount || !/^[0-9]+$/.test(String(tokenAmount.amount))) throw new Error("Finalized token balance is invalid");
     const accountDecimals = Number(tokenAmount.decimals);
     if (!Number.isInteger(accountDecimals) || accountDecimals < 0) {
       throw new Error(`Invalid decimals returned for token ${normalizedMint}`);
@@ -355,6 +356,30 @@ export async function getTokenBalanceByMint(mint) {
     decimals: resolvedDecimals,
     source: "rpc-finalized",
   };
+}
+
+/** Read-only proof for the persisted close queue; never relies on an indexer. */
+export async function getFinalizedCloseProof({ position_address, close_txs }, { connection = getConnection() } = {}) {
+  await assertMainnetRpc(connection, "close settlement proof");
+  if (!Array.isArray(close_txs) || close_txs.length === 0) throw new Error("Close signatures are missing");
+  const statuses = await connection.getSignatureStatuses(close_txs, { searchTransactionHistory: true });
+  const transactionFinalized = statuses?.value?.length === close_txs.length
+    && statuses.value.every((status) => status?.confirmationStatus === "finalized" && status.err === null
+      && Number.isInteger(status.slot));
+  if (!transactionFinalized) return { transactionFinalized: false };
+  const account = await connection.getAccountInfoAndContext(new PublicKey(position_address), {
+    commitment: "finalized", minContextSlot: Math.max(...statuses.value.map((status) => status.slot)),
+  });
+  return { transactionFinalized: true, positionAccountPresent: account.value !== null,
+    position_address, close_txs, slot: account.context.slot, checked_at: new Date().toISOString() };
+}
+
+export async function getSettlementDustPrice(mint) {
+  const tokens = await readJson(`https://datapi.jup.ag/v1/assets/search?query=${encodeURIComponent(mint)}`, {}, {
+    timeoutMs: 4_000, label: "Settlement token price",
+  });
+  const token = Array.isArray(tokens) ? tokens.find((item) => item.id === mint) : null;
+  return { mint: token?.id, usdPrice: token?.usdPrice, updatedAt: token?.updatedAt };
 }
 
 /**
@@ -716,7 +741,7 @@ export async function getJupiterPrices(mints) {
   const apiKey = requireJupiterApiKey();
   return readJson(`${JUPITER_PRICE_API}?ids=${encodeURIComponent(normalized.join(","))}`, {
     headers: { "x-api-key": apiKey },
-  }, { timeoutMs: config.spot.quoteMaxAgeMs, label: "Jupiter Price API" });
+  }, { timeoutMs: config.spot.quoteMaxAgeMs, label: "Jupiter Price API", priority: "critical" });
 }
 
 export async function getFinalizedSlot() {
@@ -731,6 +756,7 @@ async function fetchJupiterQuoteOnly({
   maxPriceImpactPct,
   maxTotalFeeLamports = null,
   requireTransactionFeeBreakdown = false,
+  priority = "entry",
 }) {
   const apiKey = requireJupiterApiKey();
   const search = new URLSearchParams({
@@ -748,7 +774,7 @@ async function fetchJupiterQuoteOnly({
   }
   const order = await readJson(`${JUPITER_SWAP_V2_API}/order?${search.toString()}`, {
     headers: { "x-api-key": apiKey },
-  }, { timeoutMs: config.spot.quoteMaxAgeMs, label: "Swap V2 quote" });
+  }, { timeoutMs: config.spot.quoteMaxAgeMs, label: "Swap V2 quote", priority });
   return validateJupiterQuote(order, {
     inputMint,
     outputMint,
@@ -767,7 +793,7 @@ export async function getSpotExitQuote({ mint, rawAmount }) {
   return exitQuoteCache.get(`${inputMint}:${rawAmount}:${config.spot.profitExitSlippageBps}:${config.spot.maxTotalFeeLamports}`, async () => {
     const quote = await fetchJupiterQuoteOnly({ inputMint, outputMint: SOL_MINT, amountAtomic: rawAmount,
       slippageBps: config.spot.profitExitSlippageBps, maxPriceImpactPct: config.spot.maxExitPriceImpactPct,
-      maxTotalFeeLamports: config.spot.maxTotalFeeLamports, requireTransactionFeeBreakdown: true });
+      maxTotalFeeLamports: config.spot.maxTotalFeeLamports, requireTransactionFeeBreakdown: true, priority: "critical" });
     const fees = BigInt(quote.totalFeeLamports);
     const expected = BigInt(quote.outAmount) - fees;
     const minimum = BigInt(quote.minimumOutAmount) - fees;
@@ -895,11 +921,9 @@ async function executeJupiterSwap({
   }
 
   const requestedAt = Date.now();
-  const orderRes = await fetch(`${JUPITER_SWAP_V2_API}/order?${search.toString()}`, {
+  const order = await readJson(`${JUPITER_SWAP_V2_API}/order?${search.toString()}`, {
     headers: { "x-api-key": jupiterApiKey },
-  });
-  if (!orderRes.ok) throw new Error(`Swap V2 order failed: ${orderRes.status} ${await orderRes.text()}`);
-  const order = await orderRes.json();
+  }, { timeoutMs: config.spot.quoteMaxAgeMs, label: "Swap V2 order", priority: outputMint === SOL_MINT ? "critical" : "entry" });
   const validatedOrder = validateJupiterOrder(order, {
     inputMint,
     outputMint,

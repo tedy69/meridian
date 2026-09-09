@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { getProviderBudget } from "./provider-budget.js";
 
 const readContext = new AsyncLocalStorage();
 
@@ -44,15 +45,31 @@ export async function withReadDeadline(read, { timeoutMs = 10_000, signal, label
 }
 
 /** Deadline covers headers AND body consumption; HTTP status errors omit URLs. */
-export function readJson(url, options = {}, { timeoutMs = 4_000, label = "Market API" } = {}) {
+export function readJson(url, options = {}, { timeoutMs = 4_000, label = "Market API", priority = "entry" } = {}) {
   if (options.method && options.method.toUpperCase() !== "GET") throw new Error("readJson only accepts GET requests");
   return withReadDeadline(async ({ signal }) => {
-    const response = await fetch(url, { ...options, signal });
-    if (!response.ok) throw Object.assign(new Error(`${label} HTTP ${response.status}`), {
-      status: response.status,
-      retryAfter: response.headers.get("retry-after"),
-    });
-    return response.json();
+    const budget = getProviderBudget(url);
+    const permit = await budget.acquire({ priority, signal });
+    // Abort must release admission even if a broken transport ignores signal.
+    signal.addEventListener("abort", permit.release, { once: true });
+    try {
+      signal.throwIfAborted();
+      const response = await fetch(url, { ...options, signal });
+      signal.throwIfAborted();
+      permit.observe(response);
+      // Headers establish quota ownership. Do not hold an exit behind a slow
+      // discovery response body; its existing read deadline still covers JSON.
+      permit.release();
+      if (!response.ok) throw Object.assign(new Error(`${label} HTTP ${response.status}`), {
+        status: response.status,
+        retryAfter: response.headers?.get?.("retry-after"),
+        retryAt: response.status === 429 ? budget.snapshot().blockedUntil : undefined,
+      });
+      return await response.json();
+    } finally {
+      signal.removeEventListener("abort", permit.release);
+      permit.release();
+    }
   }, { timeoutMs, label, signal: options.signal });
 }
 

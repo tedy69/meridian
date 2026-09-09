@@ -16,7 +16,11 @@ export function createRuntimeHealth({ now = Date.now, write = () => {} } = {}) {
       }
       save();
     },
-    heartbeat() { state.heartbeatAt = now(); save(); },
+    heartbeat({ providers } = {}) {
+      state.heartbeatAt = now();
+      if (providers) state.providers = structuredClone(providers);
+      save();
+    },
     stage(phase, detail = "") {
       Object.assign(state.scanner, { phase, detail: clean(detail), phaseStartedAt: now() });
       save();
@@ -41,7 +45,7 @@ export function createRuntimeHealth({ now = Date.now, write = () => {} } = {}) {
 }
 
 export function evaluateRuntimeHealth(state, now = Date.now()) {
-  const fail = (reason) => ({ healthy: false, reason });
+  const fail = (reason) => ({ healthy: false, ready: false, status: "unhealthy", reason });
   if (state?.version !== 1 || !Number.isFinite(state.heartbeatAt)) return fail("Runtime heartbeat unavailable");
   if (now - state.heartbeatAt > 30_000 || state.heartbeatAt > now + 5_000) return fail("Runtime heartbeat is stale or invalid");
   const scanner = state.scanner;
@@ -49,15 +53,18 @@ export function evaluateRuntimeHealth(state, now = Date.now()) {
   if (scanner.phase === "executing") {
     return now - scanner.phaseStartedAt > 180_000
       ? fail("Entry execution is unresolved; inspect reconciliation, never unlock automatically")
-      : { healthy: true, reason: "Entry execution in progress" };
+      : { healthy: true, ready: false, status: "executing", reason: "Entry execution in progress" };
   }
-  if (!scanner.enabled) return { healthy: true, reason: "Scanner explicitly paused or not monitored in this mode" };
+  if (!scanner.enabled) return { healthy: true, ready: false, status: "paused", reason: "Scanner explicitly paused or not monitored in this mode" };
   if (scanner.consecutiveErrors >= 3) return fail("Scanner failed for at least three consecutive cycles");
   const progressAt = scanner.phase === "reading" ? scanner.phaseStartedAt : scanner.lastCompletedAt;
   if (!Number.isFinite(progressAt) || now - progressAt > scanner.maxScanAgeMs || progressAt > now + 5_000) {
     return fail(`Scanner progress is stale (${clean(scanner.detail || scanner.reason || scanner.phase)})`);
   }
-  return { healthy: true, reason: "Scanner is progressing" };
+  if (["degraded", "blocked"].includes(scanner.status)) {
+    return { healthy: true, ready: false, status: scanner.status, reason: clean(scanner.reason) };
+  }
+  return { healthy: true, ready: true, status: "healthy", reason: "Scanner is progressing" };
 }
 
 export function persistRuntimeHealth(filePath, state) {
@@ -71,6 +78,6 @@ export function readRuntimeHealth(filePath) {
     const state = JSON.parse(fs.readFileSync(filePath, "utf8"));
     if (!Number.isInteger(state.pid) || state.pid <= 0) throw new Error("Invalid daemon PID");
     process.kill(state.pid, 0);
-    return { ...evaluateRuntimeHealth(state), scanner: state.scanner, heartbeatAt: state.heartbeatAt };
+    return { ...evaluateRuntimeHealth(state), scanner: state.scanner, heartbeatAt: state.heartbeatAt, providers: state.providers || {} };
   } catch { return { healthy: false, reason: "Daemon process or runtime health snapshot unavailable" }; }
 }

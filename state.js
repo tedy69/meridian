@@ -13,6 +13,7 @@ import { log } from "./logger.js";
 import { repoPath } from "./repo-root.js";
 import { evaluateTrailingProfitFloor } from "./trailing-safety.js";
 import { publishRuntimeChange } from "./runtime-events.js";
+import { settlementRetryDelayMs } from "./close-settlement.js";
 
 const STATE_FILE = process.env.MERIDIAN_STATE_FILE || repoPath("state.json");
 
@@ -44,26 +45,36 @@ function normalizeState(state) {
   return normalized;
 }
 
-function load() {
+function load({ strict = false } = {}) {
   if (!fs.existsSync(STATE_FILE)) {
     return emptyState();
   }
   try {
-    return normalizeState(JSON.parse(fs.readFileSync(STATE_FILE, "utf8")));
+    const state = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+    if (strict && (!state || typeof state !== "object" || Array.isArray(state)
+      || (state.pendingAutoSwaps != null && (typeof state.pendingAutoSwaps !== "object" || Array.isArray(state.pendingAutoSwaps))))) {
+      throw new Error("Invalid settlement state");
+    }
+    return normalizeState(state);
   } catch (err) {
+    if (strict) throw new Error("Settlement state unavailable; reconciliation required", { cause: err });
     log("state_error", `Failed to read state.json: ${err.message}`);
     return emptyState();
   }
 }
 
-function save(state) {
+function save(state, { strict = false } = {}) {
   try {
     normalizeState(state);
     state.lastUpdated = new Date().toISOString();
-    fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+    const temporary = `${STATE_FILE}.${process.pid}.tmp`;
+    fs.writeFileSync(temporary, JSON.stringify(state, null, 2), { mode: 0o600 });
+    fs.renameSync(temporary, STATE_FILE);
     publishRuntimeChange("lp_positions", JSON.stringify(Object.values(state.positions)
       .filter((p) => !p.closed).map((p) => [p.position, p.pool])));
+    publishRuntimeChange("settlements", JSON.stringify(Object.values(state.pendingAutoSwaps).map((entry) => [entry.key, entry.status])));
   } catch (err) {
+    if (strict) throw err;
     log("state_error", `Failed to write state.json: ${err.message}`);
   }
 }
@@ -250,7 +261,7 @@ export function queuePendingAutoSwap({ position_address, base_mint, close_txs = 
   if (!position_address || !base_mint) {
     throw new Error("position_address and base_mint are required to queue an auto-swap");
   }
-  const state = load();
+  const state = load({ strict: true });
   const key = pendingAutoSwapKey(position_address, base_mint);
   const now = new Date().toISOString();
   const existing = state.pendingAutoSwaps[key] || {};
@@ -268,33 +279,44 @@ export function queuePendingAutoSwap({ position_address, base_mint, close_txs = 
     last_error: existing.last_error || null,
     last_attempt_at: existing.last_attempt_at || null,
     last_observed_amount: existing.last_observed_amount ?? null,
+    next_attempt_at: null,
+    retry_count: 0,
+    residual: null,
   };
   state.pendingAutoSwaps[key] = entry;
   if (!wasAlreadyPending) {
     pushEvent(state, { action: "auto_swap_queued", position: position_address, base_mint });
   }
-  save(state);
+  save(state, { strict: true });
   log("state", `Queued base→SOL settlement for ${position_address} (${base_mint})`);
   return entry;
 }
 
 export function getPendingAutoSwaps() {
-  const state = load();
+  const state = load({ strict: true });
   return Object.values(state.pendingAutoSwaps)
     .filter((entry) => entry?.status === "pending_auto_swap")
     .sort((a, b) => String(a.created_at || "").localeCompare(String(b.created_at || "")));
 }
 
+export function getAutoSwapStatus() {
+  const entries = Object.values(load({ strict: true }).pendingAutoSwaps);
+  return { pending: entries.filter((entry) => entry?.status === "pending_auto_swap"),
+    residuals: entries.filter((entry) => entry?.status === "settled_dust_remaining") };
+}
+
 export function recordPendingAutoSwapAttempt(key, { error = null, observed_amount = null } = {}) {
-  const state = load();
+  const state = load({ strict: true });
   const entry = state.pendingAutoSwaps[key];
-  if (!entry) return null;
+  if (!entry || entry.status !== "pending_auto_swap") return null;
   entry.attempt_count = (Number.isFinite(entry.attempt_count) ? entry.attempt_count : 0) + 1;
   entry.last_attempt_at = new Date().toISOString();
   entry.updated_at = entry.last_attempt_at;
   entry.last_error = error ? sanitizeStoredText(error) : null;
   entry.last_observed_amount = Number.isFinite(observed_amount) ? observed_amount : null;
-  save(state);
+  entry.retry_count = (Number.isInteger(entry.retry_count) ? entry.retry_count : 0) + 1;
+  entry.next_attempt_at = new Date(Date.parse(entry.last_attempt_at) + settlementRetryDelayMs(entry.retry_count)).toISOString();
+  save(state, { strict: true });
   return entry;
 }
 
@@ -302,8 +324,9 @@ export function completePendingAutoSwap(key, {
   settlement_status = "settled_to_sol",
   tx = null,
   observed_amount = null,
+  residual = null,
 } = {}) {
-  const state = load();
+  const state = load({ strict: true });
   const entry = state.pendingAutoSwaps[key];
   if (!entry) return null;
   const now = new Date().toISOString();
@@ -312,6 +335,8 @@ export function completePendingAutoSwap(key, {
   entry.updated_at = now;
   entry.tx = tx || entry.tx || null;
   entry.last_error = null;
+  entry.next_attempt_at = null;
+  entry.residual = residual;
   entry.last_observed_amount = Number.isFinite(observed_amount) ? observed_amount : entry.last_observed_amount ?? null;
   pushEvent(state, {
     action: "auto_swap_settled",
@@ -320,7 +345,7 @@ export function completePendingAutoSwap(key, {
     settlement_status,
     tx: entry.tx,
   });
-  save(state);
+  save(state, { strict: true });
   log("state", `Settled pending base→SOL swap for ${entry.position_address}: ${settlement_status}`);
   return entry;
 }

@@ -9,6 +9,7 @@ logs
 user-config.json
 gmgn-config.json
 state.json
+state.json.*.tmp
 lessons.json
 smart-wallets.json
 pool-memory.json

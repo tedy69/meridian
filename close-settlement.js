@@ -54,3 +54,35 @@ export function evaluateAutoSwapBalance({ balanceReadSucceeded, amount }) {
     reason: "base_token_balance_present",
   };
 }
+
+// A single atomic unit is not automatically worthless. Require a fresh value
+// bound as well as finalized close/balance evidence, and keep the residual.
+export async function reconcileCloseResidual(entry, balance, { readCloseProof, readPrice, readBalance, now = Date.now }) {
+  const atomicResidual = (value) => value?.source === "rpc-finalized" && value.mint === entry.base_mint
+    && value.raw_amount === "1" && Number.isInteger(value.decimals) && value.decimals >= 6 && value.decimals <= 18
+    && value.amount === Number(`1e-${value.decimals}`);
+  if (!atomicResidual(balance) || !entry.close_txs?.length) return null;
+  const [proof, price] = await Promise.all([readCloseProof(entry), readPrice(entry.base_mint)]);
+  if (!evaluateCloseProof(proof || {}).confirmed) return null;
+  const updatedAt = Date.parse(price?.updatedAt);
+  const valueUsd = balance.amount * price?.usdPrice;
+  if (price?.mint !== entry.base_mint || !Number.isFinite(price?.usdPrice) || price.usdPrice <= 0
+    || !Number.isFinite(updatedAt) || now() - updatedAt > 60_000 || updatedAt > now() + 5_000
+    || !Number.isFinite(valueUsd) || valueUsd <= 0 || valueUsd > 0.000001) return null;
+  const remaining = await readBalance(entry.base_mint);
+  if (!atomicResidual(remaining) || remaining.decimals !== balance.decimals) return null;
+  // Recheck age after the second RPC read; slow providers must fail closed too.
+  if (now() - updatedAt > 60_000) return null;
+  return { settled: true, swapped: false, settlement_status: "settled_dust_remaining", balance: remaining,
+    residual: { ...remaining, value_usd: valueUsd, price_usd: price.usdPrice, price_updated_at: price.updatedAt,
+      observed_at: new Date(now()).toISOString(), close_proof: proof } };
+}
+
+export function settlementRetryDelayMs(retryCount) {
+  return Math.min(15 * 60_000, 30_000 * 2 ** Math.min(5, Math.max(0, Number(retryCount) - 1 || 0)));
+}
+
+export function isSettlementRetryDue(entry, now = Date.now()) {
+  const next = Date.parse(entry?.next_attempt_at);
+  return !Number.isFinite(next) || next <= now;
+}

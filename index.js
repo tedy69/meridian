@@ -61,6 +61,7 @@ import { createMarketDataCache } from "./market-data-cache.js";
 import { withReadDeadline } from "./read-deadline.js";
 import { runScreeningPipeline, queueScreeningAfterManagement } from "./screening-pipeline.js";
 import { createRuntimeHealth, evaluateRuntimeHealth, persistRuntimeHealth } from "./runtime-health.js";
+import { getProviderBudgetStatus } from "./provider-budget.js";
 import { getTradingStatus, formatTradingStatus } from "./tools/trading-status.js";
 const hybridLpCache = createMarketDataCache({ maxEntries: 2 });
 import {
@@ -613,9 +614,10 @@ async function runHybridScreeningCycle({ silent = false, refresh = false } = {})
         log("screening_cycle", `Hybrid ${stage}`);
       },
       read: async () => {
-        const blocked = (reason) => ({ selected: null, reason });
+        const blocked = (reason, status = "no_trade") => ({ selected: null, reason, healthStatus: status });
         const shared = getHybridRiskStatus();
-        if (shared.entry_pending) return blocked("Previous entry requires reconciliation; no timed unlock.");
+        if (shared.entry_pending) return blocked("Previous entry requires reconciliation; no timed unlock.", "blocked");
+        if (shared.pending_settlements?.length) return blocked("Pending LP settlement blocks new entries; see /status for retry details.", "blocked");
         if (shared.ledger?.date === new Date().toISOString().slice(0, 10)
           && Number(shared.ledger.lossSol) >= config.hybrid.maxDailyLossSol) return blocked("Shared daily loss cap reached.");
         if (readSpotPosition() || getTrackedPositions(true).length) return blocked("An active or unresolved position already exists.");
@@ -640,7 +642,7 @@ async function runHybridScreeningCycle({ silent = false, refresh = false } = {})
           scanSpot: () => spotFunded ? getSpotMomentumCandidates({ limit: 5, refresh }) : Promise.resolve({ candidates: [], reason: "Spot capital plus reserve/cost buffer is not funded" }),
           scanLp: () => sizing.funded
             ? hybridLpCache.get("lp-candidates", () => getTopCandidates({ limit: 1 }), {
-              ttlMs: refresh ? 0 : 30_000, requestTimeoutMs: 20_000, rateLimitKey: "lp-screener",
+              ttlMs: 30_000, requestTimeoutMs: 20_000, rateLimitKey: "lp-screener",
             }) : Promise.resolve({ candidates: [], reason: "LP reserve/rent buffer is not funded" }),
         });
         return { ...candidates, sizing };
@@ -663,7 +665,9 @@ async function runHybridScreeningCycle({ silent = false, refresh = false } = {})
         || result?.filtered_examples?.slice(0, 2).map((e) => e.reason).join("; ") || "no eligible candidates";
       report = screened.reason ? `Hybrid scan blocked: ${screened.reason}`
         : `NO TRADE\nSpot: ${describe(screened.spot)}\nLP: ${describe(screened.lp)}`;
-      if ((screened.spot?.error || screened.spot?.source_errors?.length) && screened.lp?.error) healthStatus = "error";
+      const spotFailed = Boolean(screened.spot?.error || screened.spot?.source_errors?.length);
+      const lpFailed = Boolean(screened.lp?.error || screened.lp?.source_errors?.length);
+      healthStatus = screened.healthStatus || (spotFailed && lpFailed ? "error" : spotFailed || lpFailed ? "degraded" : "no_trade");
       appendDecision({ type: "hybrid_no_trade", actor: "SCREENER", summary: "Neither strategy qualified", reason: report,
         metrics: { duration_ms: Date.now() - startedAt, spot_screened: screened.spot?.total_screened,
           spot_rejected: screened.spot?.fresh_rejected, lp_checked: screened.lp?.fresh_checked,
@@ -1250,13 +1254,15 @@ export function startCronJobs() {
   runtimeHealth.start({ monitorScanner: isSpotEnabled() });
   if (isMain && !runtimeHealthTimer) {
     runtimeHealthTimer = setInterval(() => {
-      runtimeHealth.heartbeat();
+      runtimeHealth.heartbeat({ providers: getProviderBudgetStatus() });
       const health = evaluateRuntimeHealth(runtimeHealth.snapshot());
-      if (!health.healthy && health.reason !== lastHealthAlarm) {
-        lastHealthAlarm = health.reason;
+      const alarm = !health.healthy || ["degraded", "blocked"].includes(health.status);
+      const alarmKey = health.status === "degraded" ? "provider_degraded" : health.reason;
+      if (alarm && alarmKey !== lastHealthAlarm) {
+        lastHealthAlarm = alarmKey;
         log("health_error", health.reason);
         if (telegramEnabled()) sendMessage(`⚠️ Bot health: ${health.reason}`).catch(() => {});
-      } else if (health.healthy && lastHealthAlarm) {
+      } else if (!alarm && lastHealthAlarm) {
         lastHealthAlarm = null;
         log("health", "Scanner recovered");
         if (telegramEnabled()) sendMessage("✅ Bot health: scanner kembali berjalan.").catch(() => {});
@@ -1519,8 +1525,11 @@ Summarize the current portfolio health, total fees earned, and performance of al
   _entryRealtimeMonitor = createAccountRealtimeMonitor({
     monitorName: "entry",
     watchLogs: true,
-    getAccountAddresses: () => readSpotPosition() || getTrackedPositions(true).length
-      ? [] : getEntryWatchAccounts(),
+    getAccountAddresses: () => {
+      const risk = getHybridRiskStatus();
+      return readSpotPosition() || getTrackedPositions(true).length || risk.pending_settlements.length || risk.entry_pending
+        ? [] : getEntryWatchAccounts();
+    },
     onRefresh: () => {
       if (_screeningBusy || _managementBusy || _claimAllBusy) {
         _entryScanPending = true;

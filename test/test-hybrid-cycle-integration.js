@@ -101,6 +101,27 @@ function cycleHarness(overrides = {}) {
   return { ...buildCycle(...Object.values(dependencies)), decisions, health, logs, executions, readSignals };
 }
 
+test("pending LP settlement stops discovery before any provider request", async () => {
+  const harness = cycleHarness({
+    getHybridRiskStatus: () => ({ pending_settlements: [{ key: "pending" }] }),
+    getMyPositions: () => assert.fail("must not query positions while settlement is pending"),
+    getSpotMomentumCandidates: () => assert.fail("must not screen while settlement is pending"),
+    getTopCandidates: () => assert.fail("must not discover LP while settlement is pending"),
+  });
+  assert.match(await harness.run({ silent: true }), /settlement/i);
+  assert.equal(harness.health.at(-1).status, "blocked");
+  assert.equal(harness.executions.length, 0);
+});
+
+test("one failed provider cannot be reported as a healthy empty scan", async () => {
+  const harness = cycleHarness({
+    getSpotMomentumCandidates: async () => ({ candidates: [], source_errors: [{ reason: "HTTP 429" }] }),
+    getTopCandidates: async () => ({ candidates: [] }),
+  });
+  await harness.run({ silent: true });
+  assert.equal(harness.health.at(-1).status, "degraded");
+});
+
 test("daemon screening releases a timed-out read, accepts a later cycle, and never executes the late old selection", { timeout: 1_000 }, async () => {
   let finishExpiredScan;
   let scans = 0;

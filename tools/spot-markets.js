@@ -12,12 +12,12 @@ const text = (value) => String(value || "").replace(/[<>`\r\n\t]/g, " ").slice(0
 const numeric = (value) => value == null || value === "" ? null : Number.isFinite(Number(value)) ? Number(value) : null;
 const address = (value) => new PublicKey(value).toBase58();
 
-async function requestJson(url, { ttlMs = 10000 } = {}) {
+async function requestJson(url, { ttlMs = 10000, priority = "background" } = {}) {
   const provider = url.startsWith(JUPITER) ? "jupiter-tokens" : "dexscreener";
   return cache.get(url, async () => {
     return readJson(url, {
       headers: provider === "jupiter-tokens" ? { "x-api-key": config.jupiter.apiKey } : {},
-    }, { label: provider });
+    }, { label: provider, priority });
   }, { ttlMs, rateLimitKey: provider });
 }
 
@@ -62,12 +62,12 @@ export function normalizeSpotMarket(pair, token, now = Date.now()) {
 }
 
 export function createSpotMarketProvider({ requestJson: request = requestJson, now = Date.now } = {}) {
-  return {
-    async discover({ page_size = 50, refresh = false } = {}) {
+  const discoveryCache = createMarketDataCache({ now, maxEntries: 4 });
+  const discover = async ({ page_size = 50 } = {}) => {
       const sourceErrors = [];
       const feeds = await Promise.all(["toptrending", "toptraded"].map(async (category) => {
         try {
-          const result = await request(`${JUPITER}/${category}/5m?limit=50`, { ttlMs: refresh ? 0 : 10000 });
+          const result = await request(`${JUPITER}/${category}/5m?limit=50`, { ttlMs: 10000 });
           if (!Array.isArray(result)) throw new Error("Invalid token feed response");
           return result;
         } catch (error) {
@@ -88,7 +88,7 @@ export function createSpotMarketProvider({ requestJson: request = requestJson, n
       if (selected.length) {
         try {
           const mints = selected.map((token) => address(token.id)).sort().join(",");
-          pairs = await request(`${DEX}/tokens/v1/solana/${mints}`, { ttlMs: refresh ? 0 : 10000 });
+          pairs = await request(`${DEX}/tokens/v1/solana/${mints}`, { ttlMs: 10000 });
           if (!Array.isArray(pairs)) throw new Error("Invalid pair feed response");
         } catch (error) {
           sourceErrors.push({ source: "dexscreener", reason: error.message });
@@ -111,14 +111,18 @@ export function createSpotMarketProvider({ requestJson: request = requestJson, n
       return { pools, unique_mints: tokens.length, pair_lookups: selected.length,
         source_errors: sourceErrors, filtered_examples: rejected.slice(0, 5),
         coverage: "Jupiter trending/traded tokens + cross-DEX SOL pairs; not every Solana token" };
-    },
+  };
+  return {
+    // Pool events do not invalidate the universe feed. Execution still calls
+    // resolve and requests a fresh quote before any entry can be submitted.
+    discover: (args = {}) => discoveryCache.get(`universe:${args.page_size || 50}`, () => discover(args), { ttlMs: 10_000 }),
     async resolve({ pool_address }) {
       const pool = address(pool_address);
-      const response = await request(`${DEX}/latest/dex/pairs/solana/${pool}`, { ttlMs: 0 });
+      const response = await request(`${DEX}/latest/dex/pairs/solana/${pool}`, { ttlMs: 0, priority: "entry" });
       const pair = response?.pairs?.find((entry) => entry?.pairAddress === pool && entry?.chainId === "solana");
       if (!pair) throw new Error("Fresh pair response does not match requested Solana pool");
       const mint = address(pair.baseToken?.address);
-      const tokens = await request(`${JUPITER}/search?query=${mint}`, { ttlMs: 0 });
+      const tokens = await request(`${JUPITER}/search?query=${mint}`, { ttlMs: 0, priority: "entry" });
       const token = Array.isArray(tokens) ? tokens.find((entry) => entry?.id === mint) : null;
       if (!token) throw new Error("Fresh token response does not match pair mint");
       return normalizeSpotMarket(pair, token, now());

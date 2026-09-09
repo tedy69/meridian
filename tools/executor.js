@@ -9,7 +9,7 @@ import {
   closePosition,
   searchPools,
 } from "./dlmm.js";
-import { getTokenBalanceByMint, getWalletBalances, getEntrySolBalance, inspectMintSafety, normalizeMint, swapToken } from "./wallet.js";
+import { getTokenBalanceByMint, getWalletBalances, getEntrySolBalance, getFinalizedCloseProof, getSettlementDustPrice, inspectMintSafety, normalizeMint, swapToken } from "./wallet.js";
 import { readJson, withReadDeadline } from "../read-deadline.js";
 import { isLpEnabled } from "../hybrid-risk.js";
 import { getSpotPosition } from "../spot-state.js";
@@ -57,7 +57,7 @@ import {
   assertNoPendingCloseSettlement,
   isDryRun,
 } from "../execution-guard.js";
-import { evaluateAutoSwapBalance } from "../close-settlement.js";
+import { evaluateAutoSwapBalance, reconcileCloseResidual, isSettlementRetryDue } from "../close-settlement.js";
 import {
   commitDailyDeployReservation,
   reserveDailyDeploy,
@@ -837,7 +837,7 @@ let _autoSwapDrainPromise = null;
  * RPC reads, not an indexer/USD-price view, so an unavailable token index can
  * never be mistaken for a completed settlement.
  */
-async function swapBaseToSolWithRetry(baseMint, label, { onFailure = null } = {}) {
+async function swapBaseToSolWithRetry(baseMint, label, { onFailure = null, closeEntry = null } = {}) {
   const normalizedMint = normalizeMint(baseMint);
   if (!normalizedMint) {
     return { settled: false, swapped: false, error: "Missing base-token mint" };
@@ -851,7 +851,7 @@ async function swapBaseToSolWithRetry(baseMint, label, { onFailure = null } = {}
     };
   }
 
-  const attempts = Math.max(1, Number(config.management.autoSwapRetryAttempts ?? 3));
+  const attempts = closeEntry ? 1 : Math.max(1, Number(config.management.autoSwapRetryAttempts ?? 3));
   const delayMs = Math.max(0, Number(config.management.autoSwapRetryDelayMs ?? 3000));
   let lastError = null;
   let lastBalance = null;
@@ -873,6 +873,13 @@ async function swapBaseToSolWithRetry(baseMint, label, { onFailure = null } = {}
           settlement_status: balanceDecision.settlement_status,
           balance,
         };
+      }
+      if (balanceDecision.action === "retry") throw new Error(balanceDecision.reason);
+      if (closeEntry) {
+        const residual = await reconcileCloseResidual(closeEntry, balance, {
+          readCloseProof: getFinalizedCloseProof, readPrice: getSettlementDustPrice, readBalance: getTokenBalanceByMint,
+        });
+        if (residual) return residual;
       }
 
       log("executor", `Auto-swapping ${label} ${normalizedMint.slice(0, 8)} (${balance.amount}) back to SOL (attempt ${attempt}/${attempts})`);
@@ -926,6 +933,7 @@ async function swapBaseToSolWithRetry(baseMint, label, { onFailure = null } = {}
 
 async function settleQueuedAutoSwap(entry, label) {
   const outcome = await swapBaseToSolWithRetry(entry.base_mint, label, {
+    closeEntry: entry,
     onFailure: ({ error, observed_amount }) => {
       recordPendingAutoSwapAttempt(entry.key, { error, observed_amount });
     },
@@ -935,6 +943,7 @@ async function settleQueuedAutoSwap(entry, label) {
       settlement_status: outcome.settlement_status,
       tx: outcome.result?.tx || null,
       observed_amount: outcome.balance?.amount ?? null,
+      residual: outcome.residual ?? null,
     });
   }
   return outcome;
@@ -963,11 +972,12 @@ export async function drainPendingAutoSwaps() {
 
     const results = [];
     for (const entry of pending) {
+      if (!isSettlementRetryDue(entry)) continue;
       const outcome = await settleQueuedAutoSwap(entry, "queued close settlement");
       results.push({ key: entry.key, position: entry.position_address, ...outcome });
     }
     return {
-      processed: pending.length,
+      processed: results.length,
       settled: results.filter((result) => result.settled).length,
       pending: getPendingAutoSwaps().length,
       results,
@@ -1026,7 +1036,10 @@ async function settleCloseToSol(result, args) {
     result.auto_swapped = outcome.swapped;
     result.auto_swap_note = outcome.swapped
       ? `Base token was swapped to SOL in finalized transaction ${outcome.result?.tx || ""}. Do NOT call swap_token again.`
-      : "No residual base-token balance exists at finalized commitment; no swap was required.";
+      : outcome.residual
+        ? `One atomic base-token unit remains in the wallet, valued at $${outcome.residual.value_usd} when verified. Recorded as retained dust, not converted to SOL. Do NOT swap it again.`
+        : "No residual base-token balance exists at finalized commitment; no swap was required.";
+    if (outcome.residual) result.residual = outcome.residual;
     if (outcome.result?.amount_out) result.sol_received = outcome.result.amount_out;
     return;
   }

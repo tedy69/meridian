@@ -7,6 +7,51 @@ import {
   evaluateAutoSwapBalance,
   evaluateCloseProof,
 } from "../close-settlement.js";
+import * as settlement from "../close-settlement.js";
+
+test("a verified single atomic residual is retained as dust without requesting a swap", async () => {
+  assert.equal(typeof settlement.reconcileCloseResidual, "function");
+  const balance = { mint: "mint", raw_amount: "1", amount: 1e-9, decimals: 9, source: "rpc-finalized" };
+  const now = Date.now();
+  const result = await settlement.reconcileCloseResidual({ base_mint: "mint", close_txs: ["close"] }, balance, {
+    readCloseProof: async () => ({ transactionFinalized: true, positionAccountPresent: false }),
+    readPrice: async () => ({ mint: "mint", usdPrice: 0.0023, updatedAt: new Date(now).toISOString() }),
+    readBalance: async () => balance, now: () => now,
+  });
+  assert.equal(result.settlement_status, "settled_dust_remaining");
+  assert.equal(result.swapped, false);
+  assert.equal(result.residual.raw_amount, "1");
+  assert.equal(result.residual.amount, 1e-9);
+});
+
+test("dust reconciliation fails closed for valuable, unverified, stale or growing balances", async () => {
+  assert.equal(typeof settlement.reconcileCloseResidual, "function");
+  const now = Date.now();
+  const balance = { mint: "mint", raw_amount: "1", amount: 1e-9, decimals: 9, source: "rpc-finalized" };
+  const proof = { transactionFinalized: true, positionAccountPresent: false };
+  const price = { mint: "mint", usdPrice: 0.0023, updatedAt: new Date(now).toISOString() };
+  for (const change of [
+    { balance: { ...balance, raw_amount: "2", amount: 2e-9 } },
+    { balance: { ...balance, decimals: 0, amount: 1 } },
+    { balance: { ...balance, source: "indexer" } },
+    { balance: { ...balance, amount: 2e-9 } },
+    { proof: { ...proof, transactionFinalized: false } },
+    { proof: { ...proof, positionAccountPresent: true } },
+    { proof: { ...proof, positionAccountPresent: undefined } },
+    { price: { ...price, usdPrice: 1e9 } },
+    { price: { ...price, usdPrice: 0 } },
+    { price: { ...price, mint: "other" } },
+    { price: { ...price, updatedAt: new Date(now - 60001).toISOString() } },
+    { after: { ...balance, raw_amount: "100", amount: 1e-7 } },
+  ]) {
+    const result = await settlement.reconcileCloseResidual({ base_mint: "mint", close_txs: ["close"] }, change.balance || balance, {
+      readCloseProof: async () => change.proof || proof,
+      readPrice: async () => change.price || price,
+      readBalance: async () => change.after || balance, now: () => now,
+    });
+    assert.equal(result, null, JSON.stringify(change));
+  }
+});
 
 test("a close is confirmed only after finality and direct account absence", () => {
   assert.deepEqual(
@@ -103,5 +148,40 @@ test("pending autoswaps survive retries and clear only after direct settlement",
     });
     assert.equal(state.getPendingAutoSwaps().length, 0);
     assert.equal(JSON.parse(fs.readFileSync(stateFile, "utf8")).pendingAutoSwaps[queued.key].status, "settled_to_sol");
+  });
+});
+
+test("failed settlement retries are persisted, bounded and reset by newly queued close work", async () => {
+  await withTemporaryState(async (state) => {
+    const args = { position_address: "position", base_mint: "mint", close_txs: ["close"] };
+    const queued = state.queuePendingAutoSwap(args);
+    assert.equal(settlement.isSettlementRetryDue(queued), true);
+    const failed = state.recordPendingAutoSwapAttempt(queued.key, { error: "No route", observed_amount: 1.25 });
+    const at = Date.parse(failed.last_attempt_at);
+    assert.equal(Date.parse(failed.next_attempt_at) - at, 30_000);
+    assert.equal(settlement.isSettlementRetryDue(state.getPendingAutoSwaps()[0], at + 1), false);
+    assert.equal(settlement.isSettlementRetryDue(failed, at + 30_000), true);
+    assert.equal(settlement.settlementRetryDelayMs(1665), 15 * 60_000);
+    assert.equal(settlement.isSettlementRetryDue(state.queuePendingAutoSwap(args), at + 1), true);
+  });
+});
+
+test("dust completion preserves balance proof and is visible separately from pending SOL conversion", async () => {
+  await withTemporaryState(async (state, stateFile) => {
+    const queued = state.queuePendingAutoSwap({ position_address: "position", base_mint: "mint" });
+    const residual = { mint: "mint", raw_amount: "1", amount: 1e-9, decimals: 9, source: "rpc-finalized",
+      value_usd: 2.3e-12, close_proof: { transactionFinalized: true, positionAccountPresent: false } };
+    state.completePendingAutoSwap(queued.key, { settlement_status: "settled_dust_remaining", observed_amount: 1e-9, residual });
+    assert.equal(state.getPendingAutoSwaps().length, 0);
+    assert.deepEqual(state.getAutoSwapStatus().residuals[0].residual, residual);
+    assert.equal(JSON.parse(fs.readFileSync(stateFile)).pendingAutoSwaps[queued.key].last_observed_amount, 1e-9);
+  });
+});
+
+test("an unreadable settlement registry cannot look like an empty queue", async () => {
+  await withTemporaryState(async (state, stateFile) => {
+    fs.writeFileSync(stateFile, "{broken");
+    assert.throws(() => state.getPendingAutoSwaps(), /state unavailable/i);
+    assert.throws(() => state.getAutoSwapStatus(), /state unavailable/i);
   });
 });

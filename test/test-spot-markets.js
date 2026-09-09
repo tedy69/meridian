@@ -85,14 +85,19 @@ test("entry resolution binds exact pair and re-fetches token stats without cache
   await assert.rejects(provider.resolve({ pool_address: SOL_MINT }), /match/i);
 });
 
-test("an on-chain entry trigger bypasses completed token and pair discovery caches", async () => {
+test("bursts of on-chain events reuse discovery while direct entry resolution stays fresh", async () => {
   const calls = [];
-  const provider = createSpotMarketProvider({ now: () => now, requestJson: async (url, options) => {
+  let clock = now;
+  const provider = createSpotMarketProvider({ now: () => clock, requestJson: async (url, options) => {
     calls.push(options);
     return url.includes("tokens/v2") ? [token()] : [pair()];
   } });
   const result = await provider.discover({ refresh: true });
   assert.equal(result.pools.length, 1);
+  await Promise.all(Array.from({ length: 100 }, () => provider.discover({ refresh: true })));
   assert.equal(calls.length, 3);
-  assert.ok(calls.every((options) => options.ttlMs === 0));
+  assert.ok(calls.every((options) => options.ttlMs === 10_000));
+  clock += 10_001;
+  await provider.discover({ refresh: true });
+  assert.equal(calls.length, 6, "discovery must renew after its freshness window");
 });

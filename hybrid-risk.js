@@ -5,6 +5,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { config } from "./config.js";
 import { repoPath } from "./repo-root.js";
 import { isDryRun, SOL_MINT } from "./execution-guard.js";
+import { getAutoSwapStatus } from "./state.js";
 
 const execution = new AsyncLocalStorage();
 export const isSpotEnabled = (mode = config.trading.mode) => ["spot_momentum", "hybrid"].includes(mode);
@@ -104,8 +105,10 @@ export function createHybridEntryGuard({ directory, policy, getSpotPosition, get
 export function getHybridRiskStatus() {
   const ledger = repoPath("hybrid-risk-budget.json");
   const lock = repoPath("hybrid-entry-lock.json");
+  const settlement = getAutoSwapStatus();
   return { mode: config.trading.mode, policy: config.hybrid,
     entry_pending: fs.existsSync(lock),
+    pending_settlements: settlement.pending, residual_settlements: settlement.residuals,
     ledger: fs.existsSync(ledger) ? JSON.parse(fs.readFileSync(ledger, "utf8")) : null,
     accounting_basis: "Flat-wallet SOL drawdown; cumulative observed losses do not reset on a gain or deposit. External transfers can affect this measure." };
 }

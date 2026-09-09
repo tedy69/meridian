@@ -2,6 +2,20 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createRuntimeHealth, evaluateRuntimeHealth } from "../runtime-health.js";
 
+test("completed scans expose partial provider failure and pending settlement as unready", () => {
+  const health = createRuntimeHealth();
+  health.start();
+  health.complete("degraded", "Spot provider unavailable; LP screening completed");
+  const degraded = evaluateRuntimeHealth(health.snapshot());
+  assert.equal(degraded.ready, false);
+  assert.equal(degraded.status, "degraded");
+  assert.match(degraded.reason, /Spot provider/);
+  health.complete("blocked", "Pending LP settlement blocks new entries");
+  assert.equal(evaluateRuntimeHealth(health.snapshot()).ready, false);
+  health.complete("no_trade", "No eligible candidates");
+  assert.equal(evaluateRuntimeHealth(health.snapshot()).ready, true);
+});
+
 test("a living process with a stale scanner is unhealthy, not silently healthy", () => {
   let now = 1_000;
   const health = createRuntimeHealth({ now: () => now });

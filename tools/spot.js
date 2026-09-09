@@ -247,6 +247,7 @@ async function readSpotMomentumCandidates({ limit = 10, refresh = false } = {}, 
   updateEntryWatchlist("spot", pools);
   const candidates = [];
   const filtered = [];
+  const sourceErrors = [...(discovery?.source_errors || [])];
 
   for (const pool of pools) {
     assertReadActive();
@@ -306,6 +307,9 @@ async function readSpotMomentumCandidates({ limit = 10, refresh = false } = {}, 
         });
       }
     } catch (error) {
+      if (error.status || /HTTP|API|timeout|timed out|provider|unavailable/i.test(error.message)) {
+        sourceErrors.push({ source: "spot_preflight", reason: error.message });
+      }
       filtered.push({ name: pool.name, reason: `fresh spot checks failed: ${error.message}` });
     }
     await deps.sleep(150);
@@ -318,7 +322,7 @@ async function readSpotMomentumCandidates({ limit = 10, refresh = false } = {}, 
     shortlist_size: pools.length,
     discovery_rejected: broadFiltered.length,
     fresh_rejected: filtered.length,
-    source_errors: discovery?.source_errors || [],
+    source_errors: sourceErrors,
     coverage: discovery?.coverage || null,
     filtered_examples: [...filtered, ...broadFiltered, ...(discovery?.filtered_examples || [])].slice(0, 5),
   };

@@ -8,6 +8,7 @@ function isRateLimited(error) {
 }
 
 function backoffMs(error, now) {
+  if (Number.isFinite(error?.retryAt)) return Math.max(0, error.retryAt - now);
   const raw = error?.retryAfter;
   const seconds = raw == null || raw === "" ? NaN : Number(raw);
   const delay = Number.isFinite(seconds) ? seconds * 1_000 : Date.parse(raw) - now;
@@ -53,6 +54,7 @@ export function createMarketDataCache({ now = Date.now, maxEntries = 256 } = {})
     if (retryAt > startedAt) {
       throw Object.assign(new Error("Market-data provider cooldown after HTTP 429; refusing a new request"), {
         status: 429, code: "MARKET_DATA_RATE_LIMITED", retryAfter: Math.ceil((retryAt - startedAt) / 1_000),
+        retryAt,
       });
     }
     if (inFlight.size + cooldowns.size >= maxEntries) {

@@ -6,6 +6,7 @@ import { readRuntimeHealth } from "../runtime-health.js";
 import { repoPath } from "../repo-root.js";
 import { withReadDeadline } from "../read-deadline.js";
 import { getRealtimeMonitorTelemetry } from "../account-realtime.js";
+import { getProviderBudgetStatus } from "../provider-budget.js";
 
 export async function getTradingStatus(_args = {}, { getLp = () => getMyPositions({ force: true, silent: true }),
   getSpot = getSpotPositionSnapshot, getRisk = getHybridRiskStatus,
@@ -16,17 +17,20 @@ export async function getTradingStatus(_args = {}, { getLp = () => getMyPosition
   const spotKnown = !spot?.error && (spot?.position != null || spot?.status === "none");
   return { mode: risk?.mode || config.trading.mode, lp, spot, risk, health,
     realtime: getRealtimeMonitorTelemetry(),
+    providers: { ...health?.providers, ...getProviderBudgetStatus() },
     total_open_positions: lpKnown && spotKnown ? lp.total_positions + (spot.position ? 1 : 0) : null };
 }
 
-export function formatTradingStatus({ mode, lp, spot, risk, health, realtime = {} }) {
+export function formatTradingStatus({ mode, lp, spot, risk, health, realtime = {}, providers = {} }) {
   const clean = (v) => String(v || "").replace(/[<>`\r\n]/g, " ").slice(0, 140);
   const position = spot?.position;
   const pnl = spot?.priceable && Number.isFinite(spot.pnl_pct) ? `${spot.pnl_pct.toFixed(2)}%` : "unknown";
   const lpKnown = !lp?.error && Array.isArray(lp?.positions) && lp.total_positions === lp.positions.length;
   return [
     `Mode: ${mode}`,
-    health ? `Scanner: ${health.healthy === true ? "healthy" : "unhealthy"} — ${clean(health.reason || health.error)}` : null,
+    health ? `Scanner: ${health.status || (health.healthy === true ? "healthy" : "unhealthy")} — ${clean(health.reason || health.error)}` : null,
+    health?.ready != null ? `Trading ready: ${health.ready}` : null,
+    ...Object.entries(providers).filter(([, budget]) => budget.blockedUntil > Date.now()).map(([host, budget]) => `Provider ${host}: waiting until ${new Date(budget.blockedUntil).toISOString()} | requests ${budget.admitted} | HTTP 429 ${budget.rateLimits}`),
     ...Object.entries(realtime).map(([name, monitor]) => `Realtime ${name}: ${monitor.running ? "running" : "stopped"} | ${monitor.subscribed_accounts?.length ?? 0} accounts | event→refresh p95 ${monitor.latency_ms?.event_to_refresh?.p95 ?? "N/A"}ms | refresh p95 ${monitor.latency_ms?.refresh_duration?.p95 ?? "N/A"}ms`),
     position ? `Spot: ${clean(position.symbol || position.mint)} (${clean(position.venue || "meteora")}) | ${position.status} | estimated net exit PnL: ${pnl}`
       : `Spot: ${spot?.error ? `unknown (${clean(spot.error)})` : "none"}`,
@@ -34,6 +38,9 @@ export function formatTradingStatus({ mode, lp, spot, risk, health, realtime = {
     `LP: ${lpKnown ? lp.total_positions : `unknown (${clean(lp?.error || "invalid snapshot")})`}`,
     ...(lpKnown ? lp.positions.map((p, index) => `${index + 1}. ${clean(p.pair || p.pool)} | ${p.position} | net PnL: ${p.net_pnl_status === "UNKNOWN" || p.pnl_pct_suspicious || !Number.isFinite(p.pnl_pct) ? "unknown" : `${p.pnl_pct.toFixed(2)}%`}`) : []),
     mode === "hybrid" ? `Shared reserve: ${risk?.policy?.reserveSol ?? "unknown"} SOL | max one position | pending entry: ${risk?.entry_pending ?? "unknown"}` : null,
+    `Pending LP settlements: ${risk?.pending_settlements?.length ?? "unknown"}`,
+    ...(risk?.pending_settlements || []).map((entry) => `${clean(entry.base_mint)} | remaining ${entry.last_observed_amount ?? "unknown"} | next retry ${clean(entry.next_attempt_at || "due")} | ${clean(entry.last_error || "awaiting settlement")}`),
+    ...(risk?.residual_settlements || []).map((entry) => `Retained dust: ${clean(entry.base_mint)} | ${entry.residual?.raw_amount ?? "unknown"} atomic unit | observed ${clean(entry.residual?.observed_at)} | not converted to SOL`),
     risk?.error ? `Risk state unavailable: ${clean(risk.error)}` : null,
     position ? "Use /close spot for the spot position; /close <n> for LP." : null,
   ].filter(Boolean).join("\n");
